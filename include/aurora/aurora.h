@@ -93,6 +93,15 @@ typedef struct {
   bool pauseOnFocusLost;
   bool allowTextureDumps;
   bool allowCpuAdapter;
+
+  /*
+   * Pack single-mip textures that clamp on both axes into shared 1024x1024
+   * atlas layers so that more draws share a texture bind group and can merge.
+   * The shader remaps texel coordinates into the atlas cell, which can shift
+   * sampled values by one LSB compared to sampling the texture directly;
+   * leave off for bit-exact output.
+   */
+  bool textureAtlas;
   int32_t windowPosX;
   int32_t windowPosY;
   uint32_t windowWidth;

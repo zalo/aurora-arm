@@ -74,18 +74,25 @@ struct TextureContentKey {
   XXH128_hash_t tlutHash{};
   u32 tlutFormat = 0;
   u16 tlutEntries = 0;
+  // Atlas class when the texture may be atlased: an atlas cell bakes clamp
+  // sampling into its placement, so users of the same image with another
+  // sampler class (e.g. REPEAT) must not share the GPU texture.
+  bool atlas = false;
+  u64 atlasClass = 0;
 
   bool operator==(const TextureContentKey& rhs) const noexcept {
     return textureHash.low64 == rhs.textureHash.low64 && textureHash.high64 == rhs.textureHash.high64 &&
            width == rhs.width && height == rhs.height && format == rhs.format && mipCount == rhs.mipCount &&
            tlutHash.low64 == rhs.tlutHash.low64 && tlutHash.high64 == rhs.tlutHash.high64 &&
-           tlutFormat == rhs.tlutFormat && tlutEntries == rhs.tlutEntries;
+           tlutFormat == rhs.tlutFormat && tlutEntries == rhs.tlutEntries && atlas == rhs.atlas &&
+           atlasClass == rhs.atlasClass;
   }
 
   template <typename H>
   friend H AbslHashValue(H h, const TextureContentKey& key) {
     return H::combine(std::move(h), key.textureHash.low64, key.textureHash.high64, key.width, key.height, key.format,
-                      key.mipCount, key.tlutHash.low64, key.tlutHash.high64, key.tlutFormat, key.tlutEntries);
+                      key.mipCount, key.tlutHash.low64, key.tlutHash.high64, key.tlutFormat, key.tlutEntries, key.atlas,
+                      key.atlasClass);
   }
 };
 
@@ -284,12 +291,16 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
   CHECK(obj.has_data() && textureBytes != 0, "invalid texture source for content hash");
 
   TextureKeys keys;
+  const auto textureClass = gfx::texture_class(obj);
+  const bool atlas = g_config.textureAtlas && textureClass.atlas;
   keys.contentKey = {
       .textureHash = XXH3_128bits(obj.data, textureBytes),
       .width = obj.width(),
       .height = obj.height(),
       .format = obj.format(),
       .mipCount = obj.mip_count(),
+      .atlas = atlas,
+      .atlasClass = atlas ? textureClass.sampler : 0,
   };
   s_stats.hashedBytes += textureBytes;
 
