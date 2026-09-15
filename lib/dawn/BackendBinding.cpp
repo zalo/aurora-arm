@@ -21,7 +21,7 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
   return SetupWindowAndGetSurfaceDescriptorCocoa(window);
 #else
 #ifdef MELEE_MIYOO_FLIP
-  auto desc = std::make_shared<wgpu::DawnSurfaceSourceEGLNativeWindow>();
+  auto desc = std::make_shared<wgpu::SurfaceSourceEGLNativeWindow>();
   desc->window = MeleeFlipNativeWindow();
   return desc;
 #endif
