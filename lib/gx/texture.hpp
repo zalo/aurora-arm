@@ -33,6 +33,11 @@ constexpr uint64_t ReplacementPublishBudgetBytes = 12ull * 1024ull * 1024ull;
 size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noexcept;
 size_t tlut_source_size(u16 numEntries) noexcept;
 
+// Cache identities derived from the object description (image address, size, format, sampler state, TLUT slot), so
+// that objects recreated every frame for the same image keep hitting the object cache. Never 0.
+u32 texture_object_identity(const GXTexObj_& obj) noexcept;
+u32 tlut_object_identity(const GXTlutObj_& tlut) noexcept;
+
 void invalidate_bindings() noexcept;
 uint64_t current_bind_generation() noexcept;
 void invalidate_replacement(uint64_t replacementId) noexcept;

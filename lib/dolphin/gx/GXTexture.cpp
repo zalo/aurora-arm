@@ -2,6 +2,7 @@
 #include "__gx.h"
 
 #include "../../gfx/texture.hpp"
+#include "../../gx/texture.hpp"
 #include "dolphin/gx/GXAurora.h"
 
 #include <algorithm>
@@ -17,23 +18,6 @@ constexpr u8 GXTexImage2Ids[8] = {0x90, 0x91, 0x92, 0x93, 0xB0, 0xB1, 0xB2, 0xB3
 constexpr u8 GXTexImage3Ids[8] = {0x94, 0x95, 0x96, 0x97, 0xB4, 0xB5, 0xB6, 0xB7};
 constexpr u8 GXTexTlutIds[8] = {0x98, 0x99, 0x9A, 0x9B, 0xB8, 0xB9, 0xBA, 0xBB};
 constexpr u8 GX2HWFiltConv[6] = {0x00, 0x04, 0x01, 0x05, 0x02, 0x06};
-
-u32 sNextTexObjId = 1;
-u32 sNextTlutObjId = 1;
-
-u32 next_tex_obj_id() {
-  if (sNextTexObjId == 0) {
-    FATAL("texObj ID overflow");
-  }
-  return sNextTexObjId++;
-}
-
-u32 next_tlut_obj_id() {
-  if (sNextTlutObjId == 0) {
-    FATAL("tlutObj ID overflow");
-  }
-  return sNextTlutObjId++;
-}
 
 int __cntlzw(unsigned int val) {
   if (val == 0)
@@ -55,7 +39,6 @@ void init_texobj_common(GXTexObj_& obj, const void* data, u16 width, u16 height,
   obj.mFormat = format;
   obj.tlut = GX_TLUT0;
   obj.flags = 2;
-  obj.texObjId = next_tex_obj_id();
   obj.texDataVersion = 1;
 
   SET_REG_FIELD(0, obj.mode0, 2, 0, wrapS);
@@ -75,6 +58,9 @@ void init_texobj_common(GXTexObj_& obj, const void* data, u16 width, u16 height,
   SET_REG_FIELD(0, obj.image0, 4, 20, format & 0xF);
 
   obj.data = data;
+  // Provisional identity so an object destroyed before its first load still evicts correctly; GXLoadTexObj derives
+  // the final identity from the finished description.
+  obj.texObjId = aurora::gx::texture::texture_object_identity(obj);
 }
 
 void emit_loaded_texobj_metadata(const GXTexObj_& obj, GXTexMapID id) {
@@ -114,6 +100,7 @@ void GXInitTexObjCI(GXTexObj* obj_, const void* data, u16 width, u16 height, GXC
   init_texobj_common(*obj, data, width, height, format, wrapS, wrapT, mipmap);
   obj->tlut = static_cast<GXTlut>(tlut);
   obj->flags &= ~2u;
+  obj->texObjId = aurora::gx::texture::texture_object_identity(*obj);
 }
 
 void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, float minLod, float maxLod,
@@ -234,6 +221,10 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
   __gx->dirtyState |= 1;
   __gx->bpSent = 1;
 
+  // Libraries such as HSD build a temporary GXTexObj per material every frame, so a counter identity never repeats
+  // and every load would hash the whole image again. Derive the identity from the description instead; the texture
+  // cache verifies the source contents on reuse, so a stale or colliding identity only costs a cache miss.
+  obj->texObjId = aurora::gx::texture::texture_object_identity(*obj);
   emit_loaded_texobj_metadata(*obj, id);
 }
 
@@ -311,7 +302,7 @@ void GXInitTlutObj(GXTlutObj* obj_, const void* data, GXTlutFmt format, u16 entr
   obj->data = data;
   obj->format = format;
   obj->numEntries = entries;
-  obj->tlutObjId = next_tlut_obj_id();
+  obj->tlutObjId = aurora::gx::texture::tlut_object_identity(*obj);
   obj->tlutDataVersion = 1;
 
   SET_REG_FIELD(0, obj->tlut, 2, 10, format);
@@ -325,7 +316,9 @@ void GXInitTlutObjData(GXTlutObj* obj_, const void* data) {
 }
 
 void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
-  auto* obj = reinterpret_cast<const GXTlutObj_*>(obj_);
+  // The SDK signature is const, but the identity lives in Aurora's bookkeeping fields of the object.
+  auto* obj = reinterpret_cast<GXTlutObj_*>(const_cast<GXTlutObj*>(obj_));
+  obj->tlutObjId = aurora::gx::texture::tlut_object_identity(*obj);
   __GXFlushTextureState();
   GX_WRITE_RAS_REG(obj->loadTlut0);
 

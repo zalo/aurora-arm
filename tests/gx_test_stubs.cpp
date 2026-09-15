@@ -13,6 +13,7 @@
 #include "gfx/texture_replacement.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
+#include "gx/texture.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 
@@ -69,6 +70,34 @@ const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.t
 namespace texture {
 void invalidate_bindings() noexcept {}
 uint64_t current_bind_generation() noexcept { return 1; }
+// Description hashes standing in for the texture cache's identities (FNV-1a; never 0).
+u32 texture_object_identity(const GXTexObj_& obj) noexcept {
+  const uint64_t fields[] = {reinterpret_cast<uintptr_t>(obj.data),
+                             obj.width(),
+                             obj.height(),
+                             obj.format(),
+                             obj.mode0 & 0x00FFFFFFu,
+                             obj.mode1 & 0xFFFFu,
+                             obj.flags & 3u,
+                             static_cast<u32>(obj.tlut)};
+  u32 hash = 0x811C9DC5u;
+  for (const uint64_t field : fields) {
+    for (int shift = 0; shift < 64; shift += 8) {
+      hash = (hash ^ static_cast<u32>((field >> shift) & 0xFFu)) * 0x01000193u;
+    }
+  }
+  return hash != 0 ? hash : 1;
+}
+u32 tlut_object_identity(const GXTlutObj_& tlut) noexcept {
+  const uint64_t fields[] = {reinterpret_cast<uintptr_t>(tlut.data), static_cast<u32>(tlut.format), tlut.numEntries};
+  u32 hash = 0x811C9DC5u;
+  for (const uint64_t field : fields) {
+    for (int shift = 0; shift < 64; shift += 8) {
+      hash = (hash ^ static_cast<u32>((field >> shift) & 0xFFu)) * 0x01000193u;
+    }
+  }
+  return hash != 0 ? hash : 1;
+}
 } // namespace texture
 void evict_texture_object(u32 texObjId) noexcept {
   for (auto& obj : g_gxState.loadedTextures) {
