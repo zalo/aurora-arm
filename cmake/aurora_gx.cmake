@@ -114,6 +114,10 @@ if (AURORA_GLES_DIRECT)
         target_link_libraries(aurora_gx PRIVATE ${AURORA_GLESV2_LIBRARY} ${AURORA_EGL_LIBRARY})
     endif ()
 endif ()
+if (NOT AURORA_VERTEX_BUFFER_MIB EQUAL 5)
+    math(EXPR _aurora_vertex_buffer_size "${AURORA_VERTEX_BUFFER_MIB} * 1048576")
+    target_compile_definitions(aurora_gx PUBLIC AURORA_VERTEX_BUFFER_SIZE=${_aurora_vertex_buffer_size}ull)
+endif()
 
 if (AURORA_ENABLE_RMLUI)
     target_sources(aurora_gx PRIVATE

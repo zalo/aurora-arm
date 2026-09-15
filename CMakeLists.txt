@@ -15,6 +15,7 @@ option(AURORA_ENABLE_RMLUI "Enable HTML/CSS Based UI Library for use in end-user
 option(AURORA_CACHE_USE_ZSTD "Compress WebGPU cache entries with zstd" ON)
 option(AURORA_GLES_DIRECT "Submit GX render passes directly through OpenGL ES using Dawn's native GL interop extension (needs a Dawn build that has it and the GLES/EGL headers and libraries)" ON)
 option(AURORA_DEEP_TIMERS "Compile in the sampled nested CPU timers of lib/gfx/profile.hpp (enabled at run time with AURORA_DEEP_PROFILE=1)" OFF)
+set(AURORA_VERTEX_BUFFER_MIB 5 CACHE STRING "Per-frame vertex stream size in MiB (raise for cpuVertexDecode titles with heavy streamed geometry)")
 
 # Dependency versions
 include(cmake/AuroraDependencyVersions.cmake)
