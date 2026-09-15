@@ -23,7 +23,8 @@ Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
     const float replacementScale = static_cast<float>(tex.ref->size.width) / std::max(width, 1.f);
     vpBias = std::log2(viewportScale / std::max(replacementScale, 0.001f));
   }
-  return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
+  // .w: layer of the texture in its 2D array.
+  return {width, height, tex.texObj.lod_bias() + vpBias, tex.ref ? static_cast<float>(tex.ref->layer) : 0.0f};
 }
 
 void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& info) {

@@ -131,6 +131,22 @@ if (AURORA_ENABLE_GX)
   aurora_copy_runtime_dlls(gx_texture_cache_tests)
   gtest_discover_tests(gx_texture_cache_tests)
 
+  add_executable(gfx_texture_pool_tests
+    gfx_texture_pool_test.cpp
+  )
+  target_include_directories(gfx_texture_pool_tests PRIVATE
+    ../include
+    ../lib
+  )
+  target_compile_definitions(gfx_texture_pool_tests PRIVATE AURORA TARGET_PC)
+  target_link_libraries(gfx_texture_pool_tests PRIVATE
+    gtest
+    gtest_main
+    fmt::fmt
+    dawn::dawncpp_headers
+  )
+  gtest_discover_tests(gfx_texture_pool_tests)
+
   add_executable(texture_replacement_streaming_tests
     texture_replacement_streaming_test.cpp
   )
