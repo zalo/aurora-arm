@@ -70,6 +70,9 @@ template <typename T>
 Range push_verts(ArrayRef<T> data, size_t alignment) {
   return push_verts(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
+// Reserves `length` bytes of the frame's vertex stream for the caller to fill in place through `data`
+// (null when no frame is being recorded). The pointer is valid until the next push into the stream.
+Range map_verts(size_t length, size_t alignment, uint8_t*& data);
 Range push_indices(const uint8_t* data, size_t length, size_t alignment);
 template <typename T>
 Range push_indices(ArrayRef<T> data, size_t alignment) {

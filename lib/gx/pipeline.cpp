@@ -7,6 +7,7 @@
 
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
+#include "vertex_loader.hpp"
 
 #include <tracy/Tracy.hpp>
 
@@ -18,6 +19,16 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   const auto label =
       fmt::format("GX Pipeline {:x} shader {:x}", xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)),
                   xxh3_hash(config.shaderConfig));
+  if (config.shaderConfig.cpuVertexDecode) {
+    const auto layout = decoded_vertex_layout(config.shaderConfig);
+    const wgpu::VertexBufferLayout vertexBuffer{
+        .stepMode = wgpu::VertexStepMode::Vertex,
+        .arrayStride = layout.stride,
+        .attributeCount = layout.count,
+        .attributes = layout.attributes.data(),
+    };
+    return build_pipeline(config, {&vertexBuffer, 1}, shader, label.c_str());
+  }
   return build_pipeline(config, {}, shader, label.c_str());
 }
 
@@ -27,6 +38,9 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   }
 
   const auto& resources = gfx::detail::resources();
+  if (g_config.cpuVertexDecode) {
+    pass.SetVertexBuffer(0, resources.vertexBuffer, data.vertRange.offset, data.vertRange.size);
+  }
   pass.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
   const std::array offsets{data.uniformRange.offset};
   pass.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
