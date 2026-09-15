@@ -10,6 +10,7 @@
 #include "regs.hpp"
 #include "shader_info.hpp"
 #include "texture.hpp"
+#include "vertex_loader.hpp"
 
 #include <tracy/Tracy.hpp>
 
@@ -80,14 +81,25 @@ u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxC
       numIndices += 3;
     }
   } else if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) {
-    buf.reserve_extra(6 * sizeof(u16));
-    buf.append<u16>(0);
-    buf.append<u16>(1);
-    buf.append<u16>(3);
-    buf.append<u16>(3);
-    buf.append<u16>(2);
-    buf.append<u16>(0);
-    numIndices = 6;
+    if (g_config.cpuVertexDecode) {
+      // Quads expanded by the CPU vertex decoder: four vertices per segment or point
+      buf.reserve_extra((vtxCount / 4) * 6 * sizeof(u16));
+      for (u16 v = 0; v < vtxCount; v += 4) {
+        const u16 idx0 = vtxStart + v;
+        buf.append(std::array{idx0, static_cast<u16>(idx0 + 1), static_cast<u16>(idx0 + 3)});
+        buf.append(std::array{static_cast<u16>(idx0 + 3), static_cast<u16>(idx0 + 2), idx0});
+        numIndices += 6;
+      }
+    } else {
+      buf.reserve_extra(6 * sizeof(u16));
+      buf.append<u16>(0);
+      buf.append<u16>(1);
+      buf.append<u16>(3);
+      buf.append<u16>(3);
+      buf.append<u16>(2);
+      buf.append<u16>(0);
+      numIndices = 6;
+    }
   } else
     UNLIKELY FATAL("unsupported primitive type {}", static_cast<u32>(prim));
   return numIndices;
@@ -378,23 +390,10 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
   return vtxSize;
 }
 
-static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
-                         u32 numIndices) noexcept {
+// Resolves the pipeline for the current GX state, primitive and vertex format into sDrawCache.
+static void prepare_pipeline(GXPrimitive prim, GXVtxFmt fmt) noexcept {
   auto& state = g_gxState;
   auto& cache = sDrawCache;
-
-  DrawImmediateData immediates{.vtxStart = vertRange.offset, .currentPnMtx = state.currentPnMtx};
-  for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
-    if (state.vtxDesc[i] != GX_INDEX8 && state.vtxDesc[i] != GX_INDEX16) {
-      continue;
-    }
-    auto& array = state.arrays[i];
-    if (array.cachedRange.size == 0) {
-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
-    }
-    immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
-  }
-
   const u8 lineMode = line_mode_for_prim(prim);
   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
                              cache.lineMode == lineMode && cache.config.msaaSamples == gfx::get_sample_count();
@@ -414,6 +413,65 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       cache.bindGeneration = 0;
     }
   }
+}
+
+// CPU vertex decoding: converts the raw GX vertices of a draw into the frame's vertex stream with
+// the loader for the draw's pipeline configuration. Lines and points are expanded into quads here
+// (four records per segment or point) instead of by instancing in the vertex shader, so vtxCount
+// becomes the expanded vertex count.
+static gfx::Range push_decoded_verts(GXPrimitive prim, GXVtxFmt fmt, std::span<const u8> vertexData, u16& vtxCount,
+                                     size_t alignment) noexcept {
+  ZoneScoped;
+  prepare_pipeline(prim, fmt);
+  const auto& state = g_gxState;
+  const auto& config = sDrawCache.config.shaderConfig;
+  const auto& loader = vertex_loader(config);
+  AURORA_ASSERT(loader.vtxStride != 0 && vertexData.size() == static_cast<size_t>(vtxCount) * loader.vtxStride,
+                "vertex data of {} bytes does not hold {} vertices of {} bytes", vertexData.size(), vtxCount,
+                loader.vtxStride);
+  const size_t stride = loader.layout.stride;
+  u8* out = nullptr;
+  if (config.lineMode == 0) {
+    const gfx::Range range = gfx::map_verts(static_cast<size_t>(vtxCount) * stride, alignment, out);
+    if (out != nullptr) {
+      decode_vertices(loader, vertexData.data(), vtxCount, out, state.arrays, state.currentPnMtx);
+    }
+    return range;
+  }
+  const u32 instances = line_instance_count(config.lineMode, vtxCount);
+  AURORA_ASSERT(instances * 4 <= 0xFFFF, "too many line/point primitives in one draw ({})", instances);
+  // Decode into local memory, then stream the expanded quads out; the destination is never read.
+  static std::vector<u8> decoded;
+  decoded.resize(static_cast<size_t>(vtxCount) * stride);
+  decode_vertices(loader, vertexData.data(), vtxCount, decoded.data(), state.arrays, state.currentPnMtx);
+  vtxCount = static_cast<u16>(instances * 4);
+  const gfx::Range range = gfx::map_verts(static_cast<size_t>(vtxCount) * stride, alignment, out);
+  if (out != nullptr) {
+    expand_line_vertices(loader, decoded.data(), instances, out);
+  }
+  return range;
+}
+
+static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
+                         u32 numIndices) noexcept {
+  auto& state = g_gxState;
+  auto& cache = sDrawCache;
+
+  DrawImmediateData immediates{.vtxStart = vertRange.offset, .currentPnMtx = state.currentPnMtx};
+  if (!g_config.cpuVertexDecode) { // the CPU vertex decoder resolves indexed arrays itself
+    for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+      if (state.vtxDesc[i] != GX_INDEX8 && state.vtxDesc[i] != GX_INDEX16) {
+        continue;
+      }
+      auto& array = state.arrays[i];
+      if (array.cachedRange.size == 0) {
+        array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+      }
+      immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
+    }
+  }
+
+  prepare_pipeline(prim, fmt);
 
   const bool bindGroupsValid =
       (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
@@ -446,13 +504,17 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
 
   state.dirty &= ~DirtyImmediates;
 
+  // Lines and points draw one instance per segment or point, unless the CPU vertex decoder
+  // already expanded them into quads.
   uint32_t instanceCount = 1;
-  if (prim == GX_LINES) {
-    instanceCount = vtxCount / 2;
-  } else if (prim == GX_LINESTRIP) {
-    instanceCount = vtxCount - 1;
-  } else if (prim == GX_POINTS) {
-    instanceCount = vtxCount;
+  if (!g_config.cpuVertexDecode) {
+    if (prim == GX_LINES) {
+      instanceCount = vtxCount / 2;
+    } else if (prim == GX_LINESTRIP) {
+      instanceCount = vtxCount - 1;
+    } else if (prim == GX_POINTS) {
+      instanceCount = vtxCount;
+    }
   }
   cache.lastDrawFmt = fmt;
   gfx::push_draw_command(DrawData{
@@ -502,9 +564,12 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
   const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1;
 
-  // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
+  // Push vertex data to the buffer, raw or decoded on the CPU. Merged draws must remain contiguous
+  // with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
-  gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
+  const gfx::Range vertRange = g_config.cpuVertexDecode
+                                   ? push_decoded_verts(prim, fmt, vertexData, vtxCount, canMerge ? 0 : 4)
+                                   : gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
 
   // Try to merge with previous draw call
   if (canMerge) {
@@ -723,7 +788,7 @@ void handle_aurora(ByteReader& reader) noexcept {
   } else if (subCmd == GX_AURORA_DRAW_INDEXED) {
     ZoneScopedN("DRAW_INDEXED");
     const u8 cmd = reader.read<u8>();
-    const u16 vtxCount = reader.read<u16>();
+    u16 vtxCount = reader.read<u16>();
     const u32 indexCount = reader.read<u32>();
     const GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
     const GXPrimitive prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
@@ -741,7 +806,8 @@ void handle_aurora(ByteReader& reader) noexcept {
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
     const auto vertexData = reader.take(totalVtxBytes);
-    const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+    const gfx::Range vertRange = g_config.cpuVertexDecode ? push_decoded_verts(prim, fmt, vertexData, vtxCount, 4)
+                                                          : gfx::push_verts(vertexData.data(), vertexData.size(), 4);
     if (indexCount != 0) {
       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
     }

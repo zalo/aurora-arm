@@ -6,6 +6,7 @@
 #include "gx.hpp"
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
+#include "vertex_loader.hpp"
 
 #include <dolphin/gx/GXEnum.h>
 
@@ -687,10 +688,51 @@ auto attr_address(const AttrConfig& mapping, GXAttr attr, std::string_view vidx,
   return {fmt::format("imm.vtx_start + {} * {}u + {}u", vidx, vtxStride, dlOffset + within), "vbuf"sv, false};
 }
 
+// CPU-decoded vertex input: attributes arrive through @location inputs (see vertex_loader.hpp).
+// `lineEnd` selects the end vertex of a line segment, which travels in v_line_end.
+auto decoded_attr_load(GXAttr attr, bool lineEnd) -> std::string {
+  switch (attr) {
+  case GX_VA_PNMTXIDX:
+    return lineEnd ? "u32(v_line_end.w)"s : "(v_matrices.x & 255u)"s;
+  case GX_VA_TEX0MTXIDX:
+  case GX_VA_TEX1MTXIDX:
+  case GX_VA_TEX2MTXIDX:
+  case GX_VA_TEX3MTXIDX:
+  case GX_VA_TEX4MTXIDX:
+  case GX_VA_TEX5MTXIDX:
+  case GX_VA_TEX6MTXIDX:
+  case GX_VA_TEX7MTXIDX: {
+    const u32 idx = attr - GX_VA_PNMTXIDX;
+    return fmt::format("((v_matrices.{} >> {}u) & 255u)", "xyz"[idx / 4], (idx % 4) * 8);
+  }
+  case GX_VA_POS:
+    return lineEnd ? "v_line_end.xyz"s : "v_pos"s;
+  case GX_VA_NRM:
+    return "v_nrm"s;
+  case GX_VA_CLR0:
+  case GX_VA_CLR1:
+    return fmt::format("v_clr{}", attr - GX_VA_CLR0);
+  case GX_VA_TEX0:
+  case GX_VA_TEX1:
+  case GX_VA_TEX2:
+  case GX_VA_TEX3:
+  case GX_VA_TEX4:
+  case GX_VA_TEX5:
+  case GX_VA_TEX6:
+  case GX_VA_TEX7:
+    return fmt::format("v_tex{}", attr - GX_VA_TEX0);
+  default:
+    Log.fatal("decoded_attr_load: Unimplemented {}", attr);
+  }
+}
+
 auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -> std::string {
   const auto& mapping = config.attrs[attr];
   if (mapping.attrType == GX_NONE) {
     return vtx_attr(config, attr);
+  }
+  if (config.cpuVertexDecode) {
+    return decoded_attr_load(attr, vidx == "vidx_b"sv);
   }
   const auto [offs, buf, le] = attr_address(mapping, attr, vidx, config.vtxStride, 0u, 0u);
   switch (attr) {
@@ -752,6 +794,9 @@ auto attr_load_nbt_slice(const ShaderConfig& config, NbtSlice slice, std::string
   const auto& mapping = config.attrs[GX_VA_NRM];
   if (mapping.attrType == GX_NONE || mapping.cnt != 9) {
     Log.fatal("attr_load_nbt_slice: GX_TG_BINRM/TANGENT requires GX_NRM_NBT or GX_NRM_NBT3");
+  }
+  if (config.cpuVertexDecode) {
+    return slice == NbtSlice::B ? "v_binrm"s : "v_tangent"s;
   }
   const auto sliceIdx = static_cast<u32>(slice);
   const auto compsize = comp_type_size(GX_VA_NRM, static_cast<GXCompType>(mapping.compType));
@@ -951,30 +996,59 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
   std::string vtxXfrAttrs;
   size_t vtxOutIdx = 0;
 
+  // Vertex inputs: the vertex index for storage buffer fetches, or the CPU-decoded attributes
+  if (config.cpuVertexDecode) {
+    constexpr std::array<std::string_view, MaxDecodedVertexAttrs> DecodedInputs{
+        "v_matrices: vec3u"sv, "v_pos: vec3f"sv,   "v_nrm: vec3f"sv,     "v_clr0: vec4f"sv,
+        "v_clr1: vec4f"sv,     "v_tex0: vec2f"sv,  "v_tex1: vec2f"sv,    "v_tex2: vec2f"sv,
+        "v_tex3: vec2f"sv,     "v_tex4: vec2f"sv,  "v_tex5: vec2f"sv,    "v_tex6: vec2f"sv,
+        "v_tex7: vec2f"sv,     "v_binrm: vec3f"sv, "v_tangent: vec3f"sv, "v_line_end: vec4f"sv,
+    };
+    for (u32 i = 0; i < DecodedInputs.size(); ++i) {
+      if (decoded_vertex_has_location(config, i)) {
+        vtxInAttrs += fmt::format("{}\n    @location({}) {}", vtxInAttrs.empty() ? "" : ",", i, DecodedInputs[i]);
+      }
+    }
+  } else {
+    vtxInAttrs += "\n    @builtin(vertex_index) vidx: u32";
+    if (config.lineMode != 0) {
+      vtxInAttrs += ",\n    @builtin(instance_index) iidx: u32";
+    }
+  }
+
   // Load points for line/point expansion
   std::string_view vidxAttr = "vidx"sv;
   if (config.lineMode != 0) {
-    vtxInAttrs += ",\n    @builtin(instance_index) iidx: u32";
     uniBufAttrs +=
         "\n    line_width: f32,"
         "\n    line_aspect_y: f32,"
         "\n    line_tex_offset: f32,"
         "\n    line_texcoord_mask: u32,";
+    if (config.cpuVertexDecode) {
+      // Quads were expanded by the CPU vertex decoder; the corner index travels with the vertex
+      vtxXfrAttrsPre += "\n    let vidx = v_matrices.z >> 24u;";
+    }
     if (config.lineMode == 3) {
       // GX_POINTS: each instance = one vertex, expand to quad
+      if (!config.cpuVertexDecode) {
+        vtxXfrAttrsPre += "\n    let in_vidx = iidx;";
+      }
       vtxXfrAttrsPre += fmt::format(
-          "\n    let in_vidx = iidx;"
           "\n    let in_pos = {};"
           "\n    let in_pnmtxidx = {};"
           "\n    let mv_pos = vec4f(in_pos, 1.0) * ubuf.postex_mtx[in_pnmtxidx];",
           attr_load(config, GX_VA_POS, "in_vidx"sv), attr_load(config, GX_VA_PNMTXIDX, "in_vidx"sv));
     } else {
       // GX_LINES / GX_LINESTRIP: each instance = two vertices, expand to quad
+      vtxXfrAttrsPre += "\n    let use_b = vidx >= 2u;";
+      if (!config.cpuVertexDecode) {
+        vtxXfrAttrsPre += fmt::format(
+            "\n    let vidx_a = iidx * {}u;"
+            "\n    let vidx_b = vidx_a + 1u;"
+            "\n    let in_vidx = select(vidx_a, vidx_b, use_b);",
+            config.lineMode == 1 ? 2 : 1);
+      }
       vtxXfrAttrsPre += fmt::format(
-          "\n    let use_b = vidx >= 2u;"
-          "\n    let vidx_a = iidx * {}u;"
-          "\n    let vidx_b = vidx_a + 1u;"
-          "\n    let in_vidx = select(vidx_a, vidx_b, use_b);"
           "\n    let pos_a = {};"
           "\n    let pos_b = {};"
           "\n    let in_pos = select(pos_a, pos_b, use_b);"
@@ -984,9 +1058,8 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
           "\n    let mv_pos_a = vec4f(pos_a, 1.0) * ubuf.postex_mtx[pnmtxidx_a];"
           "\n    let mv_pos_b = vec4f(pos_b, 1.0) * ubuf.postex_mtx[pnmtxidx_b];"
           "\n    let mv_pos = select(mv_pos_a, mv_pos_b, use_b);",
-          config.lineMode == 1 ? 2 : 1, attr_load(config, GX_VA_POS, "vidx_a"sv),
-          attr_load(config, GX_VA_POS, "vidx_b"sv), attr_load(config, GX_VA_PNMTXIDX, "vidx_a"sv),
-          attr_load(config, GX_VA_PNMTXIDX, "vidx_b"sv));
+          attr_load(config, GX_VA_POS, "vidx_a"sv), attr_load(config, GX_VA_POS, "vidx_b"sv),
+          attr_load(config, GX_VA_PNMTXIDX, "vidx_a"sv), attr_load(config, GX_VA_PNMTXIDX, "vidx_b"sv));
     }
     vidxAttr = "in_vidx"sv;
   } else if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
@@ -1984,8 +2057,7 @@ struct VertexOutput {{
 }};
 
 @vertex
-fn vs_main(
-    @builtin(vertex_index) vidx: u32{3}
+fn vs_main({3}
 ) -> VertexOutput {{
     var out: VertexOutput;{7}{4}
     return out;
