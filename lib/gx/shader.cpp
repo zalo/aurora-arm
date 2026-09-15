@@ -1336,7 +1336,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     fragmentFnPre += fmt::format(
         "\n    // Indirect stage {0}"
         "\n    var t_IndTexCoord{0} = 255.0 * textureSampleBias(tex{1}, tex{1}_samp, {2}, "
-        "ubuf.tex{1}_size_bias.z).abg;",
+        "i32(ubuf.tex{1}_size_bias.w), ubuf.tex{1}_size_bias.z).abg;",
         i, texMapId, scaleExpr);
   }
   if (info.usedIndStages.any()) {
@@ -1514,9 +1514,10 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
       // No indirect texturing
       uvIn = fmt::format("tex{0}_uv", underlying(stage.texCoordId));
     }
-    fragmentFnPre +=
-        fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
-                    underlying(stage.texMapId), uvIn);
+    fragmentFnPre += fmt::format(
+        "\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, i32(ubuf.tex{1}_size_bias.w), "
+        "ubuf.tex{1}_size_bias.z);",
+        i, underlying(stage.texMapId), uvIn);
   }
   if (info.usesPTTexMtx.any()) {
     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
@@ -1580,10 +1581,11 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     if (!info.sampledTextures.test(i)) {
       continue;
     }
+    // Size, LOD bias and array layer of the texture (see texture_size_bias).
     uniBufAttrs += fmt::format("\n    tex{}_size_bias: vec4f,", i);
     texBindings += fmt::format(
         "\n@group(2) @binding({1})\n"
-        "var tex{0}: texture_2d<f32>;\n"
+        "var tex{0}: texture_2d_array<f32>;\n"
         "@group(2) @binding({2})\n"
         "var tex{0}_samp: sampler;",
         i, i * 2, i * 2 + 1);

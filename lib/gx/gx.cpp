@@ -33,8 +33,7 @@ wgpu::BindGroup g_emptyTextureBindGroup;
 
 namespace {
 wgpu::Sampler sEmptySampler;
-wgpu::Texture sEmptyTexture;
-wgpu::TextureView sEmptyTextureView;
+gfx::TextureHandle sEmptyTexture;
 std::mutex sBindGroupLayoutMutex;
 absl::flat_hash_map<u32, wgpu::BindGroupLayout> sUniformBindGroupLayouts;
 absl::flat_hash_map<u32, std::pair<wgpu::BindGroupLayout, wgpu::BindGroupLayout>> sTextureBindGroupLayouts;
@@ -487,7 +486,7 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
       textureEntry.textureView = tex.ref->sampleTextureView.Get();
       samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor()).Get();
     } else {
-      textureEntry.textureView = sEmptyTextureView.Get();
+      textureEntry.textureView = sEmptyTexture->sampleTextureView.Get();
       samplerEntry.sampler = sEmptySampler.Get();
     }
   }
@@ -512,7 +511,7 @@ void initialize() noexcept {
           .texture =
               {
                   .sampleType = wgpu::TextureSampleType::Float,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
+                  .viewDimension = wgpu::TextureViewDimension::e2DArray,
               },
       };
       textureEntries[i * 2 + 1] = {
@@ -532,22 +531,13 @@ void initialize() noexcept {
     constexpr wgpu::SamplerDescriptor descriptor{.label = "Empty sampler"};
     sEmptySampler = gfx::sampler_ref(descriptor);
   }
-  {
-    constexpr wgpu::TextureDescriptor descriptor{
-        .label = "Empty texture",
-        .usage = wgpu::TextureUsage::TextureBinding,
-        .size = {1, 1},
-        .format = wgpu::TextureFormat::RGBA8Unorm,
-    };
-    sEmptyTexture = g_device.CreateTexture(&descriptor);
-    sEmptyTextureView = sEmptyTexture.CreateView();
-  }
+  sEmptyTexture = gfx::new_dynamic_texture_2d(1, 1, 1, GX_TF_RGBA8_PC, "Empty texture");
   {
     std::array<wgpu::BindGroupEntry, MaxTextures * 2> entries;
     for (u32 i = 0; i < MaxTextures; ++i) {
       entries[i * 2] = {
           .binding = i * 2,
-          .textureView = sEmptyTextureView,
+          .textureView = sEmptyTexture->sampleTextureView,
       };
       entries[i * 2 + 1] = {
           .binding = i * 2 + 1,

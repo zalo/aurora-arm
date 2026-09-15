@@ -630,7 +630,8 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
 #endif
       const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
-                                          {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr);
+                                          {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr,
+                                          gfx::texture_class(obj));
       ++s_stats.misses;
       s_stats.uploadBytes += texture_handle_size(handle);
       cache_content_texture(std::move(keys->contentKey), handle);
@@ -685,7 +686,7 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
       }
       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
                                           {converted.data.data(), converted.data.size()}, false,
-                                          "GX Static Palette Texture");
+                                          "GX Static Palette Texture", gfx::texture_class(obj));
       handle->hasArbitraryMips = converted.hasArbitraryMips;
       ++s_stats.misses;
       s_stats.uploadBytes += texture_handle_size(handle);
@@ -834,10 +835,11 @@ void evict_copy_texture(const void* dest) noexcept {
   texture::invalidate_bindings();
 }
 
-void resolve_sampled_textures(const ShaderInfo& info) noexcept {
+bool resolve_sampled_textures(const ShaderInfo& info) noexcept {
   ZoneScoped;
   apply_pending_invalidations();
 
+  bool rebound = false;
   for (u32 i = 0; i < MaxTextures; ++i) {
     if (!info.sampledTextures.test(i)) {
       continue;
@@ -873,7 +875,12 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     }
 
     obj.mFormat = resolved_format_for_handle(handle);
+    // Textures in one array share a bind group, so the caller cannot see a
+    // change of texture there: report what texture_size_bias depends on.
+    rebound |= textureBind.ref != handle || textureBind.texObj.width() != obj.width() ||
+               textureBind.texObj.height() != obj.height() || textureBind.texObj.mode0 != obj.mode0;
     textureBind = gfx::TextureBind{obj, std::move(handle), s_bindGeneration};
   }
+  return rebound;
 }
 } // namespace aurora::gx

@@ -419,12 +419,13 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
   if (!bindGroupsValid) {
     const auto prevBindGroup = cache.bindGroups.textureBindGroup;
-    resolve_sampled_textures(cache.shaderInfo);
+    const bool rebound = resolve_sampled_textures(cache.shaderInfo);
     cache.bindGroups = build_bind_groups(cache.shaderInfo);
     cache.bindGeneration = texture::current_bind_generation();
     state.dirty &= ~DirtyTextures;
-    // For texture_size_bias uniform
-    if (cache.bindGroups.textureBindGroup != prevBindGroup) {
+    // For the texture_size_bias uniform (size, LOD bias, array layer): a
+    // different texture in the same array keeps the bind group.
+    if (rebound || cache.bindGroups.textureBindGroup != prevBindGroup) {
       state.dirty |= DirtyUniform;
     }
   }

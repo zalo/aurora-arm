@@ -450,7 +450,8 @@ void set_logical_scissor(const gfx::ClipRect& scissor) noexcept;
 void set_render_scissor(const gfx::ClipRect& scissor) noexcept;
 void copy_tex(const void* dest, GXBool clear) noexcept;
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept;
-void resolve_sampled_textures(const ShaderInfo& info) noexcept;
+// Returns true when a binding changed in a way the uniform record depends on.
+bool resolve_sampled_textures(const ShaderInfo& info) noexcept;
 
 inline float clear_depth_value() {
   const float normalizedDepth = static_cast<float>(g_gxState.clearDepth) / 16777215.f;

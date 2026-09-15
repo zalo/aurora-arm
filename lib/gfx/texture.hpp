@@ -1,6 +1,7 @@
 #pragma once
 #include <dolphin/gx.h>
 
+#include <optional>
 #include <utility>
 
 #include "types.hpp"
@@ -43,6 +44,10 @@ struct TextureRef {
   u32 gxFormat;
   bool hasArbitraryMips = false;
   bool isReplacement = false;
+  // Array layer of `texture` holding this image. GX textures are layers of
+  // shared 2D array textures and `sampleTextureView` views the whole array;
+  // the layer reaches the shader through the uniform record.
+  uint32_t layer = 0;
 
   TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
              wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
@@ -55,13 +60,24 @@ struct TextureRef {
   , gxFormat(gxFormat) {}
 };
 
+// Sampler class of a GX texture object (see texture_class). Textures of one
+// class, size, mip count and format are allocated as layers of a shared 2D
+// array texture, so draws that differ only by texture keep their bind group
+// and can merge. Without a class a texture gets its own single-layer array.
+struct TextureClass {
+  uint64_t sampler = 0;
+};
+
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-                                    ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
-TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-                                     const char* label) noexcept;
+                                    ArrayRef<uint8_t> data, bool tlut, const char* label,
+                                    std::optional<TextureClass> textureClass = std::nullopt) noexcept;
+TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat, const char* label,
+                                     std::optional<TextureClass> textureClass = std::nullopt) noexcept;
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
+// Drops the pool of shared array textures; layers still referenced stay alive.
+void shutdown_texture_pool() noexcept;
 }; // namespace aurora::gfx
 
 struct GXTexObj_ {
@@ -141,4 +157,11 @@ struct TextureBind {
   [[nodiscard]] wgpu::SamplerDescriptor get_descriptor() const noexcept;
   operator bool() const noexcept { return ref.operator bool(); }
 };
+
+// The sampler state TextureBind::get_descriptor reads: wrap modes, filters and
+// anisotropy from mode0, LOD clamps from mode1. The LOD bias is a uniform.
+inline TextureClass texture_class(const GXTexObj_& obj) noexcept {
+  constexpr u32 SamplerMode0Mask = 0xFFu | (3u << 19);
+  return {.sampler = (obj.mode0 & SamplerMode0Mask) | (static_cast<uint64_t>(obj.mode1) << 32)};
+}
 } // namespace aurora::gfx
