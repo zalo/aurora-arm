@@ -15,7 +15,7 @@
 //
 //   location  input            contents
 //   0         v_matrices vec3u one matrix index per byte (PNMTXIDX, TEX0..7MTXIDX), quad corner in
-//                              bits 24-31 of .z for lines/points
+//                              bits 24-31 of .z for lines
 //   1         v_pos      vec3f
 //   2         v_nrm      vec3f
 //   3, 4      v_clr0/1   vec4f
@@ -29,6 +29,12 @@
 // exactly once, so the destination needs no clearing and can be frame storage that is only ever
 // written. Measured on a Mali-G52 handheld (Miyoo Flip) running Melee, this took the FIFO
 // translation worker from 28.6 to 24.4 ms/frame on the Onett stage.
+//
+// GX_LINES and GX_LINESTRIP are expanded into quads on the CPU (expand_line_vertices). GX_POINTS
+// keep one record per point: the pipeline steps the vertex buffer per instance and the draw renders
+// one instance of a shared six-index quad per point, whose vertex index is the corner. On the same
+// device this took Melee's Fountain of Dreams (~25k point sprites per frame) from 25 to 21 ms on the
+// FIFO translation worker by not writing every point four times.
 namespace aurora::gx {
 
 constexpr u32 MaxDecodedVertexAttrs = 16;
@@ -87,11 +93,12 @@ void decode_vertices(const VertexLoader& loader, const u8* raw, size_t count, u8
 // (3) draw.
 u32 line_instance_count(u8 lineMode, u32 vtxCount) noexcept;
 
-// Expands `instances` line segments or points from records decoded with `loader` into four quad
-// corners each, writing exactly instances * 4 * loader.layout.stride bytes to `out`. Every corner
-// carries the start position and PN matrix index; corners 2 and 3 take the remaining attributes of
-// the end vertex; the end position and PN matrix index travel in v_line_end and the corner index in
-// bits 24-31 of v_matrices.z, matching the instanced expansion of the storage-buffer vertex shader.
+// Expands `instances` line segments (or points, though the command processor draws those as
+// instances) from records decoded with `loader` into four quad corners each, writing exactly
+// instances * 4 * loader.layout.stride bytes to `out`. Every corner carries the start position and
+// PN matrix index; corners 2 and 3 take the remaining attributes of the end vertex; the end position
+// and PN matrix index travel in v_line_end and the corner index in bits 24-31 of v_matrices.z,
+// matching the instanced expansion of the storage-buffer vertex shader.
 // Records are assembled in local memory and streamed to `out`, which is never read back: on a
 // write-combined mapped destination a single 4-byte read per record cost ~20 ms/frame.
 void expand_line_vertices(const VertexLoader& loader, const u8* decoded, size_t instances, u8* out) noexcept;
