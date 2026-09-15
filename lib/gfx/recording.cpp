@@ -13,6 +13,8 @@
 #include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
+#include "profile.hpp"
+#include "sprite_pass.hpp"
 #include "../gx/resident_geometry.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -21,6 +23,8 @@
 
 #include <algorithm>
 #include <array>
+#include <unordered_set>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <new>
@@ -113,6 +117,33 @@ uint8_t current_write_mask() noexcept {
 
 void pass_fusion_split();
 bool is_clear_draw(const DrawCommand& command) noexcept;
+
+// Half-resolution sprite segment (sprite_pass.hpp): while active, GX point draws are recorded into the
+// half-size sprite pass with viewport and scissor at half scale; the EFB pass resumes when it ends.
+struct SpriteSegment {
+  bool active = false;
+  uint32_t framePoints = 0;
+  uint32_t prevFramePoints = 0;
+  Viewport savedViewport{};
+  ClipRect savedScissor{};
+  unsigned frames = 0, segments = 0, points = 0, refused = 0;
+  std::array<unsigned, 6> refusedBy{}; // line mode, blend mode, factors, depth write, dst alpha, color update
+};
+SpriteSegment g_sprites;
+} // namespace
+void sprite_segment_end();
+void sprite_segment_frame_end();
+namespace {
+
+// Small copy pass interval (AuroraConfig::smallCopyPassInterval): small color render-to-texture passes are
+// rendered every Nth frame and dropped in between, their copy texture keeping its last image.
+struct SmallCopyPasses {
+  uint64_t frame = 0;
+  std::unordered_set<const TextureRef*> rendered; // targets that hold a valid image
+  unsigned skipped = 0, renderedCount = 0;
+};
+SmallCopyPasses g_smallCopies;
+uint32_t small_copy_pass_interval() noexcept { return std::max<uint32_t>(g_config.smallCopyPassInterval, 1u); }
 
 std::string pass_label(std::string_view kind) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -374,6 +405,25 @@ void push_command(CommandType type, const Command::Data& data) {
       break;
     }
   }
+  if (g_sprites.active) {
+    // Half-resolution sprite pass: viewport and scissor at half scale.
+    if (type == CommandType::SetViewport) {
+      shifted = *payload;
+      auto& vp = shifted.setViewport;
+      vp.left *= 0.5f;
+      vp.top *= 0.5f;
+      vp.width *= 0.5f;
+      vp.height *= 0.5f;
+      payload = &shifted;
+    } else if (type == CommandType::SetScissor) {
+      shifted = *payload;
+      auto& sc = shifted.setScissor;
+      const int32_t x0 = sc.x >> 1, y0 = sc.y >> 1;
+      const int32_t x1 = (sc.x + sc.width + 1) >> 1, y1 = (sc.y + sc.height + 1) >> 1;
+      sc = {x0, y0, std::max(x1 - x0, 0), std::max(y1 - y0, 0)};
+      payload = &shifted;
+    }
+  }
   auto& renderPass = current_render_passes()[g_recorder.currentRenderPass];
   AURORA_ASSERT(!renderPass.sealed, "Attempted to append command {} to sealed render pass {}",
                 magic_enum::enum_name(type), g_recorder.currentRenderPass);
@@ -514,6 +564,7 @@ void suspend_efb() {
                 "suspend_efb called outside of an active recording frame");
   AURORA_ASSERT(!g_recorder.inOffscreen, "suspend_efb called while offscreen rendering is active");
   AURORA_ASSERT(!g_recorder.suspendedEfbPass, "suspend_efb called with an EFB pass already suspended");
+  sprite_segment_settle();
   pass_fusion_split();
 
   auto& currentPass = current_render_passes()[g_recorder.currentRenderPass];
@@ -623,6 +674,9 @@ void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
 namespace detail {
 
 void begin_recording(FramePacket& packet, size_t frameSlot) {
+  if (profile::enabled()) {
+    profile::fifoFrame.store(packet.frameId, std::memory_order_release);
+  }
   CHECK(!g_recorder.active(), "A recording session is already active");
   g_recorder.packet = &packet;
   g_recorder.frameSlot = frameSlot;
@@ -690,6 +744,8 @@ void shutdown_recording() {
   g_recorder.frameSlot = 0;
   g_recorder.suppressRenderWorker = false;
   g_passFusion = {};
+  g_sprites = {};
+  g_smallCopies = {};
 }
 
 namespace testing {
@@ -783,6 +839,7 @@ void queue_texture_copy(wgpu::TexelCopyTextureInfo src, wgpu::TexelCopyTextureIn
   ZoneScoped;
   auto& frame = current_frame_packet();
   if (g_recorder.currentRenderPass != UINT32_MAX) {
+    sprite_segment_settle();
     pass_fusion_split();
     enqueue_pass(frame, g_recorder.currentRenderPass);
     g_recorder.currentRenderPass = UINT32_MAX;
@@ -803,6 +860,7 @@ void begin_color_pass(const ColorPassDescriptor& desc) {
   ZoneScoped;
   auto& frame = current_frame_packet();
   if (g_recorder.currentRenderPass != UINT32_MAX) {
+    sprite_segment_settle();
     pass_fusion_split();
     enqueue_pass(frame, g_recorder.currentRenderPass);
   }
@@ -893,6 +951,7 @@ void set_scissor(const ClipRect& cmd) noexcept {
 template <>
 void push_draw_command(clear::DrawData data) {
   // A clear draw covers the whole target: it cannot be part of a shifted segment.
+  sprite_segment_settle();
   pass_fusion_split();
   push_draw_command(make_draw_command<clear::render>(data));
 }
@@ -1176,8 +1235,148 @@ void on_copy_texture_sampled(const TextureHandle& handle) noexcept {
   }
 }
 
+namespace {
+void append_encoder_task(FramePacket& frame, EncoderTaskId type) {
+  const auto taskIndex = static_cast<uint32_t>(frame.encoderTasks.size());
+  frame.encoderTasks.emplace_back(EncoderTask{.type = type});
+  const auto opIndex = static_cast<uint32_t>(frame.ops.size());
+  frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::EncoderTask, taskIndex));
+  enqueue_op(frame, opIndex);
+}
+
+// Sprites the half-size pass can take: alpha-tested opaque sprites or SRCALPHA blends onto INVSRCALPHA / ONE,
+// color writes on, no destination alpha. Depth-writing sprites only update the half-size depth (geometry drawn
+// after them is not occluded by them), an approximation counted but accepted.
+bool sprite_eligible(const gx::PipelineConfig& c) {
+  bool ok = true;
+  if (c.shaderConfig.lineMode != 3) {
+    ++g_sprites.refusedBy[0];
+    ok = false;
+  }
+  if (c.blendMode != GX_BM_BLEND && c.blendMode != GX_BM_NONE) {
+    ++g_sprites.refusedBy[1];
+    ok = false;
+  }
+  if (c.blendMode == GX_BM_BLEND &&
+      !(c.blendFacSrc == GX_BL_SRCALPHA && (c.blendFacDst == GX_BL_INVSRCALPHA || c.blendFacDst == GX_BL_ONE))) {
+    ++g_sprites.refusedBy[2];
+    ok = false;
+  }
+  if (c.depthCompare && c.depthUpdate) {
+    ++g_sprites.refusedBy[3];
+  }
+  if (c.dstAlpha != UINT32_MAX) {
+    ++g_sprites.refusedBy[4];
+    ok = false;
+  }
+  if (!c.colorUpdate) {
+    ++g_sprites.refusedBy[5];
+    ok = false;
+  }
+  return ok;
+}
+
+void sprite_segment_begin() {
+  auto& frame = current_frame_packet();
+  pass_fusion_split();
+  g_sprites.savedViewport = g_recorder.cachedViewport;
+  g_sprites.savedScissor = g_recorder.cachedScissor;
+  // Seal the EFB pass so far, prepare the half-size targets (clear, depth downsample), then record the sprites
+  // into the half-size pass.
+  enqueue_pass(frame, g_recorder.currentRenderPass);
+  g_recorder.currentRenderPass = UINT32_MAX;
+  append_encoder_task(frame, sprite_pass::prep_task());
+  const auto& color = sprite_pass::color_target();
+  const auto& depth = sprite_pass::depth_target();
+  begin_color_pass(ColorPassDescriptor{
+      .label = "Sprites",
+      .colorView = color.view,
+      .colorFormat = color.format,
+      .depthStencilView = depth.view,
+      .depthStencilFormat = depth.format,
+      .targetSize = color.size,
+      .colorLoadOp = wgpu::LoadOp::Load,
+      .colorStoreOp = wgpu::StoreOp::Store,
+      .hasDepth = true,
+      .depthLoadOp = wgpu::LoadOp::Load,
+      .depthStoreOp = wgpu::StoreOp::Store,
+  });
+  g_recorder.cachedViewport = g_sprites.savedViewport;
+  g_recorder.cachedScissor = g_sprites.savedScissor;
+  g_sprites.active = true; // from here push_command records viewport and scissor at half scale
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+  ++g_sprites.segments;
+}
+} // namespace
+
+void sprite_segment_end() {
+  g_sprites.active = false;
+  auto& frame = current_frame_packet();
+  end_color_pass();
+  append_encoder_task(frame, sprite_pass::composite_task());
+  // Resume the EFB pass, loading its contents.
+  auto& pass = current_render_passes().emplace_back();
+  pass.label = pass_label("EFB");
+  set_efb_targets(pass);
+  for (uint32_t i = 0; i < pass.colorAttachmentCount; ++i) {
+    pass.colorAttachments[i].clear = false;
+    pass.colorAttachments[i].loadOp = wgpu::LoadOp::Undefined;
+  }
+  pass.clearDepth = false;
+  pass.commands.reserve(2048);
+  g_recorder.currentRenderPass = static_cast<uint32_t>(current_render_passes().size() - 1);
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+}
+
+void sprite_segment_frame_end() {
+  auto& s = g_sprites;
+  s.prevFramePoints = s.framePoints;
+  s.framePoints = 0;
+  if (++s.frames % 600 == 0 && g_config.renderStats && sprite_pass::enabled()) {
+    std::fprintf(stderr,
+                 "[sprite-pass] frames=%u segments=%u points=%u refused=%u (line=%u blend=%u factors=%u zwrite=%u "
+                 "dstalpha=%u color=%u) last_frame_points=%u\n",
+                 s.frames, s.segments, s.points, s.refused, s.refusedBy[0], s.refusedBy[1], s.refusedBy[2],
+                 s.refusedBy[3], s.refusedBy[4], s.refusedBy[5], s.prevFramePoints);
+    s.segments = s.points = s.refused = 0;
+    s.refusedBy = {};
+  }
+}
+
+bool sprite_point_draw(const gx::PipelineConfig& config, uint32_t points) {
+  auto& s = g_sprites;
+  s.framePoints += points;
+  if (!sprite_pass::enabled() || !g_recorder.active() || g_recorder.inOffscreen ||
+      g_recorder.currentRenderPass == UINT32_MAX) {
+    sprite_segment_settle();
+    return false;
+  }
+  if (!sprite_eligible(config)) {
+    ++s.refused;
+    sprite_segment_settle();
+    return false;
+  }
+  if (!s.active) {
+    if (s.prevFramePoints < sprite_pass::threshold()) {
+      return false;
+    }
+    sprite_segment_begin();
+  }
+  s.points += points;
+  return s.active;
+}
+
+void sprite_segment_settle() {
+  if (g_sprites.active) {
+    sprite_segment_end();
+  }
+}
+
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat) {
+  sprite_segment_settle();
   bool fusedSecond = false;
   if (g_passFusion.active) {
     fusedSecond = pass_fusion_complete(texture, rect, clearColor, clearAlpha, clearDepth, resolveFormat);
@@ -1187,6 +1386,35 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
   }
   // Resolve current render pass
   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
+  // Small copy pass interval: a small color-format target rendered by its own pass (a reflection camera) is
+  // rendered only every Nth frame once it holds an image; in between the pass is discarded before it reaches
+  // the render worker and the texture keeps its last image. Only when the copy clears color (the pass's EFB
+  // content is not used afterwards). Intensity formats (shadow maps) and depth copies stay every-frame.
+  const bool colorFormat = resolveFormat != GX_CTF_R4 && resolveFormat != GX_TF_I4 && resolveFormat != GX_TF_I8 &&
+                           resolveFormat != GX_TF_IA4 && resolveFormat != GX_TF_IA8 && resolveFormat != GX_CTF_R8 &&
+                           resolveFormat != GX_CTF_A8 && !gx::is_depth_format(resolveFormat);
+  if (!fusedSecond && texture && small_copy_pass_interval() > 1 && !g_recorder.inOffscreen && colorFormat &&
+      rect.width <= 128 && rect.height <= 128 && clearColor) {
+    const TextureRef* key = texture.get();
+    const bool due = g_smallCopies.frame % small_copy_pass_interval() == 0;
+    if (!due && g_smallCopies.rendered.contains(key)) {
+      ++g_smallCopies.skipped;
+      prevPass.discardable = true;
+      enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+      const bool fullColorClear = clearColor && clearAlpha;
+      current_render_passes().emplace_back(
+          make_efb_continuation(prevPass, clearDepth, clearDepthValue, fullColorClear, clearColorValue));
+      ++g_recorder.currentRenderPass;
+      if (!fullColorClear && (clearColor || clearAlpha)) {
+        push_leading_clear(clearColor, clearAlpha, clearColorValue);
+      }
+      push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
+      push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+      return;
+    }
+    g_smallCopies.rendered.insert(key);
+    ++g_smallCopies.renderedCount;
+  }
   if (!fusedSecond) {
     prevPass.resolveTarget = std::move(texture);
     prevPass.resolveRect = rect;
@@ -1215,6 +1443,7 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
 
 void queue_palette_conv(tex_palette_conv::ConvRequest req) {
   // Palette conversions run before the pass; one queued in a shifted segment must not precede the first copy.
+  sprite_segment_settle();
   pass_fusion_split();
   auto& renderPass = current_render_passes()[g_recorder.currentRenderPass];
   AURORA_ASSERT(!renderPass.sealed, "Attempted to append palette conversion to sealed render pass {}",
@@ -1331,6 +1560,7 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
     wantDepth = false;
   }
 
+  sprite_segment_settle();
   pass_fusion_split();
   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
   const uint32_t width = prevPass.colorAttachments[SceneColorAttachmentIndex].size.width;
@@ -1399,6 +1629,7 @@ bool push_encoder_task(EncoderTaskId type, const void* payload, size_t payloadSi
   // pass that loads the existing contents. EFB writes persist into the continuation, so
   // content keeps the sealed pass alive even without a consumer.
   auto& frame = current_frame_packet();
+  sprite_segment_settle();
   pass_fusion_split();
   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
   prevPass.discardable = !prevPass.has_consumer() && !prevPass.has_content();
@@ -1449,7 +1680,15 @@ void finish() {
   }
   AURORA_ASSERT(!g_recorder.inOffscreen, "finish called while offscreen rendering is active");
   if (g_recorder.currentRenderPass != UINT32_MAX) {
+    sprite_segment_settle();
     pass_fusion_split();
+    sprite_segment_frame_end();
+    if (++g_smallCopies.frame % 600 == 0 && g_config.renderStats &&
+        (g_smallCopies.skipped != 0 || g_smallCopies.renderedCount != 0)) {
+      std::fprintf(stderr, "[small-copy-pass] frames=600 rendered=%u skipped=%u targets=%zu\n",
+                   g_smallCopies.renderedCount, g_smallCopies.skipped, g_smallCopies.rendered.size());
+      g_smallCopies.skipped = g_smallCopies.renderedCount = 0;
+    }
     auto& frame = current_frame_packet();
     frame.uniforms.append_zeroes(gx::MaxUniformSize);
     auto& pass = frame.renderPasses[g_recorder.currentRenderPass];

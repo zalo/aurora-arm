@@ -250,6 +250,8 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   return append_stream(g_testIndexStream, data, length, alignment);
 }
 bool vertices_follow(Range previous) { return g_testVertexStream.size() == previous.offset + previous.size; }
+bool sprite_point_draw(const gx::PipelineConfig&, uint32_t) { return false; }
+void sprite_segment_settle() {}
 bool indices_follow(Range previous) { return g_testIndexStream.size() == previous.offset + previous.size; }
 Range push_uniform(const uint8_t* data, size_t length) { return {}; }
 Range push_table_uniform(const uint8_t* data, size_t length) { return {}; }

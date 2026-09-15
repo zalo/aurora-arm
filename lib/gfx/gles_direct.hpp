@@ -3,7 +3,7 @@
 //
 // On draw-call-bound GLES devices (Mali, Adreno, VideoCore class GPUs in handhelds, Raspberry Pi
 // boards and weaker phones) the WebGPU command executor's per-draw work dominates the render
-// thread: on a Mali-G52 handheld running Melee, replaying ~180 GX draws through Dawn's GL backend
+// thread: on a Mali-G52 handheld running a GX title, replaying ~180 GX draws through Dawn's GL backend
 // cost ~47 ms of render work per frame. This path keeps Dawn's resource ownership, uploads, texture
 // cache and render pass setup, but issues the GL calls of eligible GX render passes itself through
 // Dawn's native GL interop extension (dawn/native/OpenGLBackend.h): once Dawn has bound and cleared

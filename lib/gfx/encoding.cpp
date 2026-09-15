@@ -6,6 +6,7 @@
 #include "depth_peek.hpp"
 #include "gles_direct.hpp"
 #include "pipeline_cache.hpp"
+#include "sprite_pass.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "../gx/gx.hpp"
@@ -487,6 +488,8 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
     break;
   case FrameOpType::EncoderTask:
     if (op.encoderTask != nullptr) {
+      // The sprite composite draws onto the scene: the presented texture when the scene rendered into it.
+      sprite_pass::set_scene_view(frame.surfaceView ? frame.surfaceView : webgpu::g_frameBuffer.view);
       execute_encoder_task(cmd, frame, *op.encoderTask);
     }
     break;

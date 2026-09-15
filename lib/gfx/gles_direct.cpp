@@ -3,6 +3,7 @@
 #include "clear.hpp"
 #include "frame_packet.hpp"
 #include "pipeline_cache.hpp"
+#include "profile.hpp"
 #include "resource_cache.hpp"
 #include "resources.hpp"
 #include "../gx/gx.hpp"
@@ -878,6 +879,10 @@ void bind_draw_resources(const gx::DrawData& d, PreparedPipeline& p) {
 }
 
 bool render_draw(const gx::DrawData& d, uint32_t passIndex, uint32_t drawIndex) {
+  if (profile::enabled()) {
+    profile::state.tag = (static_cast<uint64_t>(passIndex) << 32) | drawIndex;
+  }
+  profile::Scope drawProfile("gl_draw_total");
   auto* prepared = prepare_pipeline(d.pipeline);
   if (prepared == nullptr) {
     std::fprintf(stderr, "[gles-direct-error] frame=%llu pass=%u draw=%u section=pipeline-lookup\n",
@@ -898,10 +903,14 @@ bool render_draw(const gx::DrawData& d, uint32_t passIndex, uint32_t drawIndex) 
   if (!gl_ok("pipeline-state", passIndex, drawIndex)) {
     return true;
   }
-  bind_draw_resources(d, *prepared);
+  {
+    profile::Scope resourcesProfile("gl_resources");
+    bind_draw_resources(d, *prepared);
+  }
   if (!gl_ok("resources", passIndex, drawIndex)) {
     return true;
   }
+  profile::Scope drawCallProfile("gl_draw_call");
   ++sGlCalls.draws;
   const GLenum indexType = d.residentArena != 0 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
   const auto indices = reinterpret_cast<const void*>(static_cast<uintptr_t>(d.idxRange.offset));
@@ -993,6 +1002,7 @@ bool render_pass(void*, uint32_t passIndex, const char* label) {
   if (!plan.eligible) {
     return false;
   }
+  profile::Scope passProfile("gl_pass", passIndex);
   PassTimer timer;
   while (glGetError() != GL_NO_ERROR) {
   }
@@ -1002,7 +1012,7 @@ bool render_pass(void*, uint32_t passIndex, const char* label) {
   glBindVertexArray(sVao);
   sPassEbo = sMapped != nullptr ? sMapped->indices : dawn::native::opengl::GetGLInteropBuffer(resources().indexBuffer.Get());
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sPassEbo);
-  sEnabledAttributes = 0; // fresh VAO state each pass: Dawn may have used the VAO's bindings between passes
+  // sEnabledAttributes persists: the vertex array object is ours and keeps its enabled attributes between passes.
   reset_memos();
   glEnable(GL_SCISSOR_TEST);
   glDisable(GL_STENCIL_TEST);
@@ -1135,6 +1145,7 @@ bool encode_pass_resources(const wgpu::RenderPassEncoder& encoder, RenderPass& p
 }
 
 void prepare_frame(FramePacket& frame) {
+  profile::begin(frame.frameId, "render");
   sPlans.clear();
   sNextPlan = 0;
   ++sFrameNumber;
@@ -1291,6 +1302,7 @@ void uninstall_frame() {
   if (sEnabled) {
     dawn::native::opengl::SetGLInteropRenderPassCallback(nullptr, nullptr);
   }
+  profile::end();
 }
 
 void shutdown_mapped_slots(); // gles_mapped_streams.cpp

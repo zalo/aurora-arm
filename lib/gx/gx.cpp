@@ -327,12 +327,33 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
       .depthBiasSlopeScale = depthBiasSlopeScale,
       .depthBiasClamp = depthBiasClamp,
   };
-  const auto blendState =
+  auto blendState =
       to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha);
+  // Half-resolution sprite accumulation (gfx/sprite_pass.hpp): rgb blends as the game asked (src * a + dst * f),
+  // alpha accumulates coverage (1 - product of (1 - a)) for a destination factor of INVSRCALPHA and stays
+  // untouched for ONE; alpha-tested opaque sprites store premultiplied color and full coverage.
+  const bool spriteAccumulate = config.shaderConfig.spriteAccumulate;
+  if (spriteAccumulate) {
+    if (config.blendMode == GX_BM_NONE) {
+      blendState.color = {.operation = wgpu::BlendOperation::Add,
+                          .srcFactor = wgpu::BlendFactor::SrcAlpha,
+                          .dstFactor = wgpu::BlendFactor::Zero};
+      blendState.alpha = {.operation = wgpu::BlendOperation::Add,
+                          .srcFactor = wgpu::BlendFactor::One,
+                          .dstFactor = wgpu::BlendFactor::Zero};
+    } else {
+      const bool attenuates = config.blendFacDst == GX_BL_INVSRCALPHA;
+      blendState.alpha = {
+          .operation = wgpu::BlendOperation::Add,
+          .srcFactor = attenuates ? wgpu::BlendFactor::One : wgpu::BlendFactor::Zero,
+          .dstFactor = attenuates ? wgpu::BlendFactor::OneMinusSrcAlpha : wgpu::BlendFactor::One,
+      };
+    }
+  }
   const std::array colorTargets{wgpu::ColorTargetState{
       .format = g_graphicsConfig.surfaceConfiguration.format,
       .blend = &blendState,
-      .writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate),
+      .writeMask = spriteAccumulate ? wgpu::ColorWriteMask::All : to_write_mask(config.colorUpdate, config.alphaUpdate),
   }};
   const wgpu::FragmentState fragmentState{
       .module = shader,

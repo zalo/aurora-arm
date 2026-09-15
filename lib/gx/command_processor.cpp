@@ -3,6 +3,7 @@
 #include "../gfx/depth_peek.hpp"
 #include "../gfx/hash.hpp"
 #include "../gfx/frame.hpp"
+#include "../gfx/profile.hpp"
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
@@ -503,6 +504,7 @@ static void prepare_pipeline(GXPrimitive prim, GXVtxFmt fmt) noexcept {
   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
                              cache.lineMode == lineMode && cache.config.msaaSamples == gfx::get_sample_count();
   if (!pipelineValid) {
+    gfx::profile::Scope profile("pipeline_build");
     const bool hadPipeline = cache.hasPipeline;
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
@@ -568,6 +570,7 @@ static void prepare_draw_state(GXPrimitive prim, GXVtxFmt fmt, DrawImmediateData
   const bool bindGroupsValid =
       (state.dirty & DirtyTextures) == 0 && cache.bindGeneration == texture::current_bind_generation();
   if (!bindGroupsValid) {
+    gfx::profile::Scope profile("texture_resolve_bind");
     const auto prevBindGroup = cache.bindGroups.textureBindGroup;
     const bool rebound = resolve_sampled_textures(cache.shaderInfo);
     cache.bindGroups = build_bind_groups(cache.shaderInfo);
@@ -582,6 +585,7 @@ static void prepare_draw_state(GXPrimitive prim, GXVtxFmt fmt, DrawImmediateData
 
   const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;
   if (!uniformValid) {
+    gfx::profile::Scope profile("uniform_build");
     cache.uniformRange = build_uniform(cache.shaderInfo);
     state.dirty &= ~DirtyUniform;
   }
@@ -620,9 +624,24 @@ struct BatchStats {
 };
 BatchStats sBatchStats;
 
+// Pipeline variant for point draws recorded into the half-resolution sprite pass: same shader, premultiplied
+// accumulation blend (ShaderConfig::spriteAccumulate).
+static gfx::PipelineRef sprite_pipeline_variant(const DrawCache& cache) {
+  static absl::flat_hash_map<gfx::PipelineRef, gfx::PipelineRef> memo;
+  if (const auto it = memo.find(cache.pipelineRef); it != memo.end()) {
+    return it->second;
+  }
+  auto variant = cache.config;
+  variant.shaderConfig.spriteAccumulate = true;
+  const auto ref = gfx::pipeline_ref(variant);
+  memo.emplace(cache.pipelineRef, ref);
+  return ref;
+}
+
 static void batch_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, std::span<const u8> vertexData,
                        std::span<const u8> indexData) noexcept {
   ZoneScoped;
+  gfx::profile::Scope drawProfile("draw_prepare");
   auto& state = g_gxState;
   auto& cache = sDrawCache;
   DrawImmediateData immediates{.currentPnMtx = state.currentPnMtx};
@@ -630,6 +649,15 @@ static void batch_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, std::span<c
   const u8 lineMode = line_mode_for_prim(prim);
   const bool points = lineMode == 3;
   const u32 record = uniform_record_index(cache.uniformRange.offset);
+  // Half-resolution sprite pass: eligible point draws of a sprite-heavy frame render into the half-size
+  // target with the accumulation pipeline variant; any other draw ends an open sprite segment.
+  bool spriteAccumulate = false;
+  if (points) {
+    spriteAccumulate = gfx::sprite_point_draw(cache.config, vtxCount);
+  } else {
+    gfx::sprite_segment_settle();
+  }
+  const gfx::PipelineRef drawPipeline = spriteAccumulate ? sprite_pipeline_variant(cache) : cache.pipelineRef;
   const u32 expandedCount = lineMode == 1 || lineMode == 2 ? line_instance_count(lineMode, vtxCount) * 4 : vtxCount;
 
   auto& stats = sBatchStats;
@@ -641,7 +669,7 @@ static void batch_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, std::span<c
     ++stats.noPrevious;
   } else if (previous->residentArena != 0) {
     ++stats.kind;
-  } else if (previous->pipeline != cache.pipelineRef) {
+  } else if (previous->pipeline != drawPipeline) {
     ++stats.pipeline;
   } else if (previous->bindGroups.textureBindGroup != cache.bindGroups.textureBindGroup) {
     ++stats.texture;
@@ -702,7 +730,7 @@ static void batch_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, std::span<c
   }
   immediates.vtxStart = vertRange.offset;
   gfx::push_draw_command(DrawData{
-      .pipeline = cache.pipelineRef,
+      .pipeline = drawPipeline,
       .vertRange = vertRange,
       .idxRange = idxRange,
       .uniformRange = cache.uniformRange,
@@ -884,6 +912,8 @@ static void push_resident_draw(const resident::Entry& entry, GXVtxFmt fmt) noexc
   if (batch_draws_enabled()) {
     // Resident vertices carry no record index: merge with the previous resident draw of the same arena
     // whenever pipeline, textures, record, destination alpha and fog table match, whatever changed between.
+    gfx::profile::Scope drawProfile("draw_prepare");
+    gfx::sprite_segment_settle();
     DrawImmediateData immediates{.vtxStart = 0, .currentPnMtx = state.currentPnMtx};
     prepare_draw_state(GX_TRIANGLES, fmt, immediates);
     auto& stats = sBatchStats;

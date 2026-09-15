@@ -185,7 +185,7 @@ typedef struct {
    * Merge adjacent GX draws that share a pipeline, texture bind group, destination alpha, fog range
    * table and uniform window into one draw call, even when their uniform records differ (requires
    * uniformTable and cpuVertexDecode: the record index travels in bits 8-23 of each decoded vertex's
-   * matrix word). Bit-exact; on a Mali-G52 handheld running Melee this roughly halves the draw
+   * matrix word). Bit-exact; on a Mali-G52 handheld running a GX title this roughly halves the draw
    * calls of a frame.
    */
   bool batchDraws;
@@ -198,7 +198,7 @@ typedef struct {
    * Ineligible passes (custom draws, MSAA, fog range tables, a pipeline still compiling) take the WebGPU
    * path unchanged. Requires cpuVertexDecode and implies uniformTable and batchDraws.
    * 0 = automatic (on when the OpenGL ES backend is selected and the extension is available), 1 = on,
-   * -1 = off. Measured on a Mali-G52 handheld running Melee: render work 47 -> ~13 ms per frame.
+   * -1 = off. Measured on a Mali-G52 handheld running a GX title: render work 47 -> ~13 ms per frame.
    */
   int8_t glesDirectSubmission;
 
@@ -235,6 +235,24 @@ typedef struct {
    * drivers a render pass costs ~0.5-0.7 ms of driver time, which is what this saves.
    */
   bool sceneOnSurface;
+
+  /*
+   * Half-resolution sprite pass (requires batchDraws): when the previous frame drew at least this many GX
+   * point sprites, runs of eligible point draws (alpha-tested or SRCALPHA-blended, color writes on, no
+   * destination alpha) render into a half-size target with a downsampled scene depth and are composited
+   * back with premultiplied alpha. Depth-writing sprites then do not occlude geometry drawn after them, so
+   * this is an approximation; 0 (default) disables it. A particle-heavy stage (~25k sprites per frame) went
+   * from 26.6 to 23.9 ms mean frame time on a Mali-G52 handheld with a threshold of 4000.
+   */
+  uint32_t halfResolutionSpritePoints;
+
+  /*
+   * Render small (<= 128x128) color-format render-to-texture passes whose EFB copy clears color (reflection
+   * cameras) only every Nth frame; in between the pass is dropped and the copy texture keeps its previous
+   * image. 0 or 1 (default) renders every frame. A quality trade-off for scenes that re-render the world
+   * into a small reflection every frame.
+   */
+  uint32_t smallCopyPassInterval;
 } AuroraConfig;
 
 typedef struct {

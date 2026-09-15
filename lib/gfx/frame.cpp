@@ -2,6 +2,7 @@
 
 #include "depth_peek.hpp"
 #include "gles_direct.hpp"
+#include "sprite_pass.hpp"
 #include "pipeline_cache.hpp"
 #include "recording.hpp"
 #include "render_worker.hpp"
@@ -589,6 +590,7 @@ void shutdown() {
     g_deferredEndFrames.clear();
   }
   shutdown_pipeline_cache();
+  sprite_pass::shutdown();
   depth_peek::shutdown();
   tex_copy_conv::shutdown();
   tex_palette_conv::shutdown();

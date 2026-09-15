@@ -27,6 +27,9 @@ void seed_offscreen_cache(uint32_t width, uint32_t height, wgpu::TextureFormat c
 
 } // namespace aurora::gfx::detail
 
+namespace aurora::gx {
+struct PipelineConfig;
+} // namespace aurora::gx
 namespace aurora::gfx {
 struct ColorPassDescriptor {
   const char* label = nullptr;
@@ -67,6 +70,11 @@ void queue_palette_conv(tex_palette_conv::ConvRequest req);
 // Pass fusion: a draw that samples the target of a copy still pending in the current fused pass must split the
 // pass so the copy is resolved before the draw. Called with the handle of every EFB copy texture a draw samples.
 void on_copy_texture_sampled(const TextureHandle& handle) noexcept;
+// Half-resolution sprite pass (sprite_pass.hpp): called for every GX point draw with its pipeline config and
+// point count; true when the draw is recorded into the half-size sprite pass and must use its accumulation
+// pipeline variant. Any other draw calls sprite_segment_settle() first.
+bool sprite_point_draw(const gx::PipelineConfig& config, uint32_t points);
+void sprite_segment_settle();
 
 Range push_verts(const uint8_t* data, size_t length, size_t alignment);
 template <typename T>

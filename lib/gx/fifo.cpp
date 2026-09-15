@@ -2,6 +2,7 @@
 
 #include "../thread.hpp"
 #include "command_processor.hpp"
+#include "../gfx/profile.hpp"
 #include "dolphin/gx/GXAurora.h"
 #include "dolphin/gx/GXCommandList.h"
 #include "resident_geometry.hpp"
@@ -60,6 +61,14 @@ void wake_worker() noexcept {
 }
 
 void process_to(uint64_t target, std::memory_order order) noexcept {
+  if (gfx::profile::enabled()) {
+    const auto frame = gfx::profile::fifoFrame.load(std::memory_order_acquire);
+    if (gfx::profile::state.frame != frame || std::strcmp(gfx::profile::state.lane, "fifo") != 0) {
+      gfx::profile::end();
+      gfx::profile::begin(frame, "fifo");
+    }
+  }
+  gfx::profile::Scope processProfile("fifo_process");
   uint64_t processed = sProcessed.load(std::memory_order_relaxed);
   while (processed < target) {
     ProcessResult result{};

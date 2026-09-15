@@ -9,6 +9,7 @@ add_library(aurora_gx STATIC
         lib/gfx/recording.cpp
         lib/gfx/render_worker.cpp
         lib/gfx/resource_cache.cpp
+        lib/gfx/sprite_pass.cpp
         lib/gfx/dds_io.cpp
         lib/gfx/tex_copy_conv.cpp
         lib/gfx/tex_palette_conv.cpp
@@ -56,6 +57,9 @@ set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxhash)
 target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 TracyClient PNG::PNG)
 target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
+if (AURORA_DEEP_TIMERS)
+    target_compile_definitions(aurora_gx PRIVATE AURORA_DEEP_TIMERS=1)
+endif ()
 
 # OpenGL ES direct submission (lib/gfx/gles_direct.hpp): compiled in only when the Dawn in use declares the
 # native GL interop extension (dawn/native/OpenGLBackend.h, GLInteropRenderPassCallback) and the GLES/EGL
