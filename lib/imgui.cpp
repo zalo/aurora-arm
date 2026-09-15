@@ -220,6 +220,10 @@ DrawData freeze() noexcept {
   return DrawData{std::move(frozen)};
 }
 
+bool has_draws(const DrawData& drawData) noexcept {
+  return drawData.m_impl && drawData.m_impl->drawData.CmdListsCount > 0;
+}
+
 void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept {
   ZoneScoped;
 

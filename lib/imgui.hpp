@@ -25,6 +25,7 @@ private:
 
   friend DrawData freeze() noexcept;
   friend void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept;
+  friend bool has_draws(const DrawData& drawData) noexcept;
 };
 
 void create_context() noexcept;
@@ -35,5 +36,7 @@ void process_event(const SDL_Event& event) noexcept;
 bool wants_capture_event(const SDL_Event& event) noexcept;
 void new_frame(const AuroraWindowSize& size) noexcept;
 DrawData freeze() noexcept;
+/** Returns true when the frozen draw data contains at least one command list. */
+bool has_draws(const DrawData& drawData) noexcept;
 void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept;
 } // namespace aurora::imgui
