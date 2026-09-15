@@ -1,0 +1,22 @@
+step,version,frame_ms,label,phase,note
+1,v8,309.6,Stock g13 driver (baseline),platform,Mean presented interval; ~3 FPS; 279 ms inside the Mali driver
+2,g29,114.3,App-local g29p1 Mali driver,platform,Matched Onett control; barriers still on
+3,rewrite,94.5,CPU-decoded vertex inputs + uniform table,aurora,Matched Onett control
+4,v55,70.5,Group immutable geometry uploads before passes,aurora,Instrumented match mean (106.7 -> 70.5)
+5,v5x,49.6,Dawn GL path before direct submission,aurora,Frozen Onett control after the winding fix
+6,v61,38.6,Direct GLES submission,dawn-hatch,Frozen Onett mean
+7,v62,37.4,Resource-only packet encoding,dawn-hatch,
+8,v68,31.3,Threaded EGL/DRM presentation worker,dawn-hatch,
+9,v70,30.1,Dirty-range uploads + DMC governor,dawn-hatch,
+10,v79,30.7,Second-iteration baseline (new measurement setup),aurora,Frozen Onett mean; FIFO worker 28.6 ms
+11,v80,27.2,Specialized vertex loaders,aurora,FIFO 28.6 -> 24.4 ms
+12,v83,25.7,Resident display-list geometry,aurora,FIFO -> 16.4 ms
+13,v85,22.6,Stable texture identities,aurora,FIFO -> 13.6 ms
+14,v92,20.9,Persistently mapped uniform/index streams,dawn-hatch,
+15,v95,19.3,Record stream + direct-path trimming,dawn-hatch,
+16,v95b,17.4,Framebuffer-object cache (Dawn),dawn-hatch,
+17,v97,17.4,Async frames + FIFO compaction,aurora,56 FPS presented
+18,v102,17.4,Mapped vertex stream (moving scenes 27 -> 17.5),dawn-hatch,Frozen Onett unchanged
+19,v120,17.1,Shadow-pass fusion + dual conversion,aurora,Passes 7 -> 4; p95 16.8
+20,v128,17.1,Texture arrays + scene on surface,mixed,Render callback 13.8 -> 11.8 ms
+21,v143,17.1,Clamp atlas + pipeline memo + final defaults,aurora,Median 16.7 ms (60 Hz boundary)
