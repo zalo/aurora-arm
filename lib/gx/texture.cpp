@@ -198,11 +198,12 @@ uint64_t sample_tlut_content(const GXTlutObj_& tlut) noexcept {
   return sampler.finish();
 }
 
-// An entry is verified at most once per frame; texDataVersion / tlutDataVersion changes bypass this and invalidate
-// immediately.
+// An entry is verified at most once every AuroraConfig::textureVerifyInterval frames (0 / 1: once per frame);
+// texDataVersion / tlutDataVersion changes bypass this and invalidate immediately.
 template <typename Entry>
 bool verification_due(Entry& entry) noexcept {
-  if (entry.lastVerifiedFrame == s_frameCount) {
+  const uint64_t interval = std::max<uint64_t>(g_config.textureVerifyInterval, 1);
+  if (s_frameCount - entry.lastVerifiedFrame < interval) {
     return false;
   }
   entry.lastVerifiedFrame = s_frameCount;

@@ -45,6 +45,7 @@ protected:
   void SetUp() override {
     texture::shutdown();
     g_gxState = {};
+    g_config.textureVerifyInterval = 0;
     testing::reset_texture_stubs();
     texture::end_frame();
   }
@@ -443,6 +444,29 @@ TEST_F(GxTextureCacheTest, InPlaceTlutChangeRefreshesTlutTexture) {
 
   EXPECT_EQ(testing::texture_allocations(), 2);
   EXPECT_EQ(testing::palette_conversions(), 2);
+}
+
+TEST_F(GxTextureCacheTest, VerifyIntervalDefersContentChecksButNotVersionBumps) {
+  g_config.textureVerifyInterval = 4;
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  const auto first = texture::resolve_static_texture(obj);
+
+  pixels[0] = 1; // rewritten in place: noticed on the next check, up to N-1 frames later
+  for (int frame = 1; frame < 4; ++frame) {
+    texture::end_frame();
+    EXPECT_EQ(texture::resolve_static_texture(obj), first);
+  }
+  texture::end_frame();
+  const auto second = texture::resolve_static_texture(obj);
+  EXPECT_NE(second, first);
+  EXPECT_EQ(testing::texture_allocations(), 2);
+
+  pixels[1] = 1; // GXInitTexObjData: invalidates immediately regardless of the interval
+  auto bumped = obj;
+  bumped.texDataVersion = 2;
+  EXPECT_NE(texture::resolve_static_texture(bumped), second);
+  EXPECT_EQ(testing::texture_allocations(), 3);
 }
 
 TEST_F(GxTextureCacheTest, ObjectAgingKeepsContentEntry) {
