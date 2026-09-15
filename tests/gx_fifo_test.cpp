@@ -12,6 +12,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <thread>
 
 using aurora::gx::g_gxState;
@@ -25,6 +26,12 @@ extern std::atomic<uint32_t> endOffscreenCount;
 extern std::atomic<uint32_t> resolvePassCount;
 extern std::atomic<uint32_t> offscreenWidth;
 extern std::atomic<uint32_t> offscreenHeight;
+extern std::atomic<uint32_t> reservedFrameBeginCount;
+extern std::atomic<uint32_t> reservedFrameBeginSlot;
+extern std::atomic<uint32_t> reservedFrameBeginBpReg41;
+extern std::atomic<uint32_t> deferredFrameEndCount;
+extern std::atomic<uint32_t> finishCount;
+extern std::atomic<size_t> deferredFrameEndThreadHash;
 } // namespace testing
 } // namespace aurora::gfx
 
@@ -103,6 +110,76 @@ TEST_F(GXFifoTest, FifoPublishesOnlyAtExplicitBoundary) {
   aurora::gx::fifo::shutdown();
 
   EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+}
+
+TEST_F(GXFifoTest, AsyncFrameMarkersFinishTheFrameOnTheProcessor) {
+  using namespace aurora::gfx::testing;
+  reservedFrameBeginCount.store(0);
+  reservedFrameBeginSlot.store(UINT32_MAX);
+  reservedFrameBeginBpReg41.store(0);
+  deferredFrameEndCount.store(0);
+  finishCount.store(0);
+  deferredFrameEndThreadHash.store(0);
+  const std::array<u8, 5> bpWrite{GX_LOAD_BP_REG, 0x41, 0x12, 0x34, 0x56};
+
+  aurora::gx::fifo::init();
+  // Written between frames: stays unpublished and must be recorded into the next frame.
+  aurora::gx::fifo::write_data(bpWrite.data(), static_cast<u32>(bpWrite.size()));
+  aurora::gx::fifo::publish();
+  EXPECT_EQ(aurora::gx::fifo::get_buffer_size(), bpWrite.size());
+
+  aurora::gx::fifo::begin_frame_async(1);
+  // The begin marker is inserted ahead of the pending command.
+  const auto* data = aurora::gx::fifo::get_buffer_data();
+  EXPECT_EQ(data[0], GX_AURORA);
+  EXPECT_EQ(data[1], 0x00);
+  EXPECT_EQ(data[2], GX_AURORA_FRAME_BEGIN);
+  EXPECT_EQ(read_fifo_u32(std::vector<u8>(data, data + 7), 3), 1u);
+  EXPECT_EQ(data[7], GX_LOAD_BP_REG);
+
+  std::atomic<bool> afterFrameRan{false};
+  std::atomic<uint32_t> frameEndsWhenAfterFrameRan{0};
+  aurora::gx::fifo::run_after_frame([&] {
+    frameEndsWhenAfterFrameRan.store(deferredFrameEndCount.load(std::memory_order_acquire));
+    afterFrameRan.store(true, std::memory_order_release);
+  });
+  aurora::gx::fifo::end_frame_async();
+  ASSERT_TRUE(wait_for(afterFrameRan, true));
+
+  EXPECT_EQ(reservedFrameBeginCount.load(), 1u);
+  EXPECT_EQ(reservedFrameBeginSlot.load(), 1u);
+  // Recording began before the between-frame command was processed.
+  EXPECT_EQ(reservedFrameBeginBpReg41.load(), 0u);
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+  EXPECT_EQ(finishCount.load(), 1u);
+  EXPECT_EQ(deferredFrameEndCount.load(), 1u);
+  EXPECT_EQ(frameEndsWhenAfterFrameRan.load(), 1u);
+  EXPECT_NE(deferredFrameEndThreadHash.load(), std::hash<std::thread::id>{}(std::this_thread::get_id()));
+  aurora::gx::fifo::shutdown();
+}
+
+TEST_F(GXFifoTest, WaitDrawDoneWaitsForTheLatestTokenOnly) {
+  const std::array<u8, 5> bpWrite41{GX_LOAD_BP_REG, 0x41, 0x12, 0x34, 0x56};
+  const std::array<u8, 5> bpWrite42{GX_LOAD_BP_REG, 0x42, 0x65, 0x43, 0x21};
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  aurora::gx::fifo::wait_draw_done(); // no token yet
+  aurora::gx::fifo::write_data(bpWrite41.data(), static_cast<u32>(bpWrite41.size()));
+  GXSetDrawDone();
+  GXWaitDrawDone();
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+  // Unlike GXDrawDone, the stream is not drained or rewound.
+  EXPECT_GT(aurora::gx::fifo::get_buffer_size(), 0u);
+  aurora::gx::fifo::end_frame();
+
+  // A token written outside a frame is not published by GXSetDrawDone; the wait publishes it.
+  aurora::gx::fifo::write_data(bpWrite42.data(), static_cast<u32>(bpWrite42.size()));
+  GXSetDrawDone();
+  EXPECT_FALSE(g_gxState.bpRegValid.test(0x42));
+  GXWaitDrawDone();
+  EXPECT_EQ(g_gxState.bpRegCache[0x42], 0x42654321u);
+  aurora::gx::fifo::shutdown();
 }
 
 TEST_F(GXFifoTest, AutoSizedDrawPublishesAfterLengthPatch) {
