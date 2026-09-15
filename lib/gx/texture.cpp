@@ -854,6 +854,9 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     gfx::TextureHandle handle;
     const auto copyIt = g_gxState.copyTextures.find(obj.data);
     const GXState::CopyTextureRef* copyRef = copyIt != g_gxState.copyTextures.end() ? &copyIt->second : nullptr;
+    if (copyRef != nullptr) {
+      gfx::on_copy_texture_sampled(copyRef->handle);
+    }
     if (is_palette_format(obj.format())) {
       const auto tlutIdx = static_cast<size_t>(obj.tlut);
       if (tlutIdx < g_gxState.loadedTluts.size()) {

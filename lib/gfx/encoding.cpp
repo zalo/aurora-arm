@@ -185,6 +185,50 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
 #endif
 }
 
+// Copies `rect` of the pass's color (or depth) source into `target`, converting or scaling as the format requires.
+void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const TextureHandle& target, GXTexFmt format,
+                  const ClipRect& rect, const Range& uniformRange) {
+  const auto& dstSize = target->size;
+  const bool needsConversion = tex_copy_conv::needs_conversion(format);
+  const bool needsScaling =
+      dstSize.width != static_cast<uint32_t>(rect.width) || dstSize.height != static_cast<uint32_t>(rect.height);
+  const bool isDepth = gx::is_depth_format(format);
+  if (isDepth && passInfo.msaaSamples > 1) {
+    Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
+  }
+  const tex_copy_conv::ConvRequest convReq{
+      .fmt = format,
+      .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
+      .uniformRange = uniformRange,
+      .dst = target,
+      .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
+  };
+  if (needsConversion) {
+    tex_copy_conv::run(cmd, convReq);
+  } else if (needsScaling) {
+    tex_copy_conv::blit(cmd, convReq);
+  } else {
+    const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
+    const wgpu::TexelCopyTextureInfo src{
+        .texture = passInfo.copySourceTexture,
+        .origin =
+            wgpu::Origin3D{
+                .x = static_cast<uint32_t>(rect.x),
+                .y = static_cast<uint32_t>(rect.y),
+            },
+    };
+    const wgpu::TexelCopyTextureInfo dst{
+        .texture = target->texture,
+    };
+    const wgpu::Extent3D size{
+        .width = static_cast<uint32_t>(rect.width),
+        .height = static_cast<uint32_t>(rect.height),
+        .depthOrArrayLayers = 1,
+    };
+    cmd.CopyTextureToTexture(&src, &dst, &size);
+  }
+}
+
 void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
   if (!passInfo.sealed) {
@@ -255,45 +299,11 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   }
 
   if (passInfo.resolveTarget) {
-    const auto& dstSize = passInfo.resolveTarget->size;
-    const bool needsConversion = tex_copy_conv::needs_conversion(passInfo.resolveFormat);
-    const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
-                              dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
-    const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
-    if (isDepth && passInfo.msaaSamples > 1) {
-      Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
-    }
-    const tex_copy_conv::ConvRequest convReq{
-        .fmt = passInfo.resolveFormat,
-        .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
-        .uniformRange = passInfo.resolveUniformRange,
-        .dst = passInfo.resolveTarget,
-        .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
-    };
-    if (needsConversion) {
-      tex_copy_conv::run(cmd, convReq);
-    } else if (needsScaling) {
-      tex_copy_conv::blit(cmd, convReq);
-    } else {
-      const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
-      const wgpu::TexelCopyTextureInfo src{
-          .texture = passInfo.copySourceTexture,
-          .origin =
-              wgpu::Origin3D{
-                  .x = static_cast<uint32_t>(passInfo.resolveRect.x),
-                  .y = static_cast<uint32_t>(passInfo.resolveRect.y),
-              },
-      };
-      const wgpu::TexelCopyTextureInfo dst{
-          .texture = passInfo.resolveTarget->texture,
-      };
-      const wgpu::Extent3D size{
-          .width = static_cast<uint32_t>(passInfo.resolveRect.width),
-          .height = static_cast<uint32_t>(passInfo.resolveRect.height),
-          .depthOrArrayLayers = 1,
-      };
-      cmd.CopyTextureToTexture(&src, &dst, &size);
-    }
+    resolve_copy(cmd, passInfo, passInfo.resolveTarget, passInfo.resolveFormat, passInfo.resolveRect,
+                 passInfo.resolveUniformRange);
+  }
+  for (const auto& extra : passInfo.extraResolves) {
+    resolve_copy(cmd, passInfo, extra.target, extra.format, extra.rect, extra.uniformRange);
   }
 
   if (passInfo.snapshotColorDst) {

@@ -116,6 +116,12 @@ typedef struct {
    * This can be set to 0 to disable allocating this region.
    */
   uint32_t mem2Size;
+
+  /*
+   * Disables fusing adjacent small render-to-texture EFB passes (shadow maps, reflections) into one render pass.
+   * Fusion is exact and on by default; this is a debugging switch for bisecting rendering differences.
+   */
+  bool disableRenderPassFusion;
 } AuroraConfig;
 
 typedef struct {
