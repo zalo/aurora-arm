@@ -189,6 +189,41 @@ typedef struct {
    * calls of a frame.
    */
   bool batchDraws;
+
+  /*
+   * Submit GX render passes directly through OpenGL ES (build option AURORA_GLES_DIRECT, needs Dawn's
+   * native GL interop extension). Dawn keeps resource ownership, uploads and render pass setup; the GX
+   * draws of an eligible pass are issued by Aurora in the device's GL context with a redundant-state
+   * filter, the uniform table bound once per window and texture state folded into the texture objects.
+   * Ineligible passes (custom draws, MSAA, fog range tables, a pipeline still compiling) take the WebGPU
+   * path unchanged. Requires cpuVertexDecode and implies uniformTable and batchDraws.
+   * 0 = automatic (on when the OpenGL ES backend is selected and the extension is available), 1 = on,
+   * -1 = off. Measured on a Mali-G52 handheld running Melee: render work 47 -> ~13 ms per frame.
+   */
+  int8_t glesDirectSubmission;
+
+  /*
+   * With direct submission, record the frame's uniform records, indices and decoded vertices straight into
+   * persistently mapped GL buffers (GL_EXT_buffer_storage) with one fenced slot per staging buffer, so the
+   * direct path binds them without a staging copy. 0 = automatic (on with direct submission), 1 = on,
+   * -1 = off (frames stay staged through WebGPU buffers).
+   */
+  int8_t glesMappedStreams;
+
+  /*
+   * Direct submission only: reorder runs of consecutive opaque, depth-tested and depth-written draws by
+   * pipeline, texture bind group and uniform window so the driver sees fewer state changes. Not exact when
+   * opaque surfaces share depth values; off by default.
+   */
+  bool sortOpaqueDraws;
+
+  /*
+   * Print renderer diagnostics to stderr every 120 frames and account the time the game thread waits for
+   * GX translation, the translation worker spends processing, the render worker spends busy and the
+   * translation worker blocks on pipeline creation (aurora_render_stats_*). Off by default; the counters
+   * cost a clock read per item when on.
+   */
+  bool renderStats;
 } AuroraConfig;
 
 typedef struct {

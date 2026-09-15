@@ -1,5 +1,7 @@
 #include "resource_cache.hpp"
 
+#include <atomic>
+
 #include "frame.hpp"
 #include "hash.hpp"
 #include "../webgpu/gpu.hpp"
@@ -51,9 +53,13 @@ std::mutex g_samplerCacheMutex;
 
 namespace detail {
 
+std::atomic<uint64_t> g_bindGroupCacheGeneration{0};
+uint64_t bind_group_cache_generation() noexcept { return g_bindGroupCacheGeneration.load(std::memory_order_acquire); }
+
 void clear_bind_group_cache() {
   std::lock_guard lock{g_bindGroupCacheMutex};
   g_cachedBindGroups.clear();
+  g_bindGroupCacheGeneration.fetch_add(1, std::memory_order_release);
 }
 
 void expire_cached_bind_groups() {
@@ -67,6 +73,7 @@ void expire_cached_bind_groups() {
   for (auto it = g_cachedBindGroups.begin(); it != g_cachedBindGroups.end();) {
     if (frameIndex - it->second.lastUsedFrame > BindGroupCacheRetainFrames) {
       g_cachedBindGroups.erase(it++);
+      g_bindGroupCacheGeneration.fetch_add(1, std::memory_order_release);
     } else {
       ++it;
     }

@@ -12,6 +12,13 @@
 #include <string>
 #include <vector>
 
+namespace aurora::gx {
+struct DrawData;
+}
+namespace aurora::gfx::clear {
+struct DrawData;
+}
+
 namespace aurora::gfx::detail {
 
 struct StagingHighWater {
@@ -121,6 +128,10 @@ struct RenderPass {
   uint8_t leadingClearMask = 0;
   Vec4<float> leadingClearValue{0.f, 0.f, 0.f, 0.f};
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
+  // OpenGL ES direct submission (gles_direct.hpp): the WebGPU pass label the direct path matches its plan
+  // against, and whether only the pass's resources were recorded because the direct path replays its draws.
+  std::string directLabel;
+  bool directResourcesOnly = false;
 
   RenderTargetLayout target_layout() const noexcept;
   bool has_consumer() const { return resolveTarget || snapshotColorDst || snapshotDepthDst; }
@@ -219,6 +230,13 @@ struct FramePacket {
   size_t stagingBuffer = 0;
   StagingHighWater copied;
   AuroraStats stats{};
+  // verts, uniforms and indices point into persistently mapped GL storage (gles_direct.hpp) instead of the
+  // staging buffer; the staging copies for them are skipped.
+  bool mappedStreams = false;
 };
+
+// Recovers the payload of a GX / clear draw command (false for any other draw type).
+bool decode_gx_draw(const DrawCommand& command, gx::DrawData& data) noexcept;
+bool decode_clear_draw(const DrawCommand& command, clear::DrawData& data) noexcept;
 
 } // namespace aurora::gfx::detail

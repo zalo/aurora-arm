@@ -511,7 +511,8 @@ struct ShaderConfig {
   u8 cpuVertexDecode : 1 = false; // attributes arrive as vertex inputs (see vertex_loader.hpp)
   u8 uniformTable : 1 = false;    // the record is indexed within a 64 KiB uniform window (uniformTable)
   u8 batchDraws : 1 = false;      // the record index comes from the vertex matrix word (batchDraws)
-  u8 pad1 : 2 = 0;
+  u8 spriteAccumulate : 1 = false; // half-resolution sprite pass variant: premultiplied accumulation blend
+  u8 pad1 : 1 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;

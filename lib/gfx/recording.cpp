@@ -714,6 +714,22 @@ void increment_merged_draw_count() noexcept {
   }
 }
 
+bool decode_gx_draw(const DrawCommand& command, gx::DrawData& data) noexcept {
+  if (command.encoder != encode_draw<gx::render, gx::DrawData>) {
+    return false;
+  }
+  std::memcpy(&data, command.payload.data(), sizeof(data));
+  return true;
+}
+
+bool decode_clear_draw(const DrawCommand& command, clear::DrawData& data) noexcept {
+  if (!is_clear_draw(command)) {
+    return false;
+  }
+  std::memcpy(&data, command.payload.data(), sizeof(data));
+  return true;
+}
+
 } // namespace detail
 
 void queue_texture_upload(TextureUpload upload) {

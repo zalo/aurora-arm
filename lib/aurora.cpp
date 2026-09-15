@@ -4,6 +4,7 @@
 #ifdef AURORA_ENABLE_GX
 #include "gfx/resources.hpp"
 #include "gfx/frame.hpp"
+#include "gfx/gles_direct.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/render_worker.hpp"
 #include "gx/command_processor.hpp"
@@ -411,7 +412,10 @@ void end_frame() noexcept {
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
     {
       ZoneScopedN("Queue Submit");
+      // OpenGL ES direct submission: the render pass callback is live only while this command buffer executes.
+      gfx::gles_direct::install_frame();
       g_queue.Submit(1, &buffer);
+      gfx::gles_direct::uninstall_frame();
     }
     webgpu::gpu_prof::after_submit();
     if (canPresent && g_surface) {

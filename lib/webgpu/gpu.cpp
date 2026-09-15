@@ -1,4 +1,6 @@
 #include "gpu.hpp"
+
+#include "../gfx/gles_direct.hpp"
 #ifdef MELEE_MIYOO_FLIP
 // The Miyoo Flip presents through EGL on a GBM surface owned by the application (no SDL video
 // driver). It supplies Dawn's GL backend with its EGL display and function loader.
@@ -964,7 +966,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
           store_to_cache(key.data(), key.size(), value.data(), value.size(), nullptr);
         });
 
-    constexpr std::array enableToggles{
+    // The direct submission path needs the backend to be known; it also decides the GL toggles below.
+    gfx::gles_direct::configure(g_backendType);
+    std::vector<const char*> enableToggles{
 #if _WIN32
         "use_dxc",
 #ifndef NDEBUG
@@ -983,6 +987,14 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         "enable_immediate_error_handling",
         "gl_allow_context_on_multi_threads",
     };
+    if (gfx::gles_direct::enabled()) {
+      // Framebuffer objects cached by attachment identity (Dawn's native GL interop extension): +2 ms per
+      // frame with the direct path on a Mali-G52, a regression when Dawn executes the passes itself.
+      enableToggles.push_back("gl_cache_framebuffers");
+    }
+    if (g_config.renderStats && g_backendType == wgpu::BackendType::OpenGLES) {
+      enableToggles.push_back("gl_interop_timing");
+    }
     constexpr std::array disableToggles{
         "timestamp_quantization",
     };

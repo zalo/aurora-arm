@@ -4,6 +4,7 @@
 
 #include "clear.hpp"
 #include "depth_peek.hpp"
+#include "gles_direct.hpp"
 #include "pipeline_cache.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
@@ -319,7 +320,11 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   };
 
   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  render_pass(pass, frame, passInfo);
+  // OpenGL ES direct submission replays eligible passes itself when the command buffer executes; only the
+  // pass's resources are recorded then.
+  if (!gles_direct::encode_pass_resources(pass, passInfo, label)) {
+    render_pass(pass, frame, passInfo);
+  }
   pass.End();
 
   if (passInfo.captureDepthSnapshot) {
@@ -394,6 +399,13 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
   const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
   const auto& highWater = op.highWater;
   auto& res = resources();
+  if (frame.mappedStreams) {
+    // Recorded straight into mapped GL storage: the direct path binds it, and frames with a pass on the WebGPU
+    // path are uploaded whole at frame end (gles_direct::prepare_frame).
+    frame.copied.verts = std::max(frame.copied.verts, highWater.verts);
+    frame.copied.uniforms = std::max(frame.copied.uniforms, highWater.uniforms);
+    frame.copied.indices = std::max(frame.copied.indices, highWater.indices);
+  }
   copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, res.vertexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
                             res.uniformBuffer);

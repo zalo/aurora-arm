@@ -1,6 +1,12 @@
 #include "clear.hpp"
 
 #include "encoding.hpp"
+#include "hash.hpp"
+#include "pipeline_cache.hpp"
+
+#include <absl/container/flat_hash_map.h>
+
+#include <mutex>
 #include "../webgpu/gpu.hpp"
 #include "tracy/Tracy.hpp"
 
@@ -75,8 +81,27 @@ PipelineConfig make_pipeline_config(const RenderTargetLayout& layout, bool clear
   return config;
 }
 
+namespace {
+std::mutex sPipelineConfigMutex;
+absl::flat_hash_map<PipelineRef, PipelineConfig> sPipelineConfigs;
+} // namespace
+
+bool find_pipeline_config(PipelineRef ref, PipelineConfig& config) {
+  std::lock_guard lock{sPipelineConfigMutex};
+  const auto it = sPipelineConfigs.find(ref);
+  if (it == sPipelineConfigs.end()) {
+    return false;
+  }
+  config = it->second;
+  return true;
+}
+
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
+  {
+    std::lock_guard lock{sPipelineConfigMutex};
+    sPipelineConfigs[xxh3_hash(config, static_cast<HashType>(ShaderType::Clear))] = config;
+  }
   const bool writesSceneColor = config.clearColor || config.clearAlpha;
   const auto source = shader_source(writesSceneColor);
   wgpu::ShaderSourceWGSL sourceDescriptor{};

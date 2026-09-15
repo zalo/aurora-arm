@@ -1,6 +1,7 @@
 #include "frame.hpp"
 
 #include "depth_peek.hpp"
+#include "gles_direct.hpp"
 #include "pipeline_cache.hpp"
 #include "recording.hpp"
 #include "render_worker.hpp"
@@ -219,7 +220,30 @@ void pace_frame_start() {
   }
 }
 
-void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
+void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false);
+
+// Render worker, after the frame's submit. Staged frames release their slot as soon as the staging buffer is
+// mapped again; frames recorded into mapped GL streams fence their slot and release the oldest fenced slot,
+// blocking only when two are pending (the FIFO processor would otherwise overwrite storage the GPU reads).
+std::deque<size_t> g_mappedSlotsPendingRelease;
+void release_staging_slot(size_t stagingSlot, bool mappedStreams) {
+  if (!mappedStreams) {
+    map_staging_buffer(stagingSlot, true);
+    return;
+  }
+  gles_direct::fence_mapped_slot(stagingSlot);
+  g_mappedSlotsPendingRelease.push_back(stagingSlot);
+  while (!g_mappedSlotsPendingRelease.empty()) {
+    const size_t oldest = g_mappedSlotsPendingRelease.front();
+    if (!gles_direct::mapped_slot_fence_done(oldest, g_mappedSlotsPendingRelease.size() >= 2)) {
+      break;
+    }
+    g_mappedSlotsPendingRelease.pop_front();
+    map_staging_buffer(oldest, true);
+  }
+}
+
+void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion) {
   auto expected = BufferMapState::Unmapped;
   if (!g_mappingStates[slot].compare_exchange_strong(expected, BufferMapState::Mapping, std::memory_order_acq_rel,
                                                      std::memory_order_acquire)) {
@@ -545,6 +569,8 @@ void initialize() {
 
 void shutdown() {
   render_worker::synchronize();
+  gles_direct::shutdown();
+  g_mappedSlotsPendingRelease.clear();
   render_worker::shutdown();
   g_processEventsQueued.store(false, std::memory_order_release);
   g_lastPresentNs.store(0, std::memory_order_release);
@@ -666,9 +692,19 @@ bool reserve_frame(uint32_t& frameSlot) {
     buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
     bufferOffset += size;
   };
-  mapBuffer(frame.verts, VertexBufferSize);
-  mapBuffer(frame.uniforms, UniformBufferSize);
-  mapBuffer(frame.indices, IndexBufferSize);
+  if (const auto* mapped = gles_direct::mapped_slot(*stagingSlot); mapped != nullptr) {
+    // Persistently mapped GL streams: the staging ranges of these three streams stay unused (the staging
+    // layout is fixed, so their offsets are still skipped) and the slot is free, its fence having signalled.
+    frame.verts = ByteBuffer{mapped->vertexData, static_cast<size_t>(VertexBufferSize)};
+    frame.uniforms = ByteBuffer{mapped->uniformData, static_cast<size_t>(UniformBufferSize)};
+    frame.indices = ByteBuffer{mapped->indexData, static_cast<size_t>(IndexBufferSize)};
+    frame.mappedStreams = true;
+    bufferOffset += VertexBufferSize + UniformBufferSize + IndexBufferSize;
+  } else {
+    mapBuffer(frame.verts, VertexBufferSize);
+    mapBuffer(frame.uniforms, UniformBufferSize);
+    mapBuffer(frame.indices, IndexBufferSize);
+  }
   mapBuffer(frame.storage, StorageBufferSize);
   if constexpr (UseTextureBuffer) {
     mapBuffer(frame.textureUpload, TextureUploadSize);
@@ -734,6 +770,19 @@ void end_frame(EndFrameCallback callback) {
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
+    const bool mappedStreams = packet.mappedStreams;
+    if (gles_direct::enabled()) {
+      // The mapped slots are created on the first frame end, once the device's GL context exists here.
+      static bool mappedSlotsRequested = false;
+      if (!mappedSlotsRequested && gles_direct::mapped_streams_enabled()) {
+        mappedSlotsRequested = true;
+        gles_direct::create_mapped_slots(StagingBufferCount);
+      }
+      if (mappedStreams) {
+        gles_direct::flush_mapped_slot(packet);
+      }
+      gles_direct::prepare_frame(packet);
+    }
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
@@ -750,7 +799,7 @@ void end_frame(EndFrameCallback callback) {
     }
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
-    map_staging_buffer(stagingSlot, true);
+    release_staging_slot(stagingSlot, mappedStreams);
     process_events();
   });
 }

@@ -13,18 +13,38 @@
 
 #include <tracy/Tracy.hpp>
 
+#include <absl/container/flat_hash_map.h>
+
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace aurora::gx {
+namespace {
+std::mutex sPipelineConfigMutex;
+absl::flat_hash_map<gfx::PipelineRef, PipelineConfig> sPipelineConfigs;
+} // namespace
+
+bool find_pipeline_config(gfx::PipelineRef ref, PipelineConfig& config) {
+  std::lock_guard lock{sPipelineConfigMutex};
+  const auto it = sPipelineConfigs.find(ref);
+  if (it == sPipelineConfigs.end()) {
+    return false;
+  }
+  config = it->second;
+  return true;
+}
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
   const auto shader = build_shader(config.shaderConfig);
-  const auto label =
-      fmt::format("GX Pipeline {:x} shader {:x}", xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)),
-                  xxh3_hash(config.shaderConfig));
+  const auto hash = xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX));
+  const auto label = fmt::format("GX Pipeline {:x} shader {:x}", hash, xxh3_hash(config.shaderConfig));
+  {
+    std::lock_guard lock{sPipelineConfigMutex};
+    sPipelineConfigs[hash] = config;
+  }
   if (config.shaderConfig.cpuVertexDecode) {
     const auto layout = decoded_vertex_layout(config.shaderConfig);
     // Points keep one record per point and draw it as one instance of a shared quad
