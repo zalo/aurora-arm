@@ -1,7 +1,15 @@
 // Stub implementations for renderer symbols that the GX/FIFO/command_processor code
 // references but that live in the full renderer (gfx, gx.cpp, model/shader.cpp, etc.).
 // These allow the test binary to link without pulling in WebGPU runtime.
+//
+// With AURORA_GX_TEST_LINK_GX defined, the test binary links lib/gx/gx.cpp and
+// lib/gx/shader_info.cpp (plus the WebGPU library for the symbols they reference),
+// so the stubs those files provide are left out and the few symbols they need are
+// stubbed instead.
 
+#include "gfx/hash.hpp"
+#include "gfx/pipeline_cache.hpp"
+#include "gfx/resource_cache.hpp"
 #include "gx/gx.hpp"
 #include "gfx/clear.hpp"
 #include "gfx/resources.hpp"
@@ -50,12 +58,18 @@ void increment_merged_draw_count() noexcept {}
 
 namespace aurora::webgpu {
 GraphicsConfig g_graphicsConfig{};
+#ifdef AURORA_GX_TEST_LINK_GX
+wgpu::Device g_device;
+bool g_hasCoreFeatures = false;
+#endif
 } // namespace aurora::webgpu
 
 // --- GXState ---
 namespace aurora::gx {
+#ifndef AURORA_GX_TEST_LINK_GX
 GXState g_gxState{};
 void set_viewport_policy(AuroraViewportPolicy policy) noexcept {}
+#endif
 } // namespace aurora::gx
 
 namespace aurora::vi {
@@ -65,10 +79,17 @@ void configure(const GXRenderModeObj*) noexcept {}
 
 // --- get_texture ---
 namespace aurora::gx {
+#ifndef AURORA_GX_TEST_LINK_GX
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[id]; }
+#else
+void clear_copy_texture_cache() noexcept {}
+#endif
 namespace texture {
 void invalidate_bindings() noexcept {}
 uint64_t current_bind_generation() noexcept { return 1; }
+#ifdef AURORA_GX_TEST_LINK_GX
+void shutdown() noexcept {}
+#endif
 } // namespace texture
 void evict_texture_object(u32 texObjId) noexcept {
   for (auto& obj : g_gxState.loadedTextures) {
@@ -94,6 +115,7 @@ void evict_copy_texture(const void* dest) noexcept {
     }
   }
 }
+#ifndef AURORA_GX_TEST_LINK_GX
 void shutdown() noexcept {}
 Vec2<uint32_t> logical_fb_size() noexcept { return {640, 480}; }
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept { return logicalViewport; }
@@ -108,16 +130,19 @@ void set_logical_scissor(const gfx::ClipRect& scissor) noexcept {
   set_render_scissor(map_logical_scissor(scissor));
 }
 void set_render_scissor(const gfx::ClipRect& scissor) noexcept { g_gxState.renderScissor = scissor; }
+#endif
 } // namespace aurora::gx
 
 // --- Shader/pipeline stubs ---
 namespace aurora::gx {
+#ifndef AURORA_GX_TEST_LINK_GX
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   // No-op for tests
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
 gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; }
+#endif
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
 } // namespace aurora::gx
 
@@ -132,6 +157,12 @@ Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
 void set_viewport(const Viewport& viewport) noexcept {}
 void set_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) noexcept {}
 uint32_t get_sample_count() noexcept { return 1; }
+#ifdef AURORA_GX_TEST_LINK_GX
+void set_scissor(const ClipRect& scissor) noexcept {}
+uint32_t align_uniform(uint32_t value) { return value; }
+BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) { return 0; }
+wgpu::Sampler sampler_ref(const wgpu::SamplerDescriptor& descriptor) { return {}; }
+#endif
 RenderTargetLayout get_render_target_layout() noexcept {
   return {
       .colorAttachmentCount = 1,
@@ -169,7 +200,8 @@ void push_draw_command<clear::DrawData>(clear::DrawData data) {
 }
 template <>
 PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
-  return 0;
+  // Same key as the pipeline cache derives, without creating a pipeline.
+  return xxh3_hash(config, static_cast<HashType>(ShaderType::GX));
 }
 gx::DrawData g_testLastDraw{};
 uint32_t g_testDrawCount = 0;
@@ -296,6 +328,7 @@ void set_frame_buffer_aspect_fit(bool) {}
 } // namespace aurora::window
 
 // --- WebGPU C API stubs (prevent linker errors from wgpu:: destructors) ---
+#ifndef AURORA_GX_TEST_LINK_GX
 extern "C" {
 void wgpuDeviceRelease(WGPUDevice) {}
 void wgpuQueueRelease(WGPUQueue) {}
@@ -318,6 +351,7 @@ void wgpuTextureAddRef(WGPUTexture) {}
 void wgpuTextureViewAddRef(WGPUTextureView) {}
 void wgpuInstanceAddRef(WGPUInstance) {}
 }
+#endif
 
 void aurora::gfx::push_debug_group(std::string) {}
 void push_debug_group(const char*) {}

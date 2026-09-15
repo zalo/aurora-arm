@@ -52,8 +52,7 @@ gtest_discover_tests(os_time_tests)
 if (AURORA_ENABLE_GX)
   # GX FIFO round-trip tests
   # Compile GX sources directly to avoid pulling in the full renderer/WebGPU runtime
-  add_executable(gx_fifo_tests
-    gx_fifo_test.cpp
+  set(GX_FIFO_TEST_SOURCES
     gx_test_stubs.cpp
     # GX API implementations (encoders)
     ../lib/dolphin/gx/GXBump.cpp
@@ -83,7 +82,12 @@ if (AURORA_ENABLE_GX)
     # Display list reader/optimizer
     ../lib/gx/attr_fmt.cpp
     ../lib/gx/dl.cpp
+  )
+
+  add_executable(gx_fifo_tests
+    gx_fifo_test.cpp
     gx_dl_test.cpp
+    ${GX_FIFO_TEST_SOURCES}
   )
 
   target_include_directories(gx_fifo_tests PRIVATE
@@ -107,6 +111,39 @@ if (AURORA_ENABLE_GX)
   )
 
   gtest_discover_tests(gx_fifo_tests)
+
+  # Pipeline-state memo tests: the FIFO test setup plus the real pipeline config
+  # and shader info builders, so memoized results can be checked against the
+  # uncached path. The WebGPU library satisfies the symbols gx.cpp references.
+  add_executable(gx_pipeline_memo_tests
+    gx_pipeline_memo_test.cpp
+    ${GX_FIFO_TEST_SOURCES}
+    ../lib/gx/gx.cpp
+    ../lib/gx/shader_info.cpp
+  )
+
+  target_include_directories(gx_pipeline_memo_tests PRIVATE
+    ../include
+    ../lib
+    ../lib/dolphin/gx
+  )
+
+  target_compile_definitions(gx_pipeline_memo_tests PRIVATE AURORA TARGET_PC AURORA_GX_TEST_LINK_GX)
+
+  target_link_libraries(gx_pipeline_memo_tests PRIVATE
+    gtest
+    gtest_main
+    fmt::fmt
+    xxhash
+    absl::flat_hash_map
+    absl::btree
+    dawn::webgpu_dawn
+    TracyClient
+    ${AURORA_SDL3_TARGET}
+  )
+
+  aurora_copy_runtime_dlls(gx_pipeline_memo_tests)
+  gtest_discover_tests(gx_pipeline_memo_tests)
 
   add_executable(gx_texture_cache_tests
     gx_texture_cache_test.cpp
