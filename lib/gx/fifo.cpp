@@ -2,6 +2,7 @@
 
 #include "../thread.hpp"
 #include "command_processor.hpp"
+#include "resident_geometry.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -144,6 +145,7 @@ void begin_frame() noexcept { sFrameActive = true; }
 void end_frame() noexcept {
   sFrameActive = false;
   clear_draw_cache(); // command_processor
+  resident::end_frame();
 }
 
 void write_data_grow(const void* data, uint32_t length) {

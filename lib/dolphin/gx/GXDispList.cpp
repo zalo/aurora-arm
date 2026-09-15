@@ -1,5 +1,6 @@
 #include "gx.hpp"
 #include "__gx.h"
+#include "dolphin/gx/GXAurora.h"
 
 #include "../../gx/fifo.hpp"
 
@@ -55,6 +56,17 @@ void GXCallDisplayList(const void* data, u32 nbytes) {
   // Flush pending primitives
   if (*reinterpret_cast<u32*>(&__gx->vNum) != 0) {
     __GXSendFlushPrim();
+  }
+
+  // Resident display lists: reference the list instead of copying it. The command processor
+  // decodes it once into GPU-resident geometry and validates the list bytes on every call.
+  if (aurora::g_config.residentDisplayLists && aurora::g_config.cpuVertexDecode &&
+      !aurora::gx::fifo::in_display_list() && nbytes != 0) {
+    GX_WRITE_AURORA(GX_AURORA_CALL_DL);
+    GX_WRITE_U64(reinterpret_cast<u64>(data));
+    GX_WRITE_U32(nbytes);
+    aurora::gx::fifo::publish();
+    return;
   }
 
   // Write display list contents to the FIFO

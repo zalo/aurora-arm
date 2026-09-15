@@ -15,6 +15,9 @@ struct DrawData {
   uint32_t instanceCount;
   GXBindGroups bindGroups;
   uint32_t dstAlpha;
+  // 0: vertices in the frame vertex stream with 16-bit indices. Otherwise resident arena index + 1
+  // (resident_geometry.hpp): the whole arena is bound and the indices are absolute 32-bit.
+  uint32_t residentArena;
 };
 
 constexpr uint32_t GXPipelineConfigVersion = 13;

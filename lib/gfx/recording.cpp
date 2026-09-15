@@ -13,6 +13,7 @@
 #include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/resident_geometry.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
@@ -228,6 +229,7 @@ FrameOp capture_frame_op(FramePacket& frame, FrameOpType type, uint32_t index) {
   for (size_t i = 0; i < op.highWater.textureUploadCount; ++i) {
     op.textureUploads.push_back(&frame.textureUploads[i]);
   }
+  op.arenaUploads = gx::resident::take_uploads();
   return op;
 }
 
