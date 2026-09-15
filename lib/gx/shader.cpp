@@ -937,14 +937,14 @@ void apply_uniform_table(std::string& source, const ShaderConfig& config) {
   replace("struct VertexOutput {", "var<private> record_index: u32;\nstruct VertexOutput {");
   if (config.batchDraws) {
     replace("var out: VertexOutput;",
-            "var out: VertexOutput;\n    record_index = ((v_matrices.z >> 8u) & 15u) + (imm._pad & 15u);\n    "
-            "out.record = record_index;");
+            fmt::format("var out: VertexOutput;\n    record_index = ((v_matrices.z >> 8u) & {0}u) + (imm._pad & {0}u);\n    "
+                        "out.record = record_index;", UniformRecordsPerWindow - 1));
     replace("fn fs_main(in: VertexOutput) -> @location(0) vec4f {",
             "fn fs_main(in: VertexOutput) -> @location(0) vec4f {\n    record_index = in.record;");
   } else {
-    replace("var out: VertexOutput;", "var out: VertexOutput;\n    record_index = imm._pad & 15u;");
+    replace("var out: VertexOutput;", fmt::format("var out: VertexOutput;\n    record_index = imm._pad & {}u;", UniformRecordsPerWindow - 1));
     replace("fn fs_main(in: VertexOutput) -> @location(0) vec4f {",
-            "fn fs_main(in: VertexOutput) -> @location(0) vec4f {\n    record_index = imm._pad & 15u;");
+            fmt::format("fn fs_main(in: VertexOutput) -> @location(0) vec4f {{\n    record_index = imm._pad & {}u;", UniformRecordsPerWindow - 1));
   }
 }
 

@@ -118,6 +118,10 @@ if (NOT AURORA_VERTEX_BUFFER_MIB EQUAL 5)
     math(EXPR _aurora_vertex_buffer_size "${AURORA_VERTEX_BUFFER_MIB} * 1048576")
     target_compile_definitions(aurora_gx PUBLIC AURORA_VERTEX_BUFFER_SIZE=${_aurora_vertex_buffer_size}ull)
 endif()
+if (NOT AURORA_UNIFORM_WINDOW_KIB EQUAL 64)
+    math(EXPR _aurora_uniform_window_size "${AURORA_UNIFORM_WINDOW_KIB} * 1024")
+    target_compile_definitions(aurora_gx PUBLIC AURORA_UNIFORM_WINDOW_SIZE=${_aurora_uniform_window_size}u)
+endif()
 
 if (AURORA_ENABLE_RMLUI)
     target_sources(aurora_gx PRIVATE

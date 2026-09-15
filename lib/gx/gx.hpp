@@ -71,7 +71,15 @@ constexpr u32 MaxUniformSize = 3840;
 // consecutive slots share one 64 KiB uniform buffer binding (the window). Shaders index the record within
 // the bound window; see uniform_record_index / uniform_window_index.
 constexpr u32 UniformRecordStride = 4096;
+#ifdef AURORA_UNIFORM_WINDOW_SIZE
+// Sized to fit the device's GL_MAX_UNIFORM_BLOCK_SIZE. GLES 3.0 guarantees only 16 KiB, so a
+// portable low-spec build (Mali-G31 and similar) sets this to 16384; larger GPUs keep 64 KiB.
+static_assert(AURORA_UNIFORM_WINDOW_SIZE >= UniformRecordStride && (AURORA_UNIFORM_WINDOW_SIZE & (AURORA_UNIFORM_WINDOW_SIZE - 1)) == 0,
+              "AURORA_UNIFORM_WINDOW_SIZE must be a power of two and at least one record");
+constexpr u32 UniformWindowSize = AURORA_UNIFORM_WINDOW_SIZE;
+#else
 constexpr u32 UniformWindowSize = 65536;
+#endif
 constexpr u32 UniformRecordsPerWindow = UniformWindowSize / UniformRecordStride;
 static_assert(MaxUniformSize <= UniformRecordStride);
 constexpr u32 uniform_record_index(u32 uniformOffset) noexcept {
