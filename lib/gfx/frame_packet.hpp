@@ -193,6 +193,7 @@ struct FrameOp {
   EncoderTask* encoderTask = nullptr;
   StagingHighWater highWater;
   std::vector<const TextureUpload*> textureUploads;
+  std::vector<ArenaUpload> arenaUploads;
 };
 
 using RenderPassList = std::deque<RenderPass>;

@@ -11,6 +11,7 @@
 #include "gx.hpp"
 #include "pipeline.hpp"
 #include "regs.hpp"
+#include "resident_geometry.hpp"
 #include "shader_info.hpp"
 #include "texture.hpp"
 #include "vertex_loader.hpp"
@@ -552,8 +553,8 @@ static gfx::Range push_decoded_verts(GXPrimitive prim, GXVtxFmt fmt, std::span<c
   return range;
 }
 
-static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
-                         u32 numIndices) noexcept {
+static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u32 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
+                         u32 numIndices, u32 residentArena = 0) noexcept {
   auto& state = g_gxState;
   auto& cache = sDrawCache;
 
@@ -629,6 +630,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       .instanceCount = instanceCount,
       .bindGroups = cache.bindGroups,
       .dstAlpha = state.dstAlpha,
+      .residentArena = residentArena,
   });
 }
 
@@ -663,7 +665,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
                           prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
   auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
-  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1;
+  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1 && lastDraw->residentArena == 0;
 
   // Push vertex data to the buffer, raw or decoded on the CPU. Merged draws must remain contiguous
   // with the previous range.
@@ -714,6 +716,89 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   const auto fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
   const auto prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
   draw_prim(prim, fmt, reader.read<u16>(), reader);
+}
+
+// Draws a resident display list (resident_geometry.hpp): its absolute 32-bit indices are appended
+// to the frame's index stream and the whole arena is bound. Consecutive calls under unchanged state
+// merge into one draw, as streamed geometry does.
+static void push_resident_draw(const resident::Entry& entry, GXVtxFmt fmt) noexcept {
+  auto& state = g_gxState;
+  auto& cache = sDrawCache;
+  const u32 arena = entry.arena + 1;
+  const u32 stride = resident::arena_stride(entry.arena);
+  const gfx::Range vertRange{entry.firstVertex * stride, entry.vertexCount * stride};
+  const auto* indexData = reinterpret_cast<const u8*>(entry.indices.data());
+  const size_t indexBytes = entry.indices.size() * sizeof(u32);
+  const auto indexCount = static_cast<u32>(entry.indices.size());
+
+  const bool cleanState = state.dirty == 0 && fmt == cache.lastDrawFmt && cache.lineMode == 0;
+  auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
+  if (lastDraw != nullptr && lastDraw->residentArena == arena && lastDraw->instanceCount == 1) {
+    const gfx::Range idxRange = gfx::push_indices(indexData, indexBytes, 0);
+    CHECK(lastDraw->idxRange.offset + lastDraw->idxRange.size == idxRange.offset,
+          "Non-consecutive index ranges ({} < {})", lastDraw->idxRange.offset + lastDraw->idxRange.size,
+          idxRange.offset);
+    lastDraw->idxRange.size += idxRange.size;
+    lastDraw->indexCount += indexCount;
+    lastDraw->vtxCount += entry.vertexCount;
+    const u32 begin = std::min(lastDraw->vertRange.offset, vertRange.offset);
+    const u32 end = std::max(lastDraw->vertRange.offset + lastDraw->vertRange.size, vertRange.offset + vertRange.size);
+    lastDraw->vertRange = {begin, end - begin};
+    gfx::detail::increment_merged_draw_count();
+    return;
+  }
+  const gfx::Range idxRange = gfx::push_indices(indexData, indexBytes, 4);
+  push_gx_draw(GX_TRIANGLES, fmt, entry.vertexCount, vertRange, idxRange, indexCount, arena);
+}
+
+// GX_AURORA_CALL_DL: decodes the list into resident geometry on first use and draws it by reference
+// afterwards. Lists the cache does not take (state loads, lines, points, mixed vertex formats,
+// over budget) are processed inline exactly as if they had been copied into the FIFO.
+static void handle_call_display_list(const u8* list, u32 size) noexcept {
+  auto& stats = resident::stats();
+  auto& state = g_gxState;
+  ++stats.calls;
+  u32 pos = 0;
+  while (pos < size && list[pos] == CP_CMD_NOP) {
+    ++pos;
+  }
+  if (pos >= size) {
+    return;
+  }
+  // The first draw selects the vertex format; decode_display_list validates the rest.
+  u8 op = list[pos];
+  if (op == GX_AURORA && pos + 4 <= size &&
+      (static_cast<u16>(list[pos + 1]) << 8 | list[pos + 2]) == GX_AURORA_DRAW_INDEXED) {
+    op = list[pos + 3];
+  }
+  const u8 prim = op & CP_OPCODE_MASK;
+  const bool triangles = prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN || prim == GX_QUADS;
+  if (!g_config.cpuVertexDecode || !g_config.residentDisplayLists || !triangles) {
+    ++stats.fallbacks;
+    process(list, size);
+    return;
+  }
+  const auto fmt = static_cast<GXVtxFmt>(op & CP_VAT_MASK);
+  prepare_pipeline(GX_TRIANGLES, fmt);
+  const auto& config = sDrawCache.config.shaderConfig;
+  const u64 key = resident::entry_key(list, size, config, state.arrays, state.currentPnMtx);
+  const u64 listHash = resident::list_hash(list, size);
+  resident::Entry* entry = resident::find(key);
+  if (entry != nullptr && entry->listHash == listHash) {
+    ++stats.hits;
+  } else {
+    resident::Entry decoded{.list = list, .listBytes = size, .listHash = listHash};
+    if (!resident::decode_display_list(list, size, fmt, vertex_loader(config), state.arrays, state.currentPnMtx,
+                                       decoded)) {
+      resident::erase(key);
+      ++stats.fallbacks;
+      process(list, size);
+      return;
+    }
+    ++stats.misses;
+    entry = &resident::insert(key, std::move(decoded));
+  }
+  push_resident_draw(*entry, fmt);
 }
 
 void handle_aurora(ByteReader& reader) noexcept {
@@ -922,6 +1007,15 @@ void handle_aurora(ByteReader& reader) noexcept {
     gfx::finish();
     gfx::end_deferred_frame();
     dispatch_after_frame();
+  } else if (subCmd == GX_AURORA_CALL_DL) {
+    ZoneScopedN("CALL_DL");
+    const auto* list = reinterpret_cast<const u8*>(reader.read<u64>());
+    const u32 size = reader.read<u32>();
+    handle_call_display_list(list, size);
+  } else if (subCmd == GX_AURORA_INVALIDATE_RESIDENT) {
+    const auto* base = reinterpret_cast<const void*>(reader.read<u64>());
+    const u32 size = reader.read<u32>();
+    resident::invalidate(base, size);
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
     auto label = reader.read_string();
     gfx::push_debug_group(std::move(label));

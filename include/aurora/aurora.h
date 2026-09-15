@@ -151,6 +151,21 @@ typedef struct {
    * GLES-class GPUs where vertex-shader storage buffer reads are slow or unavailable.
    */
   bool cpuVertexDecode;
+
+  /*
+   * Keep geometry decoded from GXCallDisplayList resident on the GPU (requires cpuVertexDecode).
+   * Each distinct display list is decoded once and later calls only reference it. The application
+   * must call GXInvalidateResidentGeometry() before it frees or rewrites memory that held display
+   * lists or the vertex arrays they index; rewriting the first or last 64 bytes of a list in place
+   * is detected without it. GXInvalidateVtxCache() does not affect resident geometry.
+   */
+  bool residentDisplayLists;
+
+  /*
+   * Bytes of decoded display-list geometry kept resident before the cache is emptied and rebuilt
+   * (at a frame boundary). 0 selects the default of 64 MiB.
+   */
+  uint32_t residentGeometryBudget;
 } AuroraConfig;
 
 typedef struct {

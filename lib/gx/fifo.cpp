@@ -4,6 +4,7 @@
 #include "command_processor.hpp"
 #include "dolphin/gx/GXAurora.h"
 #include "dolphin/gx/GXCommandList.h"
+#include "resident_geometry.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -169,6 +170,7 @@ void begin_frame() noexcept { sFrameActive = true; }
 void end_frame() noexcept {
   sFrameActive = false;
   clear_draw_cache(); // command_processor
+  resident::end_frame();
 }
 
 void begin_frame_async(uint32_t frameSlot) {

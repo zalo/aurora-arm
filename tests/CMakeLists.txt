@@ -79,6 +79,7 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/command_processor.cpp
     ../lib/gx/regs.cpp
     ../lib/gx/vertex_loader.cpp
+    ../lib/gx/resident_geometry.cpp
     ../lib/thread.cpp
     # Display list reader/optimizer
     ../lib/gx/attr_fmt.cpp
@@ -89,6 +90,8 @@ if (AURORA_ENABLE_GX)
     gx_fifo_test.cpp
     gx_dl_test.cpp
     ${GX_FIFO_TEST_SOURCES}
+    # Resident display-list geometry
+    gx_resident_test.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE

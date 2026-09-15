@@ -9,6 +9,7 @@
 #include "tex_palette_conv.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/resident_geometry.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
@@ -423,6 +424,7 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
 namespace detail {
 void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
   copy_staging_to_high_water(cmd, frame, op);
+  gx::resident::encode_uploads(cmd, op.arenaUploads);
   switch (op.type) {
   case FrameOpType::RenderPass:
     if (op.renderPass != nullptr) {
