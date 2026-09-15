@@ -12,6 +12,7 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -51,11 +52,15 @@ struct CachedTextureEntry {
   u32 tlutDataVersion = 0;
   uint64_t replacementId = 0;
   uint64_t lastUsedFrame = 0;
+  uint64_t contentSample = 0; // sampled source fingerprint, checked on object-cache hits
+  uint64_t lastVerifiedFrame = 0;
 };
 
 struct CachedTlutTextureEntry {
   gfx::TextureHandle handle;
   u32 tlutDataVersion = 0;
+  uint64_t contentSample = 0;
+  uint64_t lastVerifiedFrame = 0;
 };
 
 struct TlutObjectCache {
@@ -138,6 +143,87 @@ constexpr bool BuildSourceKeyForDebug = false;
 
 constexpr uint32_t div_ceil(uint32_t value, uint32_t divisor) noexcept { return (value + divisor - 1) / divisor; }
 
+// Object identities are derived from the image description (texture_object_identity), so objects describing the
+// same image share one cache entry even when the memory behind it was reused or rewritten in place without a
+// texDataVersion bump. Object-cache hits are therefore checked against a sampled fingerprint of the source: sources
+// up to FullSampleLimit bytes are hashed completely, larger ones through SampleCount spread samples including the
+// tail (the same approach as Dolphin's "fast" texture cache).
+constexpr size_t SampleCount = 32;
+constexpr size_t SampleBytes = 64;
+constexpr size_t FullSampleLimit = SampleCount * SampleBytes;
+
+class ContentSampler {
+public:
+  void add(const void* data, size_t bytes) noexcept {
+    const auto* src = static_cast<const uint8_t*>(data);
+    if (src == nullptr || bytes == 0) {
+      return;
+    }
+    if (bytes <= FullSampleLimit) {
+      append(src, bytes);
+      return;
+    }
+    const size_t stride = (bytes - SampleBytes) / (SampleCount - 1);
+    for (size_t i = 0; i < SampleCount - 1; ++i) {
+      append(src + i * stride, SampleBytes);
+    }
+    append(src + bytes - SampleBytes, SampleBytes);
+  }
+
+  // Never 0: 0 marks an entry without a fingerprint.
+  uint64_t finish() const noexcept { return XXH3_64bits(m_buffer.data(), m_used) | 1; }
+
+private:
+  void append(const uint8_t* src, size_t bytes) noexcept {
+    std::memcpy(m_buffer.data() + m_used, src, bytes);
+    m_used += bytes;
+  }
+
+  std::array<uint8_t, 2 * FullSampleLimit> m_buffer;
+  size_t m_used = 0;
+};
+
+uint64_t sample_texture_content(const GXTexObj_& obj, const GXTlutObj_* tlut) noexcept {
+  ContentSampler sampler;
+  sampler.add(obj.data, texture::texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count()));
+  if (tlut != nullptr) {
+    sampler.add(tlut->data, texture::tlut_source_size(tlut->numEntries));
+  }
+  return sampler.finish();
+}
+
+uint64_t sample_tlut_content(const GXTlutObj_& tlut) noexcept {
+  ContentSampler sampler;
+  sampler.add(tlut.data, texture::tlut_source_size(tlut.numEntries));
+  return sampler.finish();
+}
+
+// An entry is verified at most once per frame; texDataVersion / tlutDataVersion changes bypass this and invalidate
+// immediately.
+template <typename Entry>
+bool verification_due(Entry& entry) noexcept {
+  if (entry.lastVerifiedFrame == s_frameCount) {
+    return false;
+  }
+  entry.lastVerifiedFrame = s_frameCount;
+  return true;
+}
+
+template <typename Entry, typename Sample>
+bool content_matches(Entry& entry, Sample&& sample) noexcept {
+  if (entry.contentSample == 0 || !verification_due(entry)) {
+    return true;
+  }
+  return entry.contentSample == sample();
+}
+
+// texObjId is a 32-bit hash of the description; comparing the description itself turns a hash collision into a
+// re-resolve instead of a stale bind.
+bool same_texture_description(const GXTexObj_& a, const GXTexObj_& b) noexcept {
+  return a.data == b.data && a.width() == b.width() && a.height() == b.height() && a.tlut == b.tlut &&
+         a.mode0 == b.mode0 && a.mode1 == b.mode1 && (a.flags & 3u) == (b.flags & 3u);
+}
+
 void do_clear_static_texture_cache() noexcept {
   s_textureObjectCaches.clear();
   s_replacementUsers.clear();
@@ -194,12 +280,13 @@ void clear_texture_dependency(u32 texObjId, const CachedTextureEntry& entry) {
   clear_texture_dependency(texObjId, entry.tlutObjId, entry.replacementId);
 }
 
-void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 tlutObjId = 0, u32 tlutDataVersion = 0,
+void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, const GXTlutObj_* tlut = nullptr,
                           uint64_t replacementId = 0) {
   if (obj.texObjId == 0) {
     return;
   }
 
+  const u32 tlutObjId = tlut != nullptr ? tlut->tlutObjId : 0;
   auto& entry = s_textureObjectCaches[obj.texObjId];
   if (entry.tlutObjId != tlutObjId || entry.replacementId != replacementId) {
     clear_texture_dependency(obj.texObjId, entry);
@@ -208,9 +295,11 @@ void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 t
   entry.handle = std::move(handle);
   entry.texDataVersion = obj.texDataVersion;
   entry.tlutObjId = tlutObjId;
-  entry.tlutDataVersion = tlutDataVersion;
+  entry.tlutDataVersion = tlut != nullptr ? tlut->tlutDataVersion : 0;
   entry.replacementId = replacementId;
   entry.lastUsedFrame = s_frameCount;
+  entry.contentSample = sample_texture_content(obj, tlut);
+  entry.lastVerifiedFrame = s_frameCount;
 
   if (tlutObjId != 0) {
     auto& cache = s_tlutObjectCaches[tlutObjId];
@@ -374,7 +463,8 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
   if (tlut.tlutObjId != 0) {
     auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
     cache.lastUsedFrame = s_frameCount;
-    if (cache.tlutTexture.handle && cache.tlutTexture.tlutDataVersion == tlut.tlutDataVersion) {
+    if (cache.tlutTexture.handle && cache.tlutTexture.tlutDataVersion == tlut.tlutDataVersion &&
+        content_matches(cache.tlutTexture, [&] { return sample_tlut_content(tlut); })) {
       return cache.tlutTexture.handle;
     }
     cache.dynamicPaletteTextures.clear();
@@ -395,6 +485,8 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
     auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
     cache.tlutTexture.handle = handle;
     cache.tlutTexture.tlutDataVersion = tlut.tlutDataVersion;
+    cache.tlutTexture.contentSample = sample_tlut_content(tlut);
+    cache.tlutTexture.lastVerifiedFrame = s_frameCount;
     cache.lastUsedFrame = s_frameCount;
   }
   return handle;
@@ -566,6 +658,41 @@ size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noex
 
 size_t tlut_source_size(u16 numEntries) noexcept { return static_cast<size_t>(numEntries) * sizeof(u16); }
 
+u32 texture_object_identity(const GXTexObj_& obj) noexcept {
+  // The top byte of mode0 / mode1 is the BP register address written by GXLoadTexObj, not object state. Everything
+  // else that reaches the sampler (wrap, filters, LOD bias / clamp, anisotropy, min / max LOD) must be part of the
+  // identity: the bound-texture cache keeps the object descriptor, so two objects for the same image with different
+  // sampler state must not alias.
+  const auto address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(obj.data));
+  const std::array<u32, 9> key{
+      static_cast<u32>(address),
+      static_cast<u32>(address >> 32),
+      obj.width(),
+      obj.height(),
+      obj.format(),
+      obj.mode0 & 0x00FFFFFFu,
+      obj.mode1 & 0x0000FFFFu,
+      obj.flags & 3u,
+      static_cast<u32>(obj.tlut),
+  };
+  const uint64_t hash = XXH3_64bits(key.data(), sizeof(key));
+  const u32 id = static_cast<u32>(hash ^ (hash >> 32));
+  return id != 0 ? id : 1;
+}
+
+u32 tlut_object_identity(const GXTlutObj_& tlut) noexcept {
+  const auto address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tlut.data));
+  const std::array<u32, 4> key{
+      static_cast<u32>(address),
+      static_cast<u32>(address >> 32),
+      static_cast<u32>(tlut.format),
+      tlut.numEntries,
+  };
+  const uint64_t hash = XXH3_64bits(key.data(), sizeof(key));
+  const u32 id = static_cast<u32>(hash ^ (hash >> 32));
+  return id != 0 ? id : 1;
+}
+
 void invalidate_bindings() noexcept { s_pendingInvalidations.fetch_add(1, std::memory_order_release); }
 
 uint64_t current_bind_generation() noexcept {
@@ -598,7 +725,8 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
   if (obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
       auto& entry = it->second;
-      if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == 0) {
+      if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == 0 &&
+          content_matches(entry, [&] { return sample_texture_content(obj, nullptr); })) {
         entry.lastUsedFrame = s_frameCount;
         ++s_stats.objectHits;
         return entry.handle;
@@ -637,7 +765,7 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
     }
   }
   if (!obj.no_cache()) {
-    store_cached_texture(obj, handle, 0, 0, replacementId);
+    store_cached_texture(obj, handle, nullptr, replacementId);
   }
   return handle;
 }
@@ -649,7 +777,8 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
       auto& entry = it->second;
       if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == tlut.tlutObjId &&
-          entry.tlutDataVersion == tlut.tlutDataVersion) {
+          entry.tlutDataVersion == tlut.tlutDataVersion &&
+          content_matches(entry, [&] { return sample_texture_content(obj, &tlut); })) {
         entry.lastUsedFrame = s_frameCount;
         if (auto tlutIt = s_tlutObjectCaches.find(tlut.tlutObjId); tlutIt != s_tlutObjectCaches.end()) {
           tlutIt->second.lastUsedFrame = s_frameCount;
@@ -693,7 +822,7 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
     }
   }
   if (!obj.no_cache() && !tlut.no_cache()) {
-    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion, replacementId);
+    store_cached_texture(obj, handle, &tlut, replacementId);
   }
   return handle;
 }
@@ -846,7 +975,8 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     GXTexObj_ obj = g_gxState.loadedTextures[i];
     auto& textureBind = g_gxState.textures[i];
     if (textureBind.generation == s_bindGeneration && obj.texObjId != 0 &&
-        obj.texObjId == textureBind.texObj.texObjId && obj.texDataVersion == textureBind.texObj.texDataVersion) {
+        obj.texObjId == textureBind.texObj.texObjId && obj.texDataVersion == textureBind.texObj.texDataVersion &&
+        same_texture_description(obj, textureBind.texObj)) {
       touch_bound_texture(obj);
       continue;
     }

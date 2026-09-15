@@ -290,6 +290,161 @@ TEST_F(GxTextureCacheTest, CopyRecreationAtSameDestinationRebindsHandle) {
   EXPECT_EQ(g_gxState.textures[0].ref, second);
 }
 
+TEST_F(GxTextureCacheTest, IdentityIsStableAcrossRecreatedObjects) {
+  std::array<uint8_t, 16> pixels{};
+  auto first = make_texture(pixels.data(), 0);
+  first.mode0 = 0x90; // clamp / clamp, linear mag, linear min
+  first.texObjId = texture::texture_object_identity(first);
+  // The same description built again from scratch, as a per-frame temporary object would be.
+  auto second = make_texture(pixels.data(), 0);
+  second.mode0 = 0x90;
+  second.texObjId = texture::texture_object_identity(second);
+  EXPECT_NE(first.texObjId, 0u);
+  EXPECT_EQ(first.texObjId, second.texObjId);
+
+  // The top byte of mode0 / mode1 is the BP register address set by GXLoadTexObj and is not object state.
+  auto loaded = second;
+  loaded.mode0 |= 0x80u << 24;
+  loaded.mode1 |= 0x84u << 24;
+  EXPECT_EQ(texture::texture_object_identity(loaded), first.texObjId);
+
+  texture::resolve_static_texture(first);
+  texture::end_frame();
+  texture::resolve_static_texture(second);
+
+  EXPECT_EQ(texture_stats().objectHits, 1);
+  EXPECT_EQ(texture_stats().hashedBytes, 0);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+}
+
+TEST_F(GxTextureCacheTest, IdentityCoversImageDescriptionAndSamplerState) {
+  std::array<uint8_t, 16> pixels{};
+  std::array<uint8_t, 16> other{};
+  const auto base = make_texture(pixels.data(), 0);
+  const u32 id = texture::texture_object_identity(base);
+
+  EXPECT_NE(texture::texture_object_identity(make_texture(other.data(), 0)), id);
+  EXPECT_NE(texture::texture_object_identity(make_texture(pixels.data(), 0, GX_TF_RGBA8_PC, 4, 1)), id);
+  EXPECT_NE(texture::texture_object_identity(make_texture(pixels.data(), 0, GX_TF_RGB565)), id);
+
+  auto wrap = base;
+  wrap.mode0 |= GX_REPEAT;
+  EXPECT_NE(texture::texture_object_identity(wrap), id);
+  auto filter = base;
+  filter.mode0 |= 1u << 4;
+  EXPECT_NE(texture::texture_object_identity(filter), id);
+  auto bias = base;
+  bias.mode0 |= 0x20u << 9;
+  EXPECT_NE(texture::texture_object_identity(bias), id);
+  auto lod = base;
+  lod.mode1 |= 0x10u << 8;
+  EXPECT_NE(texture::texture_object_identity(lod), id);
+  auto mips = base;
+  mips.flags |= 1u;
+  EXPECT_NE(texture::texture_object_identity(mips), id);
+  auto tlut = base;
+  tlut.tlut = GX_TLUT1;
+  EXPECT_NE(texture::texture_object_identity(tlut), id);
+
+  const auto tlutBase = make_tlut(pixels.data(), 0);
+  const u32 tlutId = texture::tlut_object_identity(tlutBase);
+  EXPECT_NE(tlutId, 0u);
+  EXPECT_EQ(texture::tlut_object_identity(make_tlut(pixels.data(), 0)), tlutId);
+  EXPECT_NE(texture::tlut_object_identity(make_tlut(other.data(), 0)), tlutId);
+  EXPECT_NE(texture::tlut_object_identity(make_tlut(pixels.data(), 0, 8)), tlutId);
+  auto tlutFormat = tlutBase;
+  tlutFormat.format = GX_TL_RGB565;
+  EXPECT_NE(texture::tlut_object_identity(tlutFormat), tlutId);
+}
+
+TEST_F(GxTextureCacheTest, RecreatedObjectWithOtherSamplerStateRebinds) {
+  std::array<uint8_t, 16> pixels{};
+  auto obj = make_texture(pixels.data(), 0);
+  obj.texObjId = texture::texture_object_identity(obj);
+  g_gxState.loadedTextures[0] = obj;
+  ShaderInfo info{};
+  info.sampledTextures.set(0);
+  resolve_sampled_textures(info);
+  EXPECT_EQ(g_gxState.textures[0].texObj.wrap_s(), GX_CLAMP);
+
+  obj.mode0 |= GX_REPEAT;
+  obj.texObjId = texture::texture_object_identity(obj);
+  g_gxState.loadedTextures[0] = obj;
+  resolve_sampled_textures(info);
+
+  EXPECT_EQ(g_gxState.textures[0].texObj.wrap_s(), GX_REPEAT);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+  EXPECT_EQ(texture_stats().contentHits, 1);
+}
+
+TEST_F(GxTextureCacheTest, InPlaceContentChangeIsDetectedOnObjectHit) {
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  const auto first = texture::resolve_static_texture(obj);
+
+  pixels[5] = 1; // rewritten in place without a texDataVersion bump
+  texture::end_frame();
+  const auto second = texture::resolve_static_texture(obj);
+
+  EXPECT_NE(first, second);
+  EXPECT_EQ(testing::texture_allocations(), 2);
+  EXPECT_EQ(texture_stats().objectHits, 0);
+}
+
+TEST_F(GxTextureCacheTest, LargeSourceIsVerifiedThroughSpreadSamplesAndTail) {
+  std::vector<uint8_t> pixels(64 * 64 * 4);
+  const auto obj = make_texture(pixels.data(), 1, GX_TF_RGBA8_PC, 64, 64);
+  const auto first = texture::resolve_static_texture(obj);
+
+  pixels.back() = 1;
+  texture::end_frame();
+  const auto second = texture::resolve_static_texture(obj);
+  EXPECT_NE(first, second);
+
+  pixels.front() = 1;
+  texture::end_frame();
+  const auto third = texture::resolve_static_texture(obj);
+  EXPECT_NE(second, third);
+  EXPECT_EQ(testing::texture_allocations(), 3);
+}
+
+TEST_F(GxTextureCacheTest, InPlaceTlutChangeIsDetectedOnPaletteObjectHit) {
+  std::array<uint8_t, 32> indices{};
+  std::array<uint8_t, 32> palette{};
+  const auto obj = make_texture(indices.data(), 1, GX_TF_C4, 4, 4);
+  const auto tlut = make_tlut(palette.data(), 1);
+  const auto first = texture::resolve_static_palette_texture(obj, tlut);
+
+  palette[2] = 1;
+  texture::end_frame();
+  const auto second = texture::resolve_static_palette_texture(obj, tlut);
+
+  EXPECT_NE(first, second);
+  EXPECT_EQ(testing::texture_allocations(), 2);
+}
+
+TEST_F(GxTextureCacheTest, InPlaceTlutChangeRefreshesTlutTexture) {
+  std::array<uint8_t, 32> palette{};
+  const auto copy = testing::make_texture_handle(4, 4, GX_TF_C8);
+  g_gxState.loadedTextures[0] = make_texture(palette.data(), 1, GX_TF_C8, 4, 4);
+  g_gxState.loadedTextures[0].tlut = GX_TLUT0;
+  g_gxState.loadedTluts[0] = make_tlut(palette.data(), 1, 16);
+  g_gxState.copyTextures[palette.data()] = {.handle = copy, .revision = 1};
+  ShaderInfo info{};
+  info.sampledTextures.set(0);
+  resolve_sampled_textures(info);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+  EXPECT_EQ(testing::palette_conversions(), 1);
+
+  palette[1] = 1;
+  texture::end_frame();
+  texture::invalidate_bindings();
+  resolve_sampled_textures(info);
+
+  EXPECT_EQ(testing::texture_allocations(), 2);
+  EXPECT_EQ(testing::palette_conversions(), 2);
+}
+
 TEST_F(GxTextureCacheTest, ObjectAgingKeepsContentEntry) {
   std::array<uint8_t, 16> pixels{};
   const auto obj = make_texture(pixels.data(), 1);
