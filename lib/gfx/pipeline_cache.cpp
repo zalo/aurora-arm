@@ -60,6 +60,7 @@ struct SdlVfsSqliteFile {
 
 static std::mutex g_pipelineMutex;
 static bool g_hasPipelineThread = false;
+static bool g_suppressPipelineCreation = false;
 static size_t g_pipelinesPerFrame = 0;
 // For synchronous pipeline fallback (OpenGL)
 #ifdef NDEBUG
@@ -488,7 +489,8 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
         }
         notifyWorker = priority != PipelinePriority::Background;
       }
-    } else if (!g_hasPipelineThread && (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
+    } else if (!g_hasPipelineThread && !g_suppressPipelineCreation &&
+               (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
       g_pipelines.try_emplace(hash, CachedPipeline{
                                         .pipeline = cb(),
                                         .firstFrameUsed = firstFrameUsed,
@@ -1115,6 +1117,10 @@ PipelineRef find_pipeline(ShaderType type, const rmlui::PipelineConfig& config, 
   return find_pipeline_impl(type, config, std::move(cb), PipelinePriority::Blocking, 0);
 }
 #endif
+
+namespace detail::testing {
+void suppress_pipeline_creation(bool suppress) noexcept { g_suppressPipelineCreation = suppress; }
+} // namespace detail::testing
 
 void initialize_pipeline_cache() {
   g_pipelineCacheBroken = false;

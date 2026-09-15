@@ -64,6 +64,9 @@ namespace tex_palette_conv {
 struct ConvRequest;
 }
 void queue_palette_conv(tex_palette_conv::ConvRequest req);
+// Pass fusion: a draw that samples the target of a copy still pending in the current fused pass must split the
+// pass so the copy is resolved before the draw. Called with the handle of every EFB copy texture a draw samples.
+void on_copy_texture_sampled(const TextureHandle& handle) noexcept;
 
 Range push_verts(const uint8_t* data, size_t length, size_t alignment);
 template <typename T>

@@ -36,4 +36,9 @@ PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCall
 
 bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
 
+namespace detail::testing {
+// Queues new pipelines instead of creating them, for host tests that record frames without a GPU device.
+void suppress_pipeline_creation(bool suppress) noexcept;
+} // namespace detail::testing
+
 } // namespace aurora::gfx

@@ -88,6 +88,17 @@ struct RenderPass {
   GXTexFmt resolveFormat = GX_TF_RGBA8;
   ClipRect resolveRect;
   Range resolveUniformRange;
+  // Additional EFB copies resolved from this pass. Pass fusion (recording.cpp) records the EFB pass that follows a
+  // small render-to-texture copy into the same render pass, shifted right of the first copy rectangle.
+  struct ExtraResolve {
+    TextureHandle target;
+    GXTexFmt format = GX_TF_RGBA8;
+    ClipRect rect{};
+    Range uniformRange;
+  };
+  std::vector<ExtraResolve> extraResolves;
+  // Both UV transforms of a pass with one extra resolve (32 bytes), for the two-target conversion pass.
+  Range dualResolveUniformRange;
   wgpu::Texture snapshotColorDst;
   wgpu::TextureView snapshotDepthDst;
   float clearDepthValue = 1.f;
@@ -104,6 +115,11 @@ struct RenderPass {
   bool discardable = false;
   bool captureDepthSnapshot = false;
   bool sealed = false;
+  // Channels written by the GX draws recorded so far (1 color, 2 alpha, 4 depth); clear draws do not count.
+  uint8_t writeMask = 0;
+  // Channels cleared by the full-target clear draw that opens a pass after a color- or alpha-only copy clear.
+  uint8_t leadingClearMask = 0;
+  Vec4<float> leadingClearValue{0.f, 0.f, 0.f, 0.f};
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 
   RenderTargetLayout target_layout() const noexcept;
