@@ -951,6 +951,11 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
   std::string vtxXfrAttrs;
   size_t vtxOutIdx = 0;
 
+  // Texture coordinate handed to textureSampleBias: remapped into the atlas
+  // cell when textures may be atlased (AuroraConfig::textureAtlas).
+  const auto sample_uv = [](u32 texMapId, std::string_view uv) {
+    return g_config.textureAtlas ? fmt::format("atlas_uv({}, ubuf.tex{}_atlas)", uv, texMapId) : std::string{uv};
+  };
   // Load points for line/point expansion
   std::string_view vidxAttr = "vidx"sv;
   if (config.lineMode != 0) {
@@ -1337,7 +1342,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
         "\n    // Indirect stage {0}"
         "\n    var t_IndTexCoord{0} = 255.0 * textureSampleBias(tex{1}, tex{1}_samp, {2}, "
         "i32(ubuf.tex{1}_size_bias.w), ubuf.tex{1}_size_bias.z).abg;",
-        i, texMapId, scaleExpr);
+        i, texMapId, sample_uv(texMapId, scaleExpr));
   }
   if (info.usedIndStages.any()) {
     fragmentFnPre += "\n    var t_TexCoord = vec2f(0.0);";
@@ -1517,7 +1522,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     fragmentFnPre += fmt::format(
         "\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, i32(ubuf.tex{1}_size_bias.w), "
         "ubuf.tex{1}_size_bias.z);",
-        i, underlying(stage.texMapId), uvIn);
+        i, underlying(stage.texMapId), sample_uv(underlying(stage.texMapId), uvIn));
   }
   if (info.usesPTTexMtx.any()) {
     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
@@ -1577,12 +1582,27 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
   if (info.usedIndTexMtxs.any()) {
     uniBufAttrs += fmt::format("\n    ind_mtx: array<mat2x4f, {}>,", MaxIndTexMtxs);
   }
+  if (g_config.textureAtlas) {
+    // Atlas textures sample inside their cell; the gutter of replicated edge
+    // texels around it makes clamp filtering match the standalone texture.
+    texBindings +=
+        "\nfn atlas_uv(uv: vec2f, cell: vec4f) -> vec2f {"
+        "\n    if (cell.w > 0.0) {"
+        "\n        return clamp(uv, vec2f(0.0), vec2f(1.0)) * cell.zw + cell.xy;"
+        "\n    }"
+        "\n    return uv;"
+        "\n}";
+  }
   for (int i = 0; i < info.sampledTextures.size(); ++i) {
     if (!info.sampledTextures.test(i)) {
       continue;
     }
     // Size, LOD bias and array layer of the texture (see texture_size_bias).
     uniBufAttrs += fmt::format("\n    tex{}_size_bias: vec4f,", i);
+    if (g_config.textureAtlas) {
+      // Atlas cell as (offset.xy, scale.zw), w = 0 when not atlased.
+      uniBufAttrs += fmt::format("\n    tex{}_atlas: vec4f,", i);
+    }
     texBindings += fmt::format(
         "\n@group(2) @binding({1})\n"
         "var tex{0}: texture_2d_array<f32>;\n"
