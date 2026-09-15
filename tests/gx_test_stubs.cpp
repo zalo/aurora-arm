@@ -2,6 +2,7 @@
 // references but that live in the full renderer (gfx, gx.cpp, model/shader.cpp, etc.).
 // These allow the test binary to link without pulling in WebGPU runtime.
 
+#include <vector>
 #include "gx/gx.hpp"
 #include "gfx/clear.hpp"
 #include "gfx/resources.hpp"
@@ -123,14 +124,31 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
 
 // --- Buffer push stubs ---
 namespace aurora::gfx {
-Range push_verts(const uint8_t* data, size_t length, size_t alignment) { return {}; }
-Range map_verts(size_t length, size_t alignment, uint8_t*& data) {
-  data = nullptr;
-  return {};
+// The command processor drops a draw whose stream push returns an empty range (stream full), so the
+// stubs report the pushed size at a running offset like the real streams do.
+static Range stub_range(size_t& cursor, size_t length, size_t alignment) {
+  if (alignment != 0) {
+    cursor = AURORA_ALIGN(cursor, alignment);
+  }
+  const Range range{static_cast<uint32_t>(cursor), static_cast<uint32_t>(length)};
+  cursor += length;
+  return range;
 }
-Range push_indices(const uint8_t* data, size_t length, size_t alignment) { return {}; }
-Range push_uniform(const uint8_t* data, size_t length) { return {}; }
-Range push_storage(const uint8_t* data, size_t length) { return {}; }
+static size_t g_stubVertCursor = 0, g_stubIndexCursor = 0, g_stubUniformCursor = 0, g_stubStorageCursor = 0;
+static std::vector<uint8_t> g_stubVertScratch;
+Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
+  return stub_range(g_stubVertCursor, length, alignment);
+}
+Range map_verts(size_t length, size_t alignment, uint8_t*& data) {
+  g_stubVertScratch.resize(length);
+  data = g_stubVertScratch.data();
+  return stub_range(g_stubVertCursor, length, alignment);
+}
+Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+  return stub_range(g_stubIndexCursor, length, alignment);
+}
+Range push_uniform(const uint8_t* data, size_t length) { return stub_range(g_stubUniformCursor, length, 256); }
+Range push_storage(const uint8_t* data, size_t length) { return stub_range(g_stubStorageCursor, length, 256); }
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
 void set_viewport(const Viewport& viewport) noexcept {}

@@ -53,6 +53,10 @@ set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxhash)
 target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 TracyClient PNG::PNG)
 target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
+if (NOT AURORA_VERTEX_BUFFER_MIB EQUAL 5)
+    math(EXPR _aurora_vertex_buffer_size "${AURORA_VERTEX_BUFFER_MIB} * 1048576")
+    target_compile_definitions(aurora_gx PUBLIC AURORA_VERTEX_BUFFER_SIZE=${_aurora_vertex_buffer_size}ull)
+endif()
 
 if (AURORA_ENABLE_RMLUI)
     target_sources(aurora_gx PRIVATE

@@ -37,6 +37,7 @@ using namespace detail;
 
 namespace {
 constexpr Module Log{"aurora::gfx"};
+static bool stream_has_room(const ByteBuffer& target, size_t length, size_t alignment, const char* name);
 
 struct FrameRecorder {
   FramePacket* packet = nullptr;
@@ -243,6 +244,9 @@ void seal_pass(FramePacket& frame, uint32_t passIndex) {
 }
 
 Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment) {
+  if (!stream_has_room(target, length, alignment, "frame")) {
+    return {static_cast<uint32_t>(target.size()), 0};
+  }
   if (alignment != 0) {
     const size_t begin = target.size();
     const size_t alignedBegin = AURORA_ALIGN(begin, alignment);
@@ -257,7 +261,30 @@ Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignm
   return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length)};
 }
 
+// Frame streams are views over a mapped staging range and cannot grow. A push that would overflow
+// one is refused (an empty range) instead of aborting; the caller drops its draw. CPU-decoded
+// vertex records are wider than raw GX vertices, so titles hitting this should raise
+// AURORA_VERTEX_BUFFER_MIB (or enable residentDisplayLists).
+static bool stream_has_room(const ByteBuffer& target, size_t length, size_t alignment, const char* name) {
+  if (target.owned()) {
+    return true;
+  }
+  const size_t begin = alignment != 0 ? AURORA_ALIGN(target.size(), alignment) : target.size();
+  if (begin + length <= target.capacity()) {
+    return true;
+  }
+  static uint32_t reports = 0;
+  if (reports++ % 300 == 0) {
+    Log.report(LOG_ERROR, "{} stream full ({} + {} > {} bytes); dropping draw data", name, begin, length,
+               target.capacity());
+  }
+  return false;
+}
+
 Range map(ByteBuffer& target, size_t length, size_t alignment) {
+  if (!stream_has_room(target, length, alignment, "frame")) {
+    return {static_cast<uint32_t>(target.size()), 0};
+  }
   if (alignment != 0) {
     const size_t begin = target.size();
     const size_t alignedBegin = AURORA_ALIGN(begin, alignment);

@@ -542,6 +542,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
     numIndices = prepare_idx_buffer(idxBuf, prim, 0, vtxCount);
     idxRange = gfx::push_indices(idxBuf.data(), idxBuf.size(), 4);
     idxBuf.clear();
+    if (idxRange.size == 0 && numIndices != 0)
+      UNLIKELY { return; } // index stream full (reported by gfx)
   }
 
   push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, numIndices);
@@ -570,6 +572,12 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   const gfx::Range vertRange = g_config.cpuVertexDecode
                                    ? push_decoded_verts(prim, fmt, vertexData, vtxCount, canMerge ? 0 : 4)
                                    : gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
+  if (vertRange.size == 0 && vtxCount != 0)
+    UNLIKELY {
+      // The frame's vertex stream is full (reported by gfx); drop this draw rather than record a
+      // range that does not exist.
+      return;
+    }
 
   // Try to merge with previous draw call
   if (canMerge) {
@@ -585,6 +593,8 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       numIndices += prepare_idx_buffer(idxBuf, prim, lastDraw->vtxCount, vtxCount);
       idxRange = gfx::push_indices(idxBuf.data(), idxBuf.size(), hadIndexRange ? 0 : 4);
       idxBuf.clear();
+      if (idxRange.size == 0 && numIndices != 0)
+        UNLIKELY { return; } // index stream full: leave the previous draw as it was
     }
     CHECK(lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset,
           "Non-consecutive vertex ranges ({} < {})", lastDraw->vertRange.offset + lastDraw->vertRange.size,
