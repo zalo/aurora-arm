@@ -2,6 +2,7 @@
 
 #include "frame_packet.hpp"
 #include "resources.hpp"
+#include "../gx/gx.hpp"
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 
