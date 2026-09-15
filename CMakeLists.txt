@@ -13,6 +13,7 @@ option(AURORA_ENABLE_CARD "Enable CARD implementation based on kabufuda" ON)
 option(AURORA_ENABLE_THP "Enable THP decoder" ON)
 option(AURORA_ENABLE_RMLUI "Enable HTML/CSS Based UI Library for use in end-user UI development." OFF)
 option(AURORA_CACHE_USE_ZSTD "Compress WebGPU cache entries with zstd" ON)
+set(AURORA_VERTEX_BUFFER_MIB 5 CACHE STRING "Per-frame vertex stream size in MiB (raise for cpuVertexDecode titles with heavy streamed geometry)")
 
 # Dependency versions
 include(cmake/AuroraDependencyVersions.cmake)
