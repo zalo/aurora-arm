@@ -30,7 +30,9 @@
 #include <cstdio>
 #include <functional>
 #include <thread>
+#include <cstring>
 #include <fmt/format.h>
+#include <vector>
 
 // --- aurora::g_config ---
 namespace aurora {
@@ -171,6 +173,9 @@ namespace aurora::gx {
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   // The vertex attribute part of gx.cpp's implementation, which is what the CPU vertex decoder and
   // the resident display-list cache consume; TEV and lighting state stay default.
+// Vertex attribute part of gx.cpp's populate_pipeline_config, so the CPU vertex decoder sees the
+// draw's attribute configuration; TEV and lighting state are not needed by these tests.
+void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   config.shaderConfig = {};
   config.shaderConfig.cpuVertexDecode = g_config.cpuVertexDecode;
@@ -218,14 +223,34 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
 bool resolve_sampled_textures(const ShaderInfo& info) noexcept { return false; }
 } // namespace aurora::gx
 
-// --- Buffer push stubs ---
+// --- Buffer push stubs: vertex and index pushes land in test-visible streams ---
 namespace aurora::gfx {
-Range push_verts(const uint8_t* data, size_t length, size_t alignment) { return {}; }
-Range map_verts(size_t length, size_t alignment, uint8_t*& data) {
-  data = nullptr;
-  return {};
+std::vector<uint8_t> g_testVertexStream;
+std::vector<uint8_t> g_testIndexStream;
+namespace {
+Range append_stream(std::vector<uint8_t>& stream, const uint8_t* data, size_t length, size_t alignment) {
+  size_t offset = stream.size();
+  if (alignment != 0) {
+    offset = (offset + alignment - 1) / alignment * alignment;
+  }
+  stream.resize(offset + length);
+  if (data != nullptr) {
+    std::memcpy(stream.data() + offset, data, length);
+  }
+  return {.offset = static_cast<uint32_t>(offset), .size = static_cast<uint32_t>(length)};
 }
-Range push_indices(const uint8_t* data, size_t length, size_t alignment) { return {}; }
+} // namespace
+Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
+  return append_stream(g_testVertexStream, data, length, alignment);
+}
+Range map_verts(size_t length, size_t alignment, uint8_t*& data) {
+  const Range range = append_stream(g_testVertexStream, nullptr, length, alignment);
+  data = g_testVertexStream.data() + range.offset;
+  return range;
+}
+Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+  return append_stream(g_testIndexStream, data, length, alignment);
+}
 Range push_uniform(const uint8_t* data, size_t length) { return {}; }
 Range push_storage(const uint8_t* data, size_t length) { return {}; }
 
@@ -281,6 +306,7 @@ PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
 }
 gx::DrawData g_testLastDraw{};
 uint32_t g_testDrawCount = 0;
+bool g_testMergeDraws = false; // expose the previous draw to the command processor's merge paths
 std::atomic<uint32_t> g_testProcessedDrawCount{0};
 
 template <>
@@ -291,7 +317,7 @@ void push_draw_command<gx::DrawData>(gx::DrawData data) {
 }
 template <>
 gx::DrawData* get_last_draw_command() {
-  return nullptr;
+  return g_testMergeDraws && g_testDrawCount != 0 ? &g_testLastDraw : nullptr;
 }
 } // namespace aurora::gfx
 

@@ -86,8 +86,8 @@ u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxC
       numIndices += 3;
     }
   } else if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) {
-    if (g_config.cpuVertexDecode) {
-      // Quads expanded by the CPU vertex decoder: four vertices per segment or point
+    if (g_config.cpuVertexDecode && prim != GX_POINTS) {
+      // Quads expanded by the CPU vertex decoder: four vertices per segment
       buf.reserve_extra((vtxCount / 4) * 6 * sizeof(u16));
       for (u16 v = 0; v < vtxCount; v += 4) {
         const u16 idx0 = vtxStart + v;
@@ -96,6 +96,7 @@ u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxC
         numIndices += 6;
       }
     } else {
+      // One quad, drawn as an instance per segment or point
       buf.reserve_extra(6 * sizeof(u16));
       buf.append<u16>(0);
       buf.append<u16>(1);
@@ -517,9 +518,11 @@ static void prepare_pipeline(GXPrimitive prim, GXVtxFmt fmt) noexcept {
 }
 
 // CPU vertex decoding: converts the raw GX vertices of a draw into the frame's vertex stream with
-// the loader for the draw's pipeline configuration. Lines and points are expanded into quads here
-// (four records per segment or point) instead of by instancing in the vertex shader, so vtxCount
-// becomes the expanded vertex count.
+// the loader for the draw's pipeline configuration. Lines are expanded into quads here (four
+// records per segment) instead of by instancing in the vertex shader, so vtxCount becomes the
+// expanded vertex count. Points keep one record each: the pipeline steps the vertex buffer per
+// instance and the draw renders one instance of a shared quad per point (see prepare_idx_buffer),
+// so a particle system emitting tens of thousands of GX_POINTS per frame writes each point once.
 static gfx::Range push_decoded_verts(GXPrimitive prim, GXVtxFmt fmt, std::span<const u8> vertexData, u16& vtxCount,
                                      size_t alignment) noexcept {
   ZoneScoped;
@@ -532,7 +535,7 @@ static gfx::Range push_decoded_verts(GXPrimitive prim, GXVtxFmt fmt, std::span<c
                 loader.vtxStride);
   const size_t stride = loader.layout.stride;
   u8* out = nullptr;
-  if (config.lineMode == 0) {
+  if (config.lineMode == 0 || config.lineMode == 3) {
     const gfx::Range range = gfx::map_verts(static_cast<size_t>(vtxCount) * stride, alignment, out);
     if (out != nullptr) {
       decode_vertices(loader, vertexData.data(), vtxCount, out, state.arrays, state.currentPnMtx);
@@ -606,16 +609,16 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u32 vtxCount, gfx::Rang
 
   state.dirty &= ~DirtyImmediates;
 
-  // Lines and points draw one instance per segment or point, unless the CPU vertex decoder
+  // Points draw one instance per point; lines one per segment, unless the CPU vertex decoder
   // already expanded them into quads.
   uint32_t instanceCount = 1;
-  if (!g_config.cpuVertexDecode) {
+  if (prim == GX_POINTS) {
+    instanceCount = vtxCount;
+  } else if (!g_config.cpuVertexDecode) {
     if (prim == GX_LINES) {
       instanceCount = vtxCount / 2;
     } else if (prim == GX_LINESTRIP) {
       instanceCount = vtxCount - 1;
-    } else if (prim == GX_POINTS) {
-      instanceCount = vtxCount;
     }
   }
   cache.lastDrawFmt = fmt;
@@ -666,6 +669,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
                           prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
   auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
   const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1 && lastDraw->residentArena == 0;
+  // Consecutive draws with unchanged state merge: triangle primitives by appending indices, and
+  // CPU-decoded points (one record per point, instanced over a shared quad) by adding instances.
+  const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt;
+  const bool mergePoints = g_config.cpuVertexDecode && prim == GX_POINTS && sDrawCache.lineMode == 3;
+  const bool mergeTriangles = sDrawCache.lineMode == 0 && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
+  auto* lastDraw = cleanState && (mergeTriangles || mergePoints) ? gfx::get_last_draw_command<DrawData>() : nullptr;
+  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == (mergePoints ? lastDraw->vtxCount : 1u);
 
   // Push vertex data to the buffer, raw or decoded on the CPU. Merged draws must remain contiguous
   // with the previous range.
@@ -676,6 +686,16 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
 
   // Try to merge with previous draw call
   if (canMerge) {
+    if (mergePoints) {
+      CHECK(lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset,
+            "Non-consecutive vertex ranges ({} < {})", lastDraw->vertRange.offset + lastDraw->vertRange.size,
+            vertRange.offset);
+      lastDraw->vertRange.size += vertRange.size;
+      lastDraw->vtxCount += vtxCount;
+      lastDraw->instanceCount += vtxCount;
+      gfx::detail::increment_merged_draw_count();
+      return;
+    }
     u32 numIndices = 0;
     gfx::Range idxRange;
     static ByteBuffer idxBuf;

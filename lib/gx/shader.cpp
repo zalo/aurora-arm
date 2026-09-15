@@ -1003,6 +1003,10 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
   };
   // Vertex inputs: the vertex index for storage buffer fetches, or the CPU-decoded attributes
   if (config.cpuVertexDecode) {
+    if (config.lineMode == 3) {
+      // Points: one record per instance; the quad corner is the vertex index within the shared quad
+      vtxInAttrs += "\n    @builtin(vertex_index) vidx: u32";
+    }
     constexpr std::array<std::string_view, MaxDecodedVertexAttrs> DecodedInputs{
         "v_matrices: vec3u"sv, "v_pos: vec3f"sv,   "v_nrm: vec3f"sv,     "v_clr0: vec4f"sv,
         "v_clr1: vec4f"sv,     "v_tex0: vec2f"sv,  "v_tex1: vec2f"sv,    "v_tex2: vec2f"sv,
@@ -1029,8 +1033,8 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
         "\n    line_aspect_y: f32,"
         "\n    line_tex_offset: f32,"
         "\n    line_texcoord_mask: u32,";
-    if (config.cpuVertexDecode) {
-      // Quads were expanded by the CPU vertex decoder; the corner index travels with the vertex
+    if (config.cpuVertexDecode && config.lineMode != 3) {
+      // Line quads were expanded by the CPU vertex decoder; the corner index travels with the vertex
       vtxXfrAttrsPre += "\n    let vidx = v_matrices.z >> 24u;";
     }
     if (config.lineMode == 3) {
