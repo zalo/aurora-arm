@@ -182,6 +182,10 @@ bool resolve_sampled_textures(const ShaderInfo& info) noexcept { return false; }
 // --- Buffer push stubs ---
 namespace aurora::gfx {
 Range push_verts(const uint8_t* data, size_t length, size_t alignment) { return {}; }
+Range map_verts(size_t length, size_t alignment, uint8_t*& data) {
+  data = nullptr;
+  return {};
+}
 Range push_indices(const uint8_t* data, size_t length, size_t alignment) { return {}; }
 Range push_uniform(const uint8_t* data, size_t length) { return {}; }
 Range push_storage(const uint8_t* data, size_t length) { return {}; }

@@ -146,6 +146,11 @@ typedef struct {
    * Fusion is exact and on by default; this is a debugging switch for bisecting rendering differences.
    */
   bool disableRenderPassFusion;
+   * Decode GX vertex attributes on the CPU into conventional vertex buffers instead of fetching
+   * them from storage buffers in the vertex shader. Produces the same vertex values; intended for
+   * GLES-class GPUs where vertex-shader storage buffer reads are slow or unavailable.
+   */
+  bool cpuVertexDecode;
 } AuroraConfig;
 
 typedef struct {

@@ -1449,6 +1449,18 @@ Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
   return push(current_frame_packet().verts, data, length, alignment);
 }
 
+Range map_verts(size_t length, size_t alignment, uint8_t*& data) {
+  ZoneScoped;
+  data = nullptr;
+  if (!check_recording("map_verts")) {
+    return {};
+  }
+  auto& verts = current_frame_packet().verts;
+  const auto range = map(verts, length, alignment);
+  data = verts.data() + range.offset;
+  return range;
+}
+
 Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   ZoneScoped;
   if (!check_recording("push_indices")) {

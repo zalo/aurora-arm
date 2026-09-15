@@ -78,6 +78,7 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/fifo.cpp
     ../lib/gx/command_processor.cpp
     ../lib/gx/regs.cpp
+    ../lib/gx/vertex_loader.cpp
     ../lib/thread.cpp
     # Display list reader/optimizer
     ../lib/gx/attr_fmt.cpp
@@ -131,6 +132,17 @@ if (AURORA_ENABLE_GX)
   target_compile_definitions(gx_pipeline_memo_tests PRIVATE AURORA TARGET_PC AURORA_GX_TEST_LINK_GX)
 
   target_link_libraries(gx_pipeline_memo_tests PRIVATE
+  # CPU vertex decoder: specialized loaders against a straightforward reference decoder
+  add_executable(gx_vertex_loader_tests
+    gx_vertex_loader_test.cpp
+    ../lib/gx/vertex_loader.cpp
+  )
+  target_include_directories(gx_vertex_loader_tests PRIVATE
+    ../include
+    ../lib
+  )
+  target_compile_definitions(gx_vertex_loader_tests PRIVATE AURORA TARGET_PC)
+  target_link_libraries(gx_vertex_loader_tests PRIVATE
     gtest
     gtest_main
     fmt::fmt
@@ -144,6 +156,11 @@ if (AURORA_ENABLE_GX)
 
   aurora_copy_runtime_dlls(gx_pipeline_memo_tests)
   gtest_discover_tests(gx_pipeline_memo_tests)
+    dawn::dawncpp_headers
+    TracyClient
+    ${AURORA_SDL3_TARGET}
+  )
+  gtest_discover_tests(gx_vertex_loader_tests)
 
   add_executable(gx_texture_cache_tests
     gx_texture_cache_test.cpp
