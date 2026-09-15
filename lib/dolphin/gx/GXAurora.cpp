@@ -97,3 +97,13 @@ void GXRestoreFrameBuffer() {
   GX_WRITE_AURORA(GX_AURORA_END_OFFSCREEN);
   aurora::gx::fifo::publish();
 }
+
+void GXInvalidateResidentGeometry(const void* base, u32 size) {
+  if (!aurora::g_config.residentDisplayLists || size == 0) {
+    return;
+  }
+  GX_WRITE_AURORA(GX_AURORA_INVALIDATE_RESIDENT);
+  GX_WRITE_U64(reinterpret_cast<u64>(base));
+  GX_WRITE_U32(size);
+  aurora::gx::fifo::publish();
+}

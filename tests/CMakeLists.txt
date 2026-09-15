@@ -80,11 +80,14 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/command_processor.cpp
     ../lib/gx/regs.cpp
     ../lib/gx/vertex_loader.cpp
+    ../lib/gx/resident_geometry.cpp
     ../lib/thread.cpp
     # Display list reader/optimizer
     ../lib/gx/attr_fmt.cpp
     ../lib/gx/dl.cpp
     gx_dl_test.cpp
+    # Resident display-list geometry
+    gx_resident_test.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE

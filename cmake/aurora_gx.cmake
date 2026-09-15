@@ -25,6 +25,7 @@ add_library(aurora_gx STATIC
         lib/gx/shader.cpp
         lib/gx/shader_info.cpp
         lib/gx/vertex_loader.cpp
+        lib/gx/resident_geometry.cpp
         lib/dolphin/gx/GXBump.cpp
         lib/dolphin/gx/GXCull.cpp
         lib/dolphin/gx/GXCpu2Efb.cpp

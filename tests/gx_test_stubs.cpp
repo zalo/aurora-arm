@@ -114,7 +114,46 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept { g_gxState.rende
 // --- Shader/pipeline stubs ---
 namespace aurora::gx {
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
-  // No-op for tests
+  // The vertex attribute part of gx.cpp's implementation, which is what the CPU vertex decoder and
+  // the resident display-list cache consume; TEV and lighting state stay default.
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  config.shaderConfig = {};
+  config.shaderConfig.cpuVertexDecode = g_config.cpuVertexDecode;
+  u8 vtxOffset = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto type = g_gxState.vtxDesc[i];
+    auto& mapping = config.shaderConfig.attrs[i];
+    if (type == GX_NONE) {
+      mapping = {};
+      continue;
+    }
+    const auto& attrFmt = vtxFmt.attrs[i];
+    const auto cnt = comp_cnt_count(attr, attrFmt.cnt);
+    const bool nbt3 = attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3;
+    mapping = AttrConfig{
+        .attrType = static_cast<u8>(type),
+        .cnt = cnt,
+        .compType = static_cast<u8>(attrFmt.type),
+        .offset = vtxOffset,
+        .stride = 0,
+        .frac = attrFmt.frac,
+        .le = false,
+        .nbt3 = nbt3,
+    };
+    if (type == GX_DIRECT) {
+      vtxOffset += comp_type_size(attr, attrFmt.type) * cnt;
+    } else {
+      mapping.stride = g_gxState.arrays[i].stride;
+      mapping.le = g_gxState.arrays[i].le;
+      vtxOffset += (type == GX_INDEX8 ? 1 : 2) * (nbt3 ? 3 : 1);
+    }
+  }
+  config.shaderConfig.vtxStride = vtxOffset;
+  config.shaderConfig.lineMode = primitive == GX_LINES       ? 1
+                                 : primitive == GX_LINESTRIP ? 2
+                                 : primitive == GX_POINTS    ? 3
+                                                             : 0;
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }

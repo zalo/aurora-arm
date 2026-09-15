@@ -96,6 +96,19 @@ extern "C" {
  */
 #define GX_AURORA_DRAW_INDEXED 0x0041
 
+/**
+ * Call a display list by reference, as written by GXCallDisplayList when
+ * AuroraConfig::residentDisplayLists is set. Followed by a u64 pointer and a u32 byte length.
+ * The list must stay valid and unchanged until it is released with GXInvalidateResidentGeometry().
+ */
+#define GX_AURORA_CALL_DL 0x0044
+
+/**
+ * Release resident geometry decoded from display lists or vertex arrays inside
+ * [pointer, pointer + size). Followed by a u64 pointer and a u32 byte length.
+ */
+#define GX_AURORA_INVALIDATE_RESIDENT 0x0045
+
 #define GX2_SET_POLYGON_OFFSET 0x1000
 
 
@@ -172,6 +185,13 @@ void GXCreateFrameBuffer(u32 width, u32 height);
  * Must be called after GXCreateFrameBuffer() to resume normal rendering.
  */
 void GXRestoreFrameBuffer(void);
+
+/**
+ * Release geometry kept resident from display lists or vertex arrays in [base, base + size).
+ * Call before freeing or rewriting such memory when AuroraConfig::residentDisplayLists is set;
+ * the release is ordered in the GX stream against the draws around it. No-op otherwise.
+ */
+void GXInvalidateResidentGeometry(const void* base, u32 size);
 
 #if __cplusplus
 }
