@@ -103,6 +103,8 @@ extern "C" {
  */
 #define GX_AURORA_FRAME_BEGIN 0x0042
 #define GX_AURORA_FRAME_END 0x0043
+
+/**
  * Call a display list by reference, as written by GXCallDisplayList when
  * AuroraConfig::residentDisplayLists is set. Followed by a u64 pointer and a u32 byte length.
  * The list must stay valid and unchanged until it is released with GXInvalidateResidentGeometry().

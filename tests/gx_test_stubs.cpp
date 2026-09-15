@@ -28,9 +28,9 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <thread>
-#include <cstring>
 #include <fmt/format.h>
 #include <vector>
 
@@ -93,6 +93,9 @@ void clear_copy_texture_cache() noexcept {}
 namespace texture {
 void invalidate_bindings() noexcept {}
 uint64_t current_bind_generation() noexcept { return 1; }
+#ifdef AURORA_GX_TEST_LINK_GX
+void shutdown() noexcept {}
+#endif
 // Description hashes standing in for the texture cache's identities (FNV-1a; never 0).
 u32 texture_object_identity(const GXTexObj_& obj) noexcept {
   const uint64_t fields[] = {reinterpret_cast<uintptr_t>(obj.data),
@@ -121,9 +124,6 @@ u32 tlut_object_identity(const GXTlutObj_& tlut) noexcept {
   }
   return hash != 0 ? hash : 1;
 }
-#ifdef AURORA_GX_TEST_LINK_GX
-void shutdown() noexcept {}
-#endif
 } // namespace texture
 void evict_texture_object(u32 texObjId) noexcept {
   for (auto& obj : g_gxState.loadedTextures) {
@@ -170,9 +170,6 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept { g_gxState.rende
 // --- Shader/pipeline stubs ---
 namespace aurora::gx {
 #ifndef AURORA_GX_TEST_LINK_GX
-void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
-  // The vertex attribute part of gx.cpp's implementation, which is what the CPU vertex decoder and
-  // the resident display-list cache consume; TEV and lighting state stay default.
 // Vertex attribute part of gx.cpp's populate_pipeline_config, so the CPU vertex decoder sees the
 // draw's attribute configuration; TEV and lighting state are not needed by these tests.
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
@@ -219,7 +216,6 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
 gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; }
 #endif
-void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
 bool resolve_sampled_textures(const ShaderInfo& info) noexcept { return false; }
 } // namespace aurora::gx
 
@@ -264,6 +260,13 @@ uint32_t align_uniform(uint32_t value) { return value; }
 BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) { return 0; }
 wgpu::Sampler sampler_ref(const wgpu::SamplerDescriptor& descriptor) { return {}; }
 #endif
+} // namespace aurora::gfx
+namespace aurora::gx::resident {
+#ifdef AURORA_GX_TEST_LINK_GX
+void release_buffers() noexcept {}
+#endif
+} // namespace aurora::gx::resident
+namespace aurora::gfx {
 RenderTargetLayout get_render_target_layout() noexcept {
   return {
       .colorAttachmentCount = 1,
@@ -329,13 +332,15 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept { return wg
 // --- Texture creation/write/replacement stubs ---
 namespace aurora::gfx {
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-                                    ArrayRef<uint8_t> data, bool tlut, const char* label,
-                                    std::optional<TextureClass> textureClass) noexcept {
+                                    ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept {
   return {};
 }
-TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat, const char* label,
-                                     std::optional<TextureClass> textureClass) noexcept {
-  return {};
+TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+                                     const char* label, std::optional<TextureClass>) noexcept {
+  // gx::initialize() dereferences the empty-texture handle, so hand out a real (deviceless) record.
+  return std::make_shared<TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
+                                      wgpu::Extent3D{width, height, 1}, wgpu::TextureFormat::RGBA8Unorm, mips,
+                                      gxFormat);
 }
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
   return {};

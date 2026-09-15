@@ -135,6 +135,8 @@ typedef struct {
    * GXInitTexObjData / GXInitTlutObjData changes always invalidate immediately.
    */
   uint32_t textureVerifyInterval;
+
+  /*
    * Translate GX commands asynchronously to the game thread: aurora_end_frame() no longer
    * waits for the FIFO processor, so the CPU frame time becomes the slowest of the game
    * thread, the FIFO processor and the render worker instead of game + translation.
@@ -142,10 +144,14 @@ typedef struct {
    * GXWaitDrawDone and AuroraGXSync wait for a specific point of the stream.
    */
   bool asyncFrames;
+
+  /*
    * Disables fusing adjacent small render-to-texture EFB passes (shadow maps, reflections) into one render pass.
    * Fusion is exact and on by default; this is a debugging switch for bisecting rendering differences.
    */
   bool disableRenderPassFusion;
+
+  /*
    * Decode GX vertex attributes on the CPU into conventional vertex buffers instead of fetching
    * them from storage buffers in the vertex shader. Produces the same vertex values; intended for
    * GLES-class GPUs where vertex-shader storage buffer reads are slow or unavailable.

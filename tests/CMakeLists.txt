@@ -137,6 +137,20 @@ if (AURORA_ENABLE_GX)
   target_compile_definitions(gx_pipeline_memo_tests PRIVATE AURORA TARGET_PC AURORA_GX_TEST_LINK_GX)
 
   target_link_libraries(gx_pipeline_memo_tests PRIVATE
+    gtest
+    gtest_main
+    fmt::fmt
+    xxhash
+    absl::flat_hash_map
+    absl::btree
+    dawn::webgpu_dawn
+    TracyClient
+    ${AURORA_SDL3_TARGET}
+  )
+
+  aurora_copy_runtime_dlls(gx_pipeline_memo_tests)
+  gtest_discover_tests(gx_pipeline_memo_tests)
+
   # CPU vertex decoder: specialized loaders against a straightforward reference decoder
   add_executable(gx_vertex_loader_tests
     gx_vertex_loader_test.cpp
@@ -153,14 +167,6 @@ if (AURORA_ENABLE_GX)
     fmt::fmt
     xxhash
     absl::flat_hash_map
-    absl::btree
-    dawn::webgpu_dawn
-    TracyClient
-    ${AURORA_SDL3_TARGET}
-  )
-
-  aurora_copy_runtime_dlls(gx_pipeline_memo_tests)
-  gtest_discover_tests(gx_pipeline_memo_tests)
     dawn::dawncpp_headers
     TracyClient
     ${AURORA_SDL3_TARGET}

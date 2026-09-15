@@ -488,7 +488,8 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
       textureEntry.textureView = tex.ref->sampleTextureView.Get();
       samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor()).Get();
     } else {
-      textureEntry.textureView = sEmptyTexture->sampleTextureView.Get();
+      // sEmptyTexture is created by initialize(); stay null-safe for deviceless test setups.
+      textureEntry.textureView = sEmptyTexture ? sEmptyTexture->sampleTextureView.Get() : nullptr;
       samplerEntry.sampler = sEmptySampler.Get();
     }
   }

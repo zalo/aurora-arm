@@ -665,17 +665,14 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
 
-  const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
-                          prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
-  auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
-  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1 && lastDraw->residentArena == 0;
   // Consecutive draws with unchanged state merge: triangle primitives by appending indices, and
   // CPU-decoded points (one record per point, instanced over a shared quad) by adding instances.
   const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt;
   const bool mergePoints = g_config.cpuVertexDecode && prim == GX_POINTS && sDrawCache.lineMode == 3;
   const bool mergeTriangles = sDrawCache.lineMode == 0 && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
   auto* lastDraw = cleanState && (mergeTriangles || mergePoints) ? gfx::get_last_draw_command<DrawData>() : nullptr;
-  const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == (mergePoints ? lastDraw->vtxCount : 1u);
+  const bool canMerge = lastDraw != nullptr && lastDraw->residentArena == 0 &&
+                        lastDraw->instanceCount == (mergePoints ? lastDraw->vtxCount : 1u);
 
   // Push vertex data to the buffer, raw or decoded on the CPU. Merged draws must remain contiguous
   // with the previous range.
