@@ -852,8 +852,11 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   {
     wgpu::Limits supportedLimits{};
     g_adapter.GetLimits(&supportedLimits);
+    // The storage-buffer vertex path fetches from two vertex-stage storage buffers. With CPU vertex
+    // decoding none is needed, which admits compatibility-mode adapters that offer zero (the
+    // spec's compatibility baseline; Mali GLES drivers expose no vertex-stage storage blocks).
     wgpu::CompatibilityModeLimits compatibilityModeLimits{wgpu::CompatibilityModeLimits::Init{
-        .maxStorageBuffersInVertexStage = 2,
+        .maxStorageBuffersInVertexStage = g_config.cpuVertexDecode ? 0u : 2u,
         .maxStorageBuffersInFragmentStage = 2,
     }};
     const wgpu::Limits requiredLimits{
