@@ -109,6 +109,8 @@ ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint
 GXTexFmt tlut_texture_format(GXTlutFmt format) noexcept { return GX_TF_RGBA8_PC; }
 
 void queue_palette_conv(tex_palette_conv::ConvRequest req) { ++s_paletteConversions; }
+
+void on_copy_texture_sampled(const TextureHandle& handle) noexcept {}
 } // namespace aurora::gfx
 
 namespace aurora::gfx::texture_replacement {
