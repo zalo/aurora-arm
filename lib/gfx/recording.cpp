@@ -1101,6 +1101,11 @@ bool pass_fusion_complete(const TextureHandle& texture, const ClipRect& rect, bo
       .rect = shifted,
       .uniformRange = push_uniform(copy_uv_transform(pass, shifted)),
   });
+  // Both transforms together for a two-target conversion pass.
+  const auto first = copy_uv_transform(pass, pass.resolveRect);
+  const auto second = copy_uv_transform(pass, shifted);
+  pass.dualResolveUniformRange = push_uniform(
+      std::array<float, 8>{first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3]});
   fusion.active = false;
   fusion.firstTarget = {};
   return true;

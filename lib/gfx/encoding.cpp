@@ -229,6 +229,34 @@ void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const T
   }
 }
 
+// A fused pass whose two copies share a conversion format and need no scaling converts both in one render pass
+// with two color targets instead of one pass per copy.
+bool resolve_dual(wgpu::CommandEncoder& cmd, const RenderPass& passInfo) {
+  if (passInfo.extraResolves.size() != 1 || passInfo.dualResolveUniformRange.size != 32) {
+    return false;
+  }
+  const auto& extra = passInfo.extraResolves[0];
+  const auto unscaled = [](const TextureHandle& target, const ClipRect& rect) {
+    return target->size.width == static_cast<uint32_t>(rect.width) &&
+           target->size.height == static_cast<uint32_t>(rect.height);
+  };
+  if (extra.format != passInfo.resolveFormat || gx::is_depth_format(passInfo.resolveFormat) ||
+      !tex_copy_conv::dual_supported(passInfo.resolveFormat) ||
+      !unscaled(passInfo.resolveTarget, passInfo.resolveRect) || !unscaled(extra.target, extra.rect) ||
+      extra.target->size.width != passInfo.resolveTarget->size.width ||
+      extra.target->size.height != passInfo.resolveTarget->size.height) {
+    return false;
+  }
+  const tex_copy_conv::ConvRequest convReq{
+      .fmt = passInfo.resolveFormat,
+      .srcView = passInfo.copySourceView,
+      .dst = passInfo.resolveTarget,
+      .sampleFilter = tex_copy_conv::SampleFilter::Nearest,
+  };
+  tex_copy_conv::run_dual(cmd, convReq, extra.target, passInfo.dualResolveUniformRange);
+  return true;
+}
+
 void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
   if (!passInfo.sealed) {
@@ -298,12 +326,12 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
                                       passInfo.colorAttachments[SceneColorAttachmentIndex].size, passInfo.msaaSamples);
   }
 
-  if (passInfo.resolveTarget) {
+  if (passInfo.resolveTarget && !resolve_dual(cmd, passInfo)) {
     resolve_copy(cmd, passInfo, passInfo.resolveTarget, passInfo.resolveFormat, passInfo.resolveRect,
                  passInfo.resolveUniformRange);
-  }
-  for (const auto& extra : passInfo.extraResolves) {
-    resolve_copy(cmd, passInfo, extra.target, extra.format, extra.rect, extra.uniformRange);
+    for (const auto& extra : passInfo.extraResolves) {
+      resolve_copy(cmd, passInfo, extra.target, extra.format, extra.rect, extra.uniformRange);
+    }
   }
 
   if (passInfo.snapshotColorDst) {

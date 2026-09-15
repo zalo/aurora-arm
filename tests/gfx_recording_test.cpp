@@ -4,6 +4,7 @@
 #include "gfx/frame_packet.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
+#include "gfx/resources.hpp"
 #include "gfx/texture.hpp"
 #include "gx/gx.hpp"
 #include "gx/pipeline.hpp"
@@ -11,6 +12,8 @@
 #include "webgpu/gpu.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <memory>
 
 namespace aurora::gfx {
@@ -29,6 +32,8 @@ protected:
     webgpu::g_frameBuffer.format = ColorFormat;
     webgpu::g_depthBuffer.size = {640, 480, 1};
     webgpu::g_depthBuffer.format = DepthFormat;
+    // Without a device the limits hold the "undefined" sentinel; uniform pushes need a real alignment.
+    detail::resources().limits.minUniformBufferOffsetAlignment = 256;
     g_config.disableRenderPassFusion = false;
     gx::g_gxState.clearColor = clear_value();
     gx::g_gxState.colorUpdate = true;
@@ -286,6 +291,21 @@ TEST_F(GfxRecordingTest, AdjacentSmallCopiesFuseIntoOnePass) {
 
   finish();
   EXPECT_EQ(frame.renderPasses.size(), 2u);
+}
+
+TEST_F(GfxRecordingTest, FusedPassCarriesBothConversionTransforms) {
+  begin_fused();
+  small_segment();
+  copy(make_target(256, 256));
+
+  ASSERT_EQ(frame.renderPasses.size(), 2u);
+  const auto& fused = frame.renderPasses[0];
+  ASSERT_EQ(fused.dualResolveUniformRange.size, 32u);
+  std::array<float, 8> transforms{};
+  std::memcpy(transforms.data(), frame.uniforms.data() + fused.dualResolveUniformRange.offset, sizeof(transforms));
+  const float w = 256.f / 640.f;
+  const float h = 256.f / 480.f;
+  EXPECT_EQ(transforms, (std::array<float, 8>{0.f, 0.f, w, h, w, 0.f, w, h}));
 }
 
 TEST_F(GfxRecordingTest, FusionContinuesAfterLeadingClearDraw) {

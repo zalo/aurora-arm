@@ -327,7 +327,86 @@ static wgpu::BindGroupLayout g_depthBindGroupLayout;
 static wgpu::Sampler g_nearestSampler;
 static wgpu::Sampler g_linearSampler;
 static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
+static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_dualPipelines;
 static wgpu::RenderPipeline g_blitPipeline;
+
+// Two-target variant: the same conversion applied to two source rectangles, written to two attachments. A fused
+// EFB pass (recording.cpp) resolves two copies of the same format; converting both in one render pass saves the
+// fixed per-pass driver cost on tile-based mobile GPUs.
+static constexpr std::string_view DualShaderPreamble = R"(
+@group(0) @binding(0) var src_samp: sampler;
+@group(0) @binding(1) var src: texture_2d<f32>;
+
+struct UVTransform {
+    offset: vec2f,
+    scale: vec2f,
+    offset2: vec2f,
+    scale2: vec2f,
+};
+@group(0) @binding(2) var<uniform> uv_xf: UVTransform;
+
+struct VertexOutput {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+    @location(1) uv2: vec2f,
+};
+
+var<private> positions: array<vec2f, 3> = array(
+    vec2f(-1.0, 1.0),
+    vec2f(-1.0, -3.0),
+    vec2f(3.0, 1.0),
+);
+var<private> uvs: array<vec2f, 3> = array(
+    vec2f(0.0, 0.0),
+    vec2f(0.0, 2.0),
+    vec2f(2.0, 0.0),
+);
+
+@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4f(positions[vi], 0.0, 1.0);
+    out.uv = uvs[vi] * uv_xf.scale + uv_xf.offset;
+    out.uv2 = uvs[vi] * uv_xf.scale2 + uv_xf.offset2;
+    return out;
+}
+
+fn intensity(rgb: vec3f) -> f32 {
+    // ITU-R BT.601 luma coefficients
+    return dot(rgb, vec3f(0.257, 0.504, 0.098)) + 16.0 / 255.0;
+}
+
+fn quantize4(v: f32) -> f32 {
+    return floor(v * 16.0) / 15.0;
+}
+)"sv;
+
+static constexpr std::string_view DualFragmentEpilogue = R"(
+struct DualOutput {
+    @location(0) a: vec4f,
+    @location(1) b: vec4f,
+};
+@fragment fn fs_main(in: VertexOutput) -> DualOutput {
+    var out: DualOutput;
+    out.a = conv(in.uv);
+    out.b = conv(in.uv2);
+    return out;
+}
+)"sv;
+
+std::string dual_fragment_source(const std::string_view fragShader) {
+  static constexpr std::string_view signature = "@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {";
+  std::string source{fragShader};
+  const auto pos = source.find(signature);
+  if (pos == std::string::npos) {
+    return {};
+  }
+  source.replace(pos, signature.size(), "fn conv(uv: vec2f) -> vec4f {");
+  for (size_t at = source.find("in.uv"); at != std::string::npos; at = source.find("in.uv", at + 2)) {
+    source.replace(at, 5, "uv");
+  }
+  source += DualFragmentEpilogue;
+  return source;
+}
 static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayout;
 static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayoutMS;
 static wgpu::RenderPipeline g_depthSnapshotPipeline;
@@ -447,7 +526,63 @@ static wgpu::RenderPipeline create_pipeline(const ConvPipeline& conv, const std:
   return g_device.CreateRenderPipeline(&pipelineDescriptor);
 }
 
+static wgpu::RenderPipeline create_dual_pipeline(const ConvPipeline& conv,
+                                                 const wgpu::BindGroupLayout& bindGroupLayout) {
+  const std::string fragShader = dual_fragment_source(conv.fragShader);
+  if (fragShader.empty()) {
+    return {};
+  }
+  std::string shaderSource;
+  shaderSource.reserve(DualShaderPreamble.size() + fragShader.size());
+  shaderSource += DualShaderPreamble;
+  shaderSource += fragShader;
+  const std::string label = std::string{conv.label} + " Dual";
+
+  const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{
+      .code = shaderSource.c_str(),
+  }};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{
+      .nextInChain = &wgslSource,
+      .label = label.c_str(),
+  };
+  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+
+  const std::array colorTargets{
+      wgpu::ColorTargetState{.format = conv.outputFormat},
+      wgpu::ColorTargetState{.format = conv.outputFormat},
+  };
+  const wgpu::FragmentState fragmentState{
+      .module = module,
+      .entryPoint = "fs_main",
+      .targetCount = colorTargets.size(),
+      .targets = colorTargets.data(),
+  };
+
+  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+      .bindGroupLayoutCount = 1,
+      .bindGroupLayouts = &bindGroupLayout,
+  };
+  const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
+
+  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+      .label = label.c_str(),
+      .layout = pipelineLayout,
+      .vertex =
+          wgpu::VertexState{
+              .module = module,
+              .entryPoint = "vs_main",
+          },
+      .primitive =
+          wgpu::PrimitiveState{
+              .topology = wgpu::PrimitiveTopology::TriangleList,
+          },
+      .fragment = &fragmentState,
+  };
+  return g_device.CreateRenderPipeline(&pipelineDescriptor);
+}
+
 bool needs_conversion(const GXTexFmt fmt) { return g_pipelines.contains(fmt); }
+bool dual_supported(const GXTexFmt fmt) { return g_dualPipelines.contains(fmt); }
 
 void initialize() {
   static constexpr std::array bindGroupLayoutEntries{
@@ -518,6 +653,9 @@ void initialize() {
     if (conv.outputFormat != to_wgpu(conv.fmt)) {
       Log.fatal("Output format mismatch for {}", conv.fmt);
     }
+    if (auto dual = create_dual_pipeline(conv, g_bindGroupLayout)) {
+      g_dualPipelines[conv.fmt] = std::move(dual);
+    }
   }
   // Skip depth copies in compatibility mode
   if (webgpu::g_hasCoreFeatures) {
@@ -552,6 +690,7 @@ void initialize() {
 
 void shutdown() {
   g_pipelines.clear();
+  g_dualPipelines.clear();
   g_blitPipeline = {};
   g_bindGroupLayout = {};
   g_depthBindGroupLayout = {};
@@ -647,6 +786,63 @@ void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
 }
 
 void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req) { execute(cmd, req, g_blitPipeline); }
+
+void run_dual(const wgpu::CommandEncoder& cmd, const ConvRequest& req, const TextureHandle& dst2,
+              const Range dualUniformRange) {
+  const auto it = g_dualPipelines.find(req.fmt);
+  if (it == g_dualPipelines.end()) {
+    Log.fatal("No two-target copy conversion pipeline for format {}", static_cast<int>(req.fmt));
+  }
+  const auto& sampler = req.sampleFilter == SampleFilter::Linear ? g_linearSampler : g_nearestSampler;
+  const std::array bindGroupEntries{
+      wgpu::BindGroupEntry{
+          .binding = 0,
+          .sampler = sampler,
+      },
+      wgpu::BindGroupEntry{
+          .binding = 1,
+          .textureView = req.srcView,
+      },
+      wgpu::BindGroupEntry{
+          .binding = 2,
+          .buffer = detail::resources().uniformBuffer,
+          .offset = dualUniformRange.offset,
+          .size = dualUniformRange.size,
+      },
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .layout = g_bindGroupLayout,
+      .entryCount = bindGroupEntries.size(),
+      .entries = bindGroupEntries.data(),
+  };
+  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+
+  const std::array colorAttachments{
+      wgpu::RenderPassColorAttachment{
+          .view = req.dst->attachmentTextureView,
+          .loadOp = wgpu::LoadOp::Clear,
+          .storeOp = wgpu::StoreOp::Store,
+          .clearValue = {0.0, 0.0, 0.0, 0.0},
+      },
+      wgpu::RenderPassColorAttachment{
+          .view = dst2->attachmentTextureView,
+          .loadOp = wgpu::LoadOp::Clear,
+          .storeOp = wgpu::StoreOp::Store,
+          .clearValue = {0.0, 0.0, 0.0, 0.0},
+      },
+  };
+  const wgpu::RenderPassDescriptor renderPassDescriptor{
+      .label = "TexCopyConv Dual Pass",
+      .colorAttachmentCount = colorAttachments.size(),
+      .colorAttachments = colorAttachments.data(),
+      .timestampWrites = webgpu::gpu_prof::pass_writes("EFB copy convert"),
+  };
+  const auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+  pass.SetPipeline(it->second);
+  pass.SetBindGroup(0, bindGroup);
+  pass.Draw(3);
+  pass.End();
+}
 
 bool snapshot_depth_supported() noexcept { return static_cast<bool>(g_depthSnapshotPipeline); }
 
