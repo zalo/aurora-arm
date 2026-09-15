@@ -21,8 +21,10 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
                   xxh3_hash(config.shaderConfig));
   if (config.shaderConfig.cpuVertexDecode) {
     const auto layout = decoded_vertex_layout(config.shaderConfig);
+    // Points keep one record per point and draw it as one instance of a shared quad
+    const bool perInstance = config.shaderConfig.lineMode == 3;
     const wgpu::VertexBufferLayout vertexBuffer{
-        .stepMode = wgpu::VertexStepMode::Vertex,
+        .stepMode = perInstance ? wgpu::VertexStepMode::Instance : wgpu::VertexStepMode::Vertex,
         .arrayStride = layout.stride,
         .attributeCount = layout.count,
         .attributes = layout.attributes.data(),

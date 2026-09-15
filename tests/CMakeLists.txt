@@ -85,6 +85,8 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/attr_fmt.cpp
     ../lib/gx/dl.cpp
     gx_dl_test.cpp
+    # Instanced GX_POINTS sprites with CPU vertex decoding
+    gx_point_sprite_test.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE

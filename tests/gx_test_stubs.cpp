@@ -19,7 +19,9 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <fmt/format.h>
+#include <vector>
 
 // --- aurora::g_config ---
 namespace aurora {
@@ -113,8 +115,47 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept { g_gxState.rende
 
 // --- Shader/pipeline stubs ---
 namespace aurora::gx {
+// Vertex attribute part of gx.cpp's populate_pipeline_config, so the CPU vertex decoder sees the
+// draw's attribute configuration; TEV and lighting state are not needed by these tests.
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
-  // No-op for tests
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  config.shaderConfig = {};
+  config.shaderConfig.cpuVertexDecode = g_config.cpuVertexDecode;
+  u8 vtxOffset = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto type = g_gxState.vtxDesc[i];
+    auto& mapping = config.shaderConfig.attrs[i];
+    if (type == GX_NONE) {
+      mapping = {};
+      continue;
+    }
+    const auto& attrFmt = vtxFmt.attrs[i];
+    const auto cnt = comp_cnt_count(attr, attrFmt.cnt);
+    const bool nbt3 = attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3;
+    mapping = AttrConfig{
+        .attrType = static_cast<u8>(type),
+        .cnt = cnt,
+        .compType = static_cast<u8>(attrFmt.type),
+        .offset = vtxOffset,
+        .stride = 0,
+        .frac = attrFmt.frac,
+        .le = false,
+        .nbt3 = nbt3,
+    };
+    if (type == GX_DIRECT) {
+      vtxOffset += comp_type_size(attr, attrFmt.type) * cnt;
+    } else {
+      mapping.stride = g_gxState.arrays[i].stride;
+      mapping.le = g_gxState.arrays[i].le;
+      vtxOffset += (type == GX_INDEX8 ? 1 : 2) * (nbt3 ? 3 : 1);
+    }
+  }
+  config.shaderConfig.vtxStride = vtxOffset;
+  config.shaderConfig.lineMode = primitive == GX_LINES       ? 1
+                                 : primitive == GX_LINESTRIP ? 2
+                                 : primitive == GX_POINTS    ? 3
+                                                             : 0;
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
@@ -122,33 +163,36 @@ gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; 
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
 } // namespace aurora::gx
 
-// --- Buffer push stubs ---
+// --- Buffer push stubs: vertex and index pushes land in test-visible streams ---
 namespace aurora::gfx {
-// The command processor drops a draw whose stream push returns an empty range (stream full), so the
-// stubs report the pushed size at a running offset like the real streams do.
-static Range stub_range(size_t& cursor, size_t length, size_t alignment) {
+std::vector<uint8_t> g_testVertexStream;
+std::vector<uint8_t> g_testIndexStream;
+namespace {
+Range append_stream(std::vector<uint8_t>& stream, const uint8_t* data, size_t length, size_t alignment) {
+  size_t offset = stream.size();
   if (alignment != 0) {
-    cursor = AURORA_ALIGN(cursor, alignment);
+    offset = (offset + alignment - 1) / alignment * alignment;
   }
-  const Range range{static_cast<uint32_t>(cursor), static_cast<uint32_t>(length)};
-  cursor += length;
-  return range;
+  stream.resize(offset + length);
+  if (data != nullptr) {
+    std::memcpy(stream.data() + offset, data, length);
+  }
+  return {.offset = static_cast<uint32_t>(offset), .size = static_cast<uint32_t>(length)};
 }
-static size_t g_stubVertCursor = 0, g_stubIndexCursor = 0, g_stubUniformCursor = 0, g_stubStorageCursor = 0;
-static std::vector<uint8_t> g_stubVertScratch;
+} // namespace
 Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
-  return stub_range(g_stubVertCursor, length, alignment);
+  return append_stream(g_testVertexStream, data, length, alignment);
 }
 Range map_verts(size_t length, size_t alignment, uint8_t*& data) {
-  g_stubVertScratch.resize(length);
-  data = g_stubVertScratch.data();
-  return stub_range(g_stubVertCursor, length, alignment);
+  const Range range = append_stream(g_testVertexStream, nullptr, length, alignment);
+  data = g_testVertexStream.data() + range.offset;
+  return range;
 }
 Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
-  return stub_range(g_stubIndexCursor, length, alignment);
+  return append_stream(g_testIndexStream, data, length, alignment);
 }
-Range push_uniform(const uint8_t* data, size_t length) { return stub_range(g_stubUniformCursor, length, 256); }
-Range push_storage(const uint8_t* data, size_t length) { return stub_range(g_stubStorageCursor, length, 256); }
+Range push_uniform(const uint8_t* data, size_t length) { return {}; }
+Range push_storage(const uint8_t* data, size_t length) { return {}; }
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
 void set_viewport(const Viewport& viewport) noexcept {}
@@ -195,6 +239,7 @@ PipelineRef pipeline_ref<gx::PipelineConfig>(const gx::PipelineConfig& config) {
 }
 gx::DrawData g_testLastDraw{};
 uint32_t g_testDrawCount = 0;
+bool g_testMergeDraws = false; // expose the previous draw to the command processor's merge paths
 std::atomic<uint32_t> g_testProcessedDrawCount{0};
 
 template <>
@@ -205,7 +250,7 @@ void push_draw_command<gx::DrawData>(gx::DrawData data) {
 }
 template <>
 gx::DrawData* get_last_draw_command() {
-  return nullptr;
+  return g_testMergeDraws && g_testDrawCount != 0 ? &g_testLastDraw : nullptr;
 }
 } // namespace aurora::gfx
 
