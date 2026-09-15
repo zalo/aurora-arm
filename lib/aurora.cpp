@@ -343,7 +343,10 @@ void end_frame() noexcept {
         }
         pass.End();
       }
-      {
+      // An empty overlay still costs a full render pass (load, store, and on
+      // tile-based mobile drivers ~0.5 ms of driver time). Skip it when ImGui
+      // recorded nothing this frame.
+      if (imgui::has_draws(imguiDrawData)) {
         const std::array attachments{
             wgpu::RenderPassColorAttachment{
                 .view = currentView,
