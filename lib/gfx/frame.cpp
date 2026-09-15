@@ -57,6 +57,8 @@ std::atomic<uint32_t> g_frameIndex{UINT32_MAX};
 
 std::array<FramePacket, FrameSlotCount> g_framePackets;
 uint64_t g_nextFrameId = 1;
+// Scene on surface: the presented texture of the frame being finished (render worker only).
+std::pair<wgpu::Texture, wgpu::TextureView> g_frameSurface;
 render_worker::FrameSlotPool g_frameSlots{FrameSlotCount};
 render_worker::FrameSlotPool g_stagingSlots{StagingBufferCount};
 // Asynchronous frames: presentation callbacks in frame order, consumed at each end marker.
@@ -419,6 +421,7 @@ void initialize() {
     g_deferredEndFrames.clear();
   }
   render_worker::initialize();
+  render_worker::set_busy_accounting(g_config.renderStats);
   // This appears to take a while and blocks the render thread for periods of time
   // render_worker::set_event_pump([] {
   //   if (g_instance) {
@@ -786,6 +789,7 @@ void end_frame(EndFrameCallback callback) {
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
+    g_frameSurface = {std::move(packet.surfaceTexture), std::move(packet.surfaceView)};
     packet = {};
     g_resources.stats.drawCallCount = stats.drawCallCount;
     g_resources.stats.mergedDrawCallCount = stats.mergedDrawCallCount;
@@ -805,6 +809,8 @@ void end_frame(EndFrameCallback callback) {
 }
 
 uint32_t current_frame() noexcept { return g_frameIndex; }
+
+std::pair<wgpu::Texture, wgpu::TextureView> take_frame_surface() noexcept { return std::exchange(g_frameSurface, {}); }
 
 void after_submit() noexcept { depth_peek::after_submit(); }
 

@@ -35,6 +35,9 @@ template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
 bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
+// Renderer time accounting (AuroraConfig::renderStats): time and count of blocking pipeline waits.
+uint64_t pipeline_wait_ns() noexcept;
+uint64_t pipeline_wait_count() noexcept;
 
 namespace detail::testing {
 // Queues new pipelines instead of creating them, for host tests that record frames without a GPU device.

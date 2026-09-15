@@ -1,10 +1,14 @@
 #include <aurora/aurora.h>
 #include <aurora/time.hpp>
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
 
 #ifdef AURORA_ENABLE_GX
 #include "gfx/resources.hpp"
 #include "gfx/frame.hpp"
 #include "gfx/gles_direct.hpp"
+#include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/render_worker.hpp"
 #include "gx/command_processor.hpp"
@@ -329,7 +333,26 @@ void end_frame() noexcept {
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
-    {
+    // Renderer phase timing (renderStats): acquire, encode, submit and present per frame.
+    auto phaseNow = std::chrono::steady_clock::now();
+    const auto phase = [&](double& accumulator) {
+      if (!g_config.renderStats) {
+        return;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      accumulator += std::chrono::duration<double, std::milli>(now - phaseNow).count();
+      phaseNow = now;
+    };
+    static double sAcquireMs = 0, sEncodeMs = 0, sSubmitMs = 0, sPresentMs = 0;
+    static unsigned sPhaseFrames = 0;
+    // Scene on surface: the frame's EFB passes already rendered into a presented texture acquired at encode time.
+    bool sceneOnSurface = false;
+    if (auto [surfaceTexture, surfaceView] = gfx::take_frame_surface(); surfaceTexture) {
+      currentTexture = std::move(surfaceTexture);
+      currentView = std::move(surfaceView);
+      surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal;
+      sceneOnSurface = true;
+    } else {
       window::SurfaceLock surfaceLock;
       if (window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
@@ -342,15 +365,43 @@ void end_frame() noexcept {
         }
       }
     }
+    phase(sAcquireMs);
 
     const bool canPresent = currentTexture && currentView;
-    if (canPresent) {
+    const auto& surfaceConfig = webgpu::g_graphicsConfig.surfaceConfiguration;
+    const auto viewportWidth = static_cast<uint32_t>(viewport.width + 0.5f);
+    const auto viewportHeight = static_cast<uint32_t>(viewport.height + 0.5f);
+    const bool fullSurfaceViewport = viewport.left == 0.f && viewport.top == 0.f &&
+                                     viewportWidth == surfaceConfig.width && viewportHeight == surfaceConfig.height;
+    // The scene is already in the presented texture: skip the present copy pass when nothing else would be
+    // composited into it. AURORA_SCENE_MIRROR=1 copies it back into the EFB texture for capture tooling.
+    const bool skipPresentCopy = sceneOnSurface && !(rmlBindGroup && rmlOverlay) && fullSurfaceViewport;
+    if (canPresent && skipPresentCopy) {
+      static const bool mirror = [] {
+        const char* value = std::getenv("AURORA_SCENE_MIRROR");
+        return value != nullptr && value[0] == '1';
+      }();
+      if (mirror) {
+        const auto& efb = webgpu::present_source();
+        const wgpu::TexelCopyTextureInfo src{.texture = currentTexture};
+        const wgpu::TexelCopyTextureInfo dst{.texture = efb.texture};
+        const wgpu::Extent3D size{efb.size.width, efb.size.height, 1};
+        encoder.CopyTextureToTexture(&src, &dst, &size);
+      }
+    }
+    if (canPresent && !skipPresentCopy) {
       wgpu::BindGroup presentBindGroup;
       if (rmlBindGroup && !rmlOverlay) {
         presentBindGroup = rmlBindGroup;
       } else {
-        const auto& resampledSource = webgpu::resample_present_source(encoder, viewport);
-        presentBindGroup = webgpu::create_copy_bind_group(resampledSource);
+        // At 1:1 the resample pass is an identity: copy the EFB directly and save a full-screen render pass.
+        const auto& efbSource = webgpu::present_source();
+        if (efbSource.size.width == viewportWidth && efbSource.size.height == viewportHeight) {
+          presentBindGroup = webgpu::create_copy_bind_group(efbSource);
+        } else {
+          const auto& resampledSource = webgpu::resample_present_source(encoder, viewport);
+          presentBindGroup = webgpu::create_copy_bind_group(resampledSource);
+        }
       }
       {
         const std::array attachments{
@@ -381,6 +432,8 @@ void end_frame() noexcept {
         }
         pass.End();
       }
+    }
+    if (canPresent) {
       // An empty overlay still costs a full render pass (load, store, and on
       // tile-based mobile drivers ~0.5 ms of driver time). Skip it when ImGui
       // recorded nothing this frame.
@@ -410,6 +463,7 @@ void end_frame() noexcept {
     webgpu::gpu_prof::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
+    phase(sEncodeMs);
     {
       ZoneScopedN("Queue Submit");
       // OpenGL ES direct submission: the render pass callback is live only while this command buffer executes.
@@ -417,6 +471,7 @@ void end_frame() noexcept {
       g_queue.Submit(1, &buffer);
       gfx::gles_direct::uninstall_frame();
     }
+    phase(sSubmitMs);
     webgpu::gpu_prof::after_submit();
     if (canPresent && g_surface) {
       ZoneScopedN("Present");
@@ -426,6 +481,12 @@ void end_frame() noexcept {
         if (window::is_presentable()) {
           status = g_surface.Present();
         }
+      }
+      phase(sPresentMs);
+      if (g_config.renderStats && ++sPhaseFrames % 120 == 0) {
+        std::fprintf(stderr, "[render-phase] acquire_ms=%.3f encode_ms=%.3f submit_ms=%.3f present_ms=%.3f\n",
+                     sAcquireMs / 120, sEncodeMs / 120, sSubmitMs / 120, sPresentMs / 120);
+        sAcquireMs = sEncodeMs = sSubmitMs = sPresentMs = 0;
       }
       if (status) {
         gfx::after_present();
@@ -495,6 +556,19 @@ AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config)
   return aurora::initialize(argc, argv, *config);
 }
 void aurora_shutdown() { aurora::shutdown(); }
+#ifdef AURORA_ENABLE_GX
+uint64_t aurora_render_stats_fifo_wait_ns() { return aurora::gx::fifo::wait_ns(); }
+uint64_t aurora_render_stats_fifo_process_ns() { return aurora::gx::fifo::process_ns(); }
+uint64_t aurora_render_stats_render_worker_busy_ns() { return aurora::gfx::render_worker::busy_ns(); }
+uint64_t aurora_render_stats_pipeline_wait_ns() { return aurora::gfx::pipeline_wait_ns(); }
+uint64_t aurora_render_stats_pipeline_wait_count() { return aurora::gfx::pipeline_wait_count(); }
+#else
+uint64_t aurora_render_stats_fifo_wait_ns() { return 0; }
+uint64_t aurora_render_stats_fifo_process_ns() { return 0; }
+uint64_t aurora_render_stats_render_worker_busy_ns() { return 0; }
+uint64_t aurora_render_stats_pipeline_wait_ns() { return 0; }
+uint64_t aurora_render_stats_pipeline_wait_count() { return 0; }
+#endif
 const AuroraEvent* aurora_update() { return aurora::update(); }
 bool aurora_begin_frame() { return aurora::begin_frame(); }
 void aurora_end_frame() { aurora::end_frame(); }

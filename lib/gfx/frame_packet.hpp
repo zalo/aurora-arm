@@ -233,6 +233,11 @@ struct FramePacket {
   // verts, uniforms and indices point into persistently mapped GL storage (gles_direct.hpp) instead of the
   // staging buffer; the staging copies for them are skipped.
   bool mappedStreams = false;
+  // Scene on surface (AuroraConfig::sceneOnSurface): the presented texture acquired when this frame's first
+  // full-size EFB pass was encoded; those passes render into it and the present copy is skipped.
+  wgpu::Texture surfaceTexture;
+  wgpu::TextureView surfaceView;
+  bool surfaceTried = false;
 };
 
 // Recovers the payload of a GX / clear draw command (false for any other draw type).

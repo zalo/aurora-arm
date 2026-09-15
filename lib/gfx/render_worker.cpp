@@ -31,6 +31,9 @@ void complete_sync(const std::shared_ptr<SyncState>& sync) {
   sync->cv.notify_all();
 }
 
+std::atomic<uint64_t> g_busyNs{0};
+std::atomic<bool> g_accountBusy{false};
+
 void worker_main(std::stop_token token) {
   g_workerThreadId = std::this_thread::get_id();
 
@@ -46,7 +49,15 @@ void worker_main(std::stop_token token) {
 
     if (item->work) {
       ZoneScopedN("QueueItem work");
-      item->work();
+      if (g_accountBusy.load(std::memory_order_relaxed)) {
+        const auto start = std::chrono::steady_clock::now();
+        item->work();
+        g_busyNs.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(),
+            std::memory_order_relaxed);
+      } else {
+        item->work();
+      }
     }
     complete_sync(item->sync);
     g_pendingItems.fetch_sub(1, std::memory_order_acq_rel);
@@ -265,6 +276,9 @@ void synchronize() {
   std::unique_lock lock{sync->mutex};
   sync->cv.wait(lock, [&] { return sync->complete; });
 }
+
+void set_busy_accounting(bool enabled) noexcept { g_accountBusy.store(enabled, std::memory_order_relaxed); }
+uint64_t busy_ns() noexcept { return g_busyNs.load(std::memory_order_relaxed); }
 
 bool is_worker_thread() noexcept { return g_workerThreadId == std::this_thread::get_id(); }
 

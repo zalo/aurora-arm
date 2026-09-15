@@ -62,6 +62,11 @@ void wait_draw_done() noexcept;
 // Block until every published command has been processed, without publishing pending ones.
 void synchronize() noexcept;
 
+// Renderer time accounting (AuroraConfig::renderStats): nanoseconds the producer spent blocked on the
+// processor (drain, GXWaitDrawDone, synchronize) and the processor spent translating commands.
+uint64_t wait_ns() noexcept;
+uint64_t process_ns() noexcept;
+
 // Out-of-line slow path: grows internal buffer then appends data
 void write_data_grow(const void* data, uint32_t length);
 

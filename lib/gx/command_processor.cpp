@@ -20,6 +20,7 @@
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -1246,6 +1247,22 @@ void handle_aurora(ByteReader& reader) noexcept {
 }
 
 void clear_draw_cache() noexcept {
+  if (g_config.renderStats && batch_draws_enabled()) {
+    static uint32_t frames = 0;
+    if (++frames % 300 == 0) {
+      const auto& s = sBatchStats;
+      std::fprintf(stderr,
+                   "[gx-batch] frames=300 attempts=%llu merged=%llu no-previous=%llu kind=%llu pipeline=%llu "
+                   "texture=%llu dst-alpha=%llu fog=%llu window=%llu record=%llu limit=%llu gap=%llu\n",
+                   static_cast<unsigned long long>(s.attempts), static_cast<unsigned long long>(s.merged),
+                   static_cast<unsigned long long>(s.noPrevious), static_cast<unsigned long long>(s.kind),
+                   static_cast<unsigned long long>(s.pipeline), static_cast<unsigned long long>(s.texture),
+                   static_cast<unsigned long long>(s.dstAlpha), static_cast<unsigned long long>(s.fog),
+                   static_cast<unsigned long long>(s.window), static_cast<unsigned long long>(s.record),
+                   static_cast<unsigned long long>(s.limit), static_cast<unsigned long long>(s.gap));
+      sBatchStats = {};
+    }
+  }
   sDrawCache.bindGeneration = 0;
   sDrawCache.uniformRange = {};
   sDrawCache.fogRange = {};

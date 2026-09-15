@@ -1075,7 +1075,11 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       .surfaceConfiguration =
           wgpu::SurfaceConfiguration{
               .format = surfaceFormat,
-              .usage = wgpu::TextureUsage::RenderAttachment,
+              // Scene on surface: EFB copies sample the presented texture and capture tooling copies from it.
+              .usage = g_config.sceneOnSurface
+                           ? wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
+                                 wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst
+                           : wgpu::TextureUsage::RenderAttachment,
               .width = size.native_fb_width,
               .height = size.native_fb_height,
               .presentMode = presentMode,

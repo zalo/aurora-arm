@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -83,11 +84,26 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
   }
 }
 
+// Renderer time accounting (AuroraConfig::renderStats).
+std::atomic<uint64_t> sWaitNs{0};
+std::atomic<uint64_t> sProcessNs{0};
+uint64_t now_ns() noexcept {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 void wait_for_processed(uint64_t target) noexcept {
   uint64_t processed = sProcessed.load(std::memory_order_acquire);
+  if (processed >= target) {
+    return;
+  }
+  const uint64_t start = g_config.renderStats ? now_ns() : 0;
   while (processed < target) {
     sProcessed.wait(processed, std::memory_order_acquire);
     processed = sProcessed.load(std::memory_order_acquire);
+  }
+  if (start != 0) {
+    sWaitNs.fetch_add(now_ns() - start, std::memory_order_relaxed);
   }
 }
 
@@ -98,7 +114,13 @@ void worker_main(std::stop_token token) noexcept {
     const uint64_t processed = sProcessed.load(std::memory_order_relaxed);
     const uint64_t published = sPublished.load(std::memory_order_acquire);
     if (published != processed) {
-      process_to(published, std::memory_order_release);
+      if (g_config.renderStats) {
+        const uint64_t start = now_ns();
+        process_to(published, std::memory_order_release);
+        sProcessNs.fetch_add(now_ns() - start, std::memory_order_relaxed);
+      } else {
+        process_to(published, std::memory_order_release);
+      }
       continue;
     }
 
@@ -353,6 +375,9 @@ uint32_t end_display_list() {
 }
 
 bool in_display_list() { return detail::sInDisplayList; }
+
+uint64_t wait_ns() noexcept { return sWaitNs.load(std::memory_order_relaxed); }
+uint64_t process_ns() noexcept { return sProcessNs.load(std::memory_order_relaxed); }
 
 void drain() {
   if (detail::sBufferSize == 0) {

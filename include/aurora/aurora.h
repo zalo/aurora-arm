@@ -224,6 +224,17 @@ typedef struct {
    * cost a clock read per item when on.
    */
   bool renderStats;
+
+  /*
+   * Render the frame's EFB passes straight into the presented swapchain texture instead of the EFB texture,
+   * skipping the full-screen present copy pass when the whole surface is covered and no overlay is
+   * composited (the presented texture is acquired when the first such pass is encoded, so the swapchain
+   * needs TextureBinding and copy usage). The EFB texture then no longer holds the finished scene; capture
+   * tooling that reads it can set AURORA_SCENE_MIRROR=1 to have the surface copied back into it each frame.
+   * Applies to full-size, non-MSAA EFB passes only; other passes render as usual. On tile-based mobile
+   * drivers a render pass costs ~0.5-0.7 ms of driver time, which is what this saves.
+   */
+  bool sceneOnSurface;
 } AuroraConfig;
 
 typedef struct {
@@ -236,6 +247,20 @@ typedef struct {
 
 AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config);
 void aurora_shutdown();
+
+/*
+ * Renderer time accounting (AuroraConfig::renderStats; all zero when it is off). Monotonic totals in
+ * nanoseconds since initialization, for the application's own frame-time breakdown:
+ * - fifo_wait: game thread blocked waiting for the GX translation worker (drain, GXWaitDrawDone, sync)
+ * - fifo_process: translation worker time spent processing GX commands
+ * - render_worker_busy: render worker time spent executing queued items (encoding, submit, present)
+ * - pipeline_wait / pipeline_wait_count: translation worker blocked on pipeline creation, and how often
+ */
+uint64_t aurora_render_stats_fifo_wait_ns(void);
+uint64_t aurora_render_stats_fifo_process_ns(void);
+uint64_t aurora_render_stats_render_worker_busy_ns(void);
+uint64_t aurora_render_stats_pipeline_wait_ns(void);
+uint64_t aurora_render_stats_pipeline_wait_count(void);
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();

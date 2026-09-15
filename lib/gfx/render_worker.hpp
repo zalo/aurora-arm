@@ -84,5 +84,9 @@ void synchronize();
 
 bool is_worker_thread() noexcept;
 bool is_idle() noexcept;
+// Renderer time accounting (AuroraConfig::renderStats): nanoseconds spent executing queued items, counted
+// only while enabled.
+void set_busy_accounting(bool enabled) noexcept;
+uint64_t busy_ns() noexcept;
 
 } // namespace aurora::gfx::render_worker

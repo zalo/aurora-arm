@@ -1,5 +1,7 @@
 #include "pipeline_cache.hpp"
 
+#include <chrono>
+
 #include "clear.hpp"
 #include "resources.hpp"
 #include "hash.hpp"
@@ -430,6 +432,11 @@ static void notify_pipeline_ready(bool queued) {
 
 static PipelineRef g_lastPipelineRef = std::numeric_limits<PipelineRef>::max();
 
+static std::atomic<uint64_t> g_pipelineWaitNs{0};
+static std::atomic<uint64_t> g_pipelineWaitCount{0};
+uint64_t pipeline_wait_ns() noexcept { return g_pipelineWaitNs.load(std::memory_order_relaxed); }
+uint64_t pipeline_wait_count() noexcept { return g_pipelineWaitCount.load(std::memory_order_relaxed); }
+
 template <typename PipelineConfig>
 static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& config, NewPipelineCallback&& cb,
                                       PipelinePriority priority = PipelinePriority::Normal,
@@ -542,7 +549,16 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
 
   if (blocking && !pipelineReady) {
     std::unique_lock lock{g_pipelineMutex};
-    g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; });
+    if (g_config.renderStats) {
+      const auto waitStart = std::chrono::steady_clock::now();
+      g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; });
+      g_pipelineWaitNs.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count(),
+          std::memory_order_relaxed);
+      g_pipelineWaitCount.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; });
+    }
     auto pipelineIt = g_pipelines.find(hash);
     if (pipelineIt != g_pipelines.end() && persist && firstFrameUsed < pipelineIt->second.firstFrameUsed) {
       pipelineIt->second.firstFrameUsed = firstFrameUsed;

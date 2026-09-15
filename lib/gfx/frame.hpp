@@ -4,6 +4,7 @@
 #include "frame_packet.hpp"
 
 #include <optional>
+#include <utility>
 
 namespace aurora::gfx::detail {
 
@@ -48,6 +49,9 @@ void begin_reserved_frame(uint32_t frameSlot);
 void defer_end_frame(EndFrameCallback callback);
 void end_deferred_frame();
 uint32_t current_frame() noexcept;
+// Scene on surface: the presented texture the frame's EFB passes rendered into, set by the render worker
+// before the presentation callback runs and taken by it (empty when the scene rendered into the EFB).
+std::pair<wgpu::Texture, wgpu::TextureView> take_frame_surface() noexcept;
 void after_submit() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;

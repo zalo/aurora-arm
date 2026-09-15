@@ -16,6 +16,7 @@
 #endif
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
+#include "../window.hpp"
 
 #include <algorithm>
 #include <array>
@@ -187,9 +188,16 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
 #endif
 }
 
+// The color texture a pass's copies read: the EFB texture, or the presented texture when the scene rendered
+// into it (sceneOnSurface).
+struct SceneSource {
+  wgpu::Texture texture;
+  wgpu::TextureView view;
+};
+
 // Copies `rect` of the pass's color (or depth) source into `target`, converting or scaling as the format requires.
-void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const TextureHandle& target, GXTexFmt format,
-                  const ClipRect& rect, const Range& uniformRange) {
+void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const SceneSource& scene,
+                  const TextureHandle& target, GXTexFmt format, const ClipRect& rect, const Range& uniformRange) {
   const auto& dstSize = target->size;
   const bool needsConversion = tex_copy_conv::needs_conversion(format);
   const bool needsScaling =
@@ -200,7 +208,7 @@ void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const T
   }
   const tex_copy_conv::ConvRequest convReq{
       .fmt = format,
-      .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
+      .srcView = isDepth ? passInfo.copySourceDepthView : scene.view,
       .uniformRange = uniformRange,
       .dst = target,
       .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
@@ -212,7 +220,7 @@ void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const T
   } else {
     const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
     const wgpu::TexelCopyTextureInfo src{
-        .texture = passInfo.copySourceTexture,
+        .texture = scene.texture,
         .origin =
             wgpu::Origin3D{
                 .x = static_cast<uint32_t>(rect.x),
@@ -233,7 +241,7 @@ void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const T
 
 // A fused pass whose two copies share a conversion format and need no scaling converts both in one render pass
 // with two color targets instead of one pass per copy.
-bool resolve_dual(wgpu::CommandEncoder& cmd, const RenderPass& passInfo) {
+bool resolve_dual(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const SceneSource& scene) {
   if (passInfo.extraResolves.size() != 1 || passInfo.dualResolveUniformRange.size != 32) {
     return false;
   }
@@ -251,7 +259,7 @@ bool resolve_dual(wgpu::CommandEncoder& cmd, const RenderPass& passInfo) {
   }
   const tex_copy_conv::ConvRequest convReq{
       .fmt = passInfo.resolveFormat,
-      .srcView = passInfo.copySourceView,
+      .srcView = scene.view,
       .dst = passInfo.resolveTarget,
       .sampleFilter = tex_copy_conv::SampleFilter::Nearest,
   };
@@ -274,11 +282,39 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     return;
   }
 
+  // Scene on surface: full-size, single-sample EFB passes render into the presented texture, acquired when
+  // the frame's first such pass is encoded (the render worker has presented the previous frame by then) and
+  // handed to the presentation callback with the packet.
+  SceneSource scene{passInfo.copySourceTexture, passInfo.copySourceView};
+  bool sceneOnSurface = false;
+  if (g_config.sceneOnSurface && passInfo.msaaSamples == 1 && passInfo.colorAttachmentCount == 1) {
+    const auto& color = passInfo.colorAttachments[SceneColorAttachmentIndex];
+    const auto& surfaceConfig = webgpu::g_graphicsConfig.surfaceConfiguration;
+    if (color.view && color.view.Get() == webgpu::g_frameBuffer.view.Get() && color.size.width == surfaceConfig.width &&
+        color.size.height == surfaceConfig.height) {
+      if (!frame.surfaceTried) {
+        frame.surfaceTried = true;
+        window::SurfaceLock surfaceLock;
+        if (window::is_presentable() && webgpu::g_surface) {
+          wgpu::SurfaceTexture surfaceTexture;
+          webgpu::g_surface.GetCurrentTexture(&surfaceTexture);
+          if (surfaceTexture.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal && surfaceTexture.texture) {
+            frame.surfaceTexture = std::move(surfaceTexture.texture);
+            frame.surfaceView = frame.surfaceTexture.CreateView();
+          }
+        }
+      }
+      sceneOnSurface = static_cast<bool>(frame.surfaceView);
+    }
+  }
+  if (sceneOnSurface) {
+    scene = {frame.surfaceTexture, frame.surfaceView};
+  }
   std::array<wgpu::RenderPassColorAttachment, MaxColorAttachments> attachments{};
   for (uint32_t i = 0; i < passInfo.colorAttachmentCount; ++i) {
     const auto& source = passInfo.colorAttachments[i];
     attachments[i] = {
-        .view = source.view,
+        .view = sceneOnSurface && i == SceneColorAttachmentIndex ? frame.surfaceView : source.view,
         .resolveTarget = source.resolveView,
         .loadOp = source.loadOp != wgpu::LoadOp::Undefined ? source.loadOp
                                                            : (source.clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load),
@@ -332,18 +368,18 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
                                       passInfo.colorAttachments[SceneColorAttachmentIndex].size, passInfo.msaaSamples);
   }
 
-  if (passInfo.resolveTarget && !resolve_dual(cmd, passInfo)) {
-    resolve_copy(cmd, passInfo, passInfo.resolveTarget, passInfo.resolveFormat, passInfo.resolveRect,
+  if (passInfo.resolveTarget && !resolve_dual(cmd, passInfo, scene)) {
+    resolve_copy(cmd, passInfo, scene, passInfo.resolveTarget, passInfo.resolveFormat, passInfo.resolveRect,
                  passInfo.resolveUniformRange);
     for (const auto& extra : passInfo.extraResolves) {
-      resolve_copy(cmd, passInfo, extra.target, extra.format, extra.rect, extra.uniformRange);
+      resolve_copy(cmd, passInfo, scene, extra.target, extra.format, extra.rect, extra.uniformRange);
     }
   }
 
   if (passInfo.snapshotColorDst) {
     const webgpu::gpu_prof::Zone zone{cmd, "Pass snapshot"};
     const wgpu::TexelCopyTextureInfo src{
-        .texture = passInfo.copySourceTexture,
+        .texture = scene.texture,
     };
     const wgpu::TexelCopyTextureInfo dst{
         .texture = passInfo.snapshotColorDst,
