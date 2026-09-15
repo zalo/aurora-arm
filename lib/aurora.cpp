@@ -271,6 +271,7 @@ bool begin_frame() noexcept {
   }
 
   imgui::new_frame(window::get_window_size());
+  gx::fifo::recycle();
   if (async_frames()) {
     // The processor begins recording into the slot when it reaches the marker.
     uint32_t frameSlot;
