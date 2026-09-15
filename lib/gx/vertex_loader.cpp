@@ -385,6 +385,11 @@ bool decoded_vertex_has_location(const ShaderConfig& config, u32 location) noexc
     if (config.lineMode != 0) {
       return true;
     }
+    // With the uniform table and draw batching the record index rides in this word for every
+    // vertex, so the location must exist even when the vertex format has no matrix indices.
+    if (config.uniformTable && config.batchDraws) {
+      return true;
+    }
     for (u32 i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7MTXIDX; ++i) {
       if (config.attrs[i].attrType != GX_NONE) {
         return true;
