@@ -46,6 +46,7 @@ protected:
     texture::shutdown();
     g_gxState = {};
     g_config.textureVerifyInterval = 0;
+    g_config = {};
     testing::reset_texture_stubs();
     texture::end_frame();
   }
@@ -71,6 +72,32 @@ TEST_F(GxTextureCacheTest, ReusesIdenticalContentAtDifferentAddresses) {
   EXPECT_EQ(firstHandle, secondHandle);
   EXPECT_EQ(testing::texture_allocations(), 1);
   EXPECT_EQ(texture_stats().contentHits, 1);
+}
+
+TEST_F(GxTextureCacheTest, AtlasKeepsClampAndRepeatUsersOfOneImageApart) {
+  std::array<uint8_t, 16> pixels{};
+  auto clamp = make_texture(pixels.data(), 1);
+  clamp.mode0 = static_cast<u32>(GX_CLAMP) | (static_cast<u32>(GX_CLAMP) << 2);
+  auto repeat = make_texture(pixels.data(), 2);
+  repeat.mode0 = static_cast<u32>(GX_REPEAT) | (static_cast<u32>(GX_REPEAT) << 2);
+
+  // Without the atlas the content cache shares one texture: the sampler alone
+  // distinguishes the two users.
+  EXPECT_EQ(texture::resolve_static_texture(clamp), texture::resolve_static_texture(repeat));
+  EXPECT_EQ(testing::texture_allocations(), 1);
+
+  // An atlas cell bakes clamp sampling into its placement: REPEAT must not
+  // share it, while other single-mip clamp users of the image may.
+  texture::shutdown();
+  testing::reset_texture_stubs();
+  g_config.textureAtlas = true;
+  const auto clampHandle = texture::resolve_static_texture(clamp);
+  EXPECT_NE(clampHandle, texture::resolve_static_texture(repeat));
+  EXPECT_EQ(testing::texture_allocations(), 2);
+  auto otherClamp = clamp;
+  otherClamp.texObjId = 3;
+  EXPECT_EQ(texture::resolve_static_texture(otherClamp), clampHandle);
+  EXPECT_EQ(testing::texture_allocations(), 2);
 }
 
 TEST_F(GxTextureCacheTest, ObjectHitDoesNotHashAgain) {

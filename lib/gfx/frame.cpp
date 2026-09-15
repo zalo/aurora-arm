@@ -549,6 +549,7 @@ void shutdown() {
   tex_palette_conv::shutdown();
   texture_replacement::shutdown();
   gx::shutdown();
+  shutdown_texture_pool();
 #ifdef AURORA_ENABLE_RMLUI
   rmlui::shutdown_pipeline();
 #endif

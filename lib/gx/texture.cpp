@@ -79,18 +79,25 @@ struct TextureContentKey {
   XXH128_hash_t tlutHash{};
   u32 tlutFormat = 0;
   u16 tlutEntries = 0;
+  // Atlas class when the texture may be atlased: an atlas cell bakes clamp
+  // sampling into its placement, so users of the same image with another
+  // sampler class (e.g. REPEAT) must not share the GPU texture.
+  bool atlas = false;
+  u64 atlasClass = 0;
 
   bool operator==(const TextureContentKey& rhs) const noexcept {
     return textureHash.low64 == rhs.textureHash.low64 && textureHash.high64 == rhs.textureHash.high64 &&
            width == rhs.width && height == rhs.height && format == rhs.format && mipCount == rhs.mipCount &&
            tlutHash.low64 == rhs.tlutHash.low64 && tlutHash.high64 == rhs.tlutHash.high64 &&
-           tlutFormat == rhs.tlutFormat && tlutEntries == rhs.tlutEntries;
+           tlutFormat == rhs.tlutFormat && tlutEntries == rhs.tlutEntries && atlas == rhs.atlas &&
+           atlasClass == rhs.atlasClass;
   }
 
   template <typename H>
   friend H AbslHashValue(H h, const TextureContentKey& key) {
     return H::combine(std::move(h), key.textureHash.low64, key.textureHash.high64, key.width, key.height, key.format,
-                      key.mipCount, key.tlutHash.low64, key.tlutHash.high64, key.tlutFormat, key.tlutEntries);
+                      key.mipCount, key.tlutHash.low64, key.tlutHash.high64, key.tlutFormat, key.tlutEntries, key.atlas,
+                      key.atlasClass);
   }
 };
 
@@ -374,12 +381,16 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
   CHECK(obj.has_data() && textureBytes != 0, "invalid texture source for content hash");
 
   TextureKeys keys;
+  const auto textureClass = gfx::texture_class(obj);
+  const bool atlas = g_config.textureAtlas && textureClass.atlas;
   keys.contentKey = {
       .textureHash = XXH3_128bits(obj.data, textureBytes),
       .width = obj.width(),
       .height = obj.height(),
       .format = obj.format(),
       .mipCount = obj.mip_count(),
+      .atlas = atlas,
+      .atlasClass = atlas ? textureClass.sampler : 0,
   };
   s_stats.hashedBytes += textureBytes;
 
@@ -759,7 +770,8 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
 #endif
       const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
-                                          {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr);
+                                          {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr,
+                                          gfx::texture_class(obj));
       ++s_stats.misses;
       s_stats.uploadBytes += texture_handle_size(handle);
       cache_content_texture(std::move(keys->contentKey), handle);
@@ -815,7 +827,7 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
       }
       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
                                           {converted.data.data(), converted.data.size()}, false,
-                                          "GX Static Palette Texture");
+                                          "GX Static Palette Texture", gfx::texture_class(obj));
       handle->hasArbitraryMips = converted.hasArbitraryMips;
       ++s_stats.misses;
       s_stats.uploadBytes += texture_handle_size(handle);
@@ -964,10 +976,11 @@ void evict_copy_texture(const void* dest) noexcept {
   texture::invalidate_bindings();
 }
 
-void resolve_sampled_textures(const ShaderInfo& info) noexcept {
+bool resolve_sampled_textures(const ShaderInfo& info) noexcept {
   ZoneScoped;
   apply_pending_invalidations();
 
+  bool rebound = false;
   for (u32 i = 0; i < MaxTextures; ++i) {
     if (!info.sampledTextures.test(i)) {
       continue;
@@ -1004,7 +1017,12 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     }
 
     obj.mFormat = resolved_format_for_handle(handle);
+    // Textures in one array share a bind group, so the caller cannot see a
+    // change of texture there: report what texture_size_bias depends on.
+    rebound |= textureBind.ref != handle || textureBind.texObj.width() != obj.width() ||
+               textureBind.texObj.height() != obj.height() || textureBind.texObj.mode0 != obj.mode0;
     textureBind = gfx::TextureBind{obj, std::move(handle), s_bindGeneration};
   }
+  return rebound;
 }
 } // namespace aurora::gx

@@ -6,13 +6,17 @@
 #include "aurora/aurora.h"
 #include "texture.hpp"
 #include "texture_convert.hpp"
+#include "texture_pool.hpp"
 #include "../gx/gx_fmt.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <utility>
+#include <vector>
 
+#include <absl/container/flat_hash_map.h>
 #include <fmt/format.h>
 #include <tracy/Tracy.hpp>
 #include <webgpu/webgpu_cpp.h>
@@ -95,13 +99,293 @@ u16 wgpu_aniso(GXAnisotropy aniso) {
     return std::max<u16>(webgpu::g_graphicsConfig.textureAnisotropy, 1);
   }
 }
+
+// GX shaders sample every texture as texture_2d_array. In compatibility mode
+// (GLES) a texture is bound through views of one dimension fixed at creation,
+// which defaults to 2D for a single layer, so declare 2D-array up front; core
+// devices may view any 2D texture as an array and do not need the chain.
+const wgpu::ChainedStruct* array_binding_chain() noexcept {
+  static const wgpu::TextureBindingViewDimension chain{wgpu::TextureBindingViewDimension::Init{
+      .textureBindingViewDimension = wgpu::TextureViewDimension::e2DArray,
+  }};
+  return webgpu::g_hasCoreFeatures ? nullptr : &chain;
+}
+
+// GX textures live in "slabs": 2D array textures shared by all textures of one
+// size, mip count, format and sampler class. A texture owns one layer and
+// returns it when its TextureRef dies.
+//
+// Atlas slabs hold single-mip clamp textures of many sizes in AtlasSize square
+// layers instead, one shelf packer per layer (AuroraConfig::textureAtlas).
+struct TextureSlab {
+  wgpu::Texture texture;
+  wgpu::TextureView view;
+  uint32_t layers = 0;
+  std::vector<uint32_t> freeLayers;
+  std::vector<texture_pool::ShelfPacker> atlasLayers;
+};
+
+struct TextureSlabKey {
+  uint32_t width;
+  uint32_t height;
+  uint32_t mips;
+  wgpu::TextureFormat format;
+  u32 gxFormat; // selects the view swizzle
+  uint64_t sampler;
+  bool atlas;
+
+  bool operator==(const TextureSlabKey&) const noexcept = default;
+
+  template <typename H>
+  friend H AbslHashValue(H h, const TextureSlabKey& key) {
+    return H::combine(std::move(h), key.width, key.height, key.mips, key.format, key.gxFormat, key.sampler, key.atlas);
+  }
+};
+
+std::mutex g_slabMutex;
+absl::flat_hash_map<TextureSlabKey, std::vector<std::shared_ptr<TextureSlab>>> g_slabs;
+
+std::shared_ptr<TextureSlab> create_slab(const TextureSlabKey& key, uint32_t layers, const char* label) {
+  auto slab = std::make_shared<TextureSlab>();
+  slab->layers = layers;
+  const auto slabLabel = fmt::format("{} {} x{}", label, key.atlas ? "atlas" : "array", layers);
+  const wgpu::TextureDescriptor textureDescriptor{
+      .nextInChain = array_binding_chain(),
+      .label = slabLabel.c_str(),
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = {key.width, key.height, layers},
+      .format = key.format,
+      .mipLevelCount = key.mips,
+      .sampleCount = 1,
+  };
+  slab->texture = g_device.CreateTexture(&textureDescriptor);
+  wgpu::TextureViewDescriptor viewDescriptor{
+      .label = slabLabel.c_str(),
+      .format = key.format,
+      .dimension = wgpu::TextureViewDimension::e2DArray,
+      .mipLevelCount = key.mips,
+      .arrayLayerCount = layers,
+  };
+  wgpu::TextureComponentSwizzleDescriptor swizzle;
+  if (setup_swizzle(swizzle, key.gxFormat)) {
+    viewDescriptor.nextInChain = &swizzle;
+  }
+  slab->view = slab->texture.CreateView(&viewDescriptor);
+  if (key.atlas) {
+    slab->atlasLayers.resize(layers);
+    return slab;
+  }
+  // Hand out layer 0 first; the free list pops from the back.
+  for (uint32_t layer = layers; layer > 0; --layer) {
+    slab->freeLayers.push_back(layer - 1);
+  }
+  return slab;
+}
+
+TextureHandle allocate_slab_layer(const TextureSlabKey& key, const char* label) {
+  std::shared_ptr<TextureSlab> slab;
+  uint32_t layer = 0;
+  {
+    std::lock_guard lock{g_slabMutex};
+    auto& slabs = g_slabs[key];
+    for (const auto& candidate : slabs) {
+      if (!candidate->freeLayers.empty()) {
+        slab = candidate;
+        break;
+      }
+    }
+    if (!slab) {
+      const uint64_t layerBytes = calc_texture_size(key.format, key.width, key.height, key.mips);
+      const uint32_t layers =
+          texture_pool::next_slab_layers(key.width, key.height, slabs.empty() ? 0 : slabs.back()->layers, layerBytes);
+      slab = slabs.emplace_back(create_slab(key, layers, label));
+    }
+    layer = slab->freeLayers.back();
+    slab->freeLayers.pop_back();
+  }
+  const wgpu::Extent3D size{
+      .width = key.width,
+      .height = key.height,
+      .depthOrArrayLayers = 1,
+  };
+  auto* ref = new TextureRef(slab->texture, slab->view, wgpu::TextureView{}, size, key.format, key.mips, key.gxFormat);
+  ref->layer = layer;
+  return TextureHandle(ref, [slab, layer](TextureRef* ptr) {
+    delete ptr;
+    std::lock_guard lock{g_slabMutex};
+    slab->freeLayers.push_back(layer);
+  });
+}
+
+bool fits_atlas(uint32_t width, uint32_t height, uint32_t mips, wgpu::TextureFormat format) {
+  const auto info = format_info(format);
+  return mips == 1 && info.blockWidth == 1 && info.blockHeight == 1 &&
+         width + 2 * texture_pool::AtlasGutter <= texture_pool::AtlasSize &&
+         height + 2 * texture_pool::AtlasGutter <= texture_pool::AtlasSize;
+}
+
+TextureHandle allocate_atlas_cell(const TextureSlabKey& key, uint32_t width, uint32_t height, const char* label) {
+  std::shared_ptr<TextureSlab> slab;
+  uint32_t layer = 0;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  {
+    std::lock_guard lock{g_slabMutex};
+    auto& slabs = g_slabs[key];
+    const auto place = [&](const std::shared_ptr<TextureSlab>& candidate) {
+      for (uint32_t l = 0; l < candidate->layers; ++l) {
+        if (candidate->atlasLayers[l].place(width, height, x, y)) {
+          slab = candidate;
+          layer = l;
+          return true;
+        }
+      }
+      return false;
+    };
+    for (const auto& candidate : slabs) {
+      if (place(candidate)) {
+        break;
+      }
+    }
+    if (!slab) {
+      const uint32_t layers = texture_pool::next_atlas_slab_layers(slabs.empty() ? 0 : slabs.back()->layers);
+      const bool placed = place(slabs.emplace_back(create_slab(key, layers, label)));
+      CHECK(placed, "{}: {}x{} does not fit an empty atlas layer", label, width, height);
+    }
+  }
+  const wgpu::Extent3D size{
+      .width = width,
+      .height = height,
+      .depthOrArrayLayers = 1,
+  };
+  auto* ref = new TextureRef(slab->texture, slab->view, wgpu::TextureView{}, size, key.format, 1, key.gxFormat);
+  ref->layer = layer;
+  ref->atlasCell = Vec2<uint32_t>{x, y};
+  return TextureHandle(ref, [slab, layer](TextureRef* ptr) {
+    delete ptr;
+    std::lock_guard lock{g_slabMutex};
+    slab->atlasLayers[layer].release();
+  });
+}
+
+// Writes level 0 of an atlas texture into its cell, gutter included.
+void upload_atlas_texture(TextureRef& ref, ArrayRef<uint8_t> data, const char* label) {
+  using texture_pool::AtlasGutter;
+  const auto info = format_info(ref.format);
+  const uint32_t bytesPerRow = ref.size.width * info.blockSize;
+  const size_t dataSize = static_cast<size_t>(bytesPerRow) * ref.size.height;
+  CHECK(dataSize <= data.size(), "{}: expected at least {} bytes, got {}", label, dataSize, data.size());
+  std::vector<uint8_t> padded;
+  const uint32_t paddedBytesPerRow =
+      texture_pool::pad_with_gutter(data.data(), bytesPerRow, ref.size.width, ref.size.height, info.blockSize, padded);
+  const wgpu::Extent3D paddedSize{
+      .width = ref.size.width + 2 * AtlasGutter,
+      .height = ref.size.height + 2 * AtlasGutter,
+      .depthOrArrayLayers = 1,
+  };
+  const wgpu::TexelCopyTextureInfo dstView{
+      .texture = ref.texture,
+      .mipLevel = 0,
+      .origin = {ref.atlasCell->x - AtlasGutter, ref.atlasCell->y - AtlasGutter, ref.layer},
+  };
+  if constexpr (UseTextureBuffer) {
+    queue_texture_upload_data(padded.data(), paddedBytesPerRow, paddedSize.height, dstView, paddedSize);
+  } else {
+    const wgpu::TexelCopyBufferLayout dataLayout{
+        .bytesPerRow = paddedBytesPerRow,
+        .rowsPerImage = paddedSize.height,
+    };
+    g_queue.WriteTexture(&dstView, padded.data(), padded.size(), &dataLayout, &paddedSize);
+  }
+}
+
+// A texture of its own with a single layer, sampled through a view of
+// `viewDimension` (2D array for GX shaders, 2D for TLUTs read by the palette
+// conversion).
+TextureHandle create_texture(uint32_t width, uint32_t height, uint32_t mips, wgpu::TextureFormat format, u32 gxFormat,
+                             wgpu::TextureViewDimension viewDimension, const char* label) {
+  const bool array = viewDimension == wgpu::TextureViewDimension::e2DArray;
+  const wgpu::Extent3D size{
+      .width = width,
+      .height = height,
+      .depthOrArrayLayers = 1,
+  };
+  const wgpu::TextureDescriptor textureDescriptor{
+      .nextInChain = array ? array_binding_chain() : nullptr,
+      .label = label,
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = size,
+      .format = format,
+      .mipLevelCount = mips,
+      .sampleCount = 1,
+  };
+  auto texture = g_device.CreateTexture(&textureDescriptor);
+  const auto viewLabel = fmt::format("{} view", label);
+  wgpu::TextureViewDescriptor textureViewDescriptor{
+      .label = viewLabel.c_str(),
+      .format = format,
+      .dimension = viewDimension,
+      .mipLevelCount = mips,
+  };
+  wgpu::TextureComponentSwizzleDescriptor swizzle;
+  if (setup_swizzle(swizzle, gxFormat)) {
+    textureViewDescriptor.nextInChain = &swizzle;
+  }
+  auto textureView = texture.CreateView(&textureViewDescriptor);
+  return std::make_shared<TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size, format,
+                                      mips, gxFormat);
+}
+
+// A render or conversion target: attached through a 2D view of its only layer,
+// sampled by GX shaders through a 2D-array view.
+TextureHandle create_target_texture(uint32_t width, uint32_t height, wgpu::TextureFormat format, u32 gxFormat,
+                                    wgpu::TextureUsage usage, const char* label) {
+  const wgpu::Extent3D size{
+      .width = width,
+      .height = height,
+      .depthOrArrayLayers = 1,
+  };
+  const wgpu::TextureDescriptor textureDescriptor{
+      .nextInChain = array_binding_chain(),
+      .label = label,
+      .usage = usage,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = size,
+      .format = format,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  auto texture = g_device.CreateTexture(&textureDescriptor);
+
+  const auto viewLabel = fmt::format("{} view", label);
+  const wgpu::TextureViewDescriptor attachmentViewDescriptor{
+      .label = viewLabel.c_str(),
+      .format = format,
+      .dimension = wgpu::TextureViewDimension::e2D,
+  };
+  auto attachmentTextureView = texture.CreateView(&attachmentViewDescriptor);
+  const auto sampleViewLabel = fmt::format("{} array view", label);
+  const wgpu::TextureViewDescriptor sampleViewDescriptor{
+      .label = sampleViewLabel.c_str(),
+      .format = format,
+      .dimension = wgpu::TextureViewDimension::e2DArray,
+  };
+  auto sampleTextureView = texture.CreateView(&sampleViewDescriptor);
+  return std::make_shared<TextureRef>(std::move(texture), std::move(sampleTextureView),
+                                      std::move(attachmentTextureView), size, format, 1, gxFormat);
+}
 } // namespace
 
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
-                                    bool tlut, const char* label) noexcept {
+                                    bool tlut, const char* label, std::optional<TextureClass> textureClass) noexcept {
   ZoneScoped;
 
-  auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
+  // TLUTs are read by the palette conversion as plain 2D textures.
+  auto handle =
+      tlut ? create_texture(width, height, mips, to_wgpu(format), format, wgpu::TextureViewDimension::e2D, label)
+           : new_dynamic_texture_2d(width, height, mips, format, label, textureClass);
   auto& ref = *handle;
 
   ConvertedTexture converted;
@@ -119,6 +403,10 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
     }
   }
 
+  if (ref.atlasCell) {
+    upload_atlas_texture(ref, data, label);
+    return handle;
+  }
   uint32_t offset = 0;
   for (uint32_t mip = 0; mip < mips; ++mip) {
     const wgpu::Extent3D mipSize{
@@ -137,6 +425,7 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
     const wgpu::TexelCopyTextureInfo dstView{
         .texture = ref.texture,
         .mipLevel = mip,
+        .origin = {0, 0, ref.layer},
     };
     if constexpr (UseTextureBuffer) {
       queue_texture_upload_data(data.data() + offset, bytesPerRow, heightBlocks, std::move(dstView), physicalSize);
@@ -155,105 +444,37 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
   return handle;
 }
 
-TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-                                     const char* label) noexcept {
+TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat, const char* label,
+                                     std::optional<TextureClass> textureClass) noexcept {
   ZoneScopedS(3);
   const auto wgpuFormat = to_wgpu(gxFormat);
-  const wgpu::Extent3D size{
-      .width = width,
-      .height = height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = label,
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = wgpuFormat,
-      .mipLevelCount = mips,
-      .sampleCount = 1,
-  };
-  auto texture = g_device.CreateTexture(&textureDescriptor);
-  const auto viewLabel = fmt::format("{} view", label);
-  wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = viewLabel.c_str(),
-      .format = wgpuFormat,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = mips,
-  };
-  wgpu::TextureComponentSwizzleDescriptor swizzle;
-  if (setup_swizzle(swizzle, gxFormat)) {
-    textureViewDescriptor.nextInChain = &swizzle;
+  if (textureClass) {
+    if (g_config.textureAtlas && textureClass->atlas && fits_atlas(width, height, mips, wgpuFormat)) {
+      return allocate_atlas_cell(
+          {texture_pool::AtlasSize, texture_pool::AtlasSize, 1, wgpuFormat, gxFormat, textureClass->sampler, true},
+          width, height, label);
+    }
+    return allocate_slab_layer({width, height, mips, wgpuFormat, gxFormat, textureClass->sampler, false}, label);
   }
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  return std::make_shared<TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size, wgpuFormat,
-                                      mips, gxFormat);
+  return create_texture(width, height, mips, wgpuFormat, gxFormat, wgpu::TextureViewDimension::e2DArray, label);
 }
 
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
   ZoneScoped;
-
-  const auto wgpuFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format;
-  const wgpu::Extent3D size{
-      .width = width,
-      .height = height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = label,
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::RenderAttachment,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = wgpuFormat,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  auto texture = g_device.CreateTexture(&textureDescriptor);
-
-  // Create texture view for color attachments
-  const auto viewLabel = fmt::format("{} view", label);
-  wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = viewLabel.c_str(),
-      .format = wgpuFormat,
-      .dimension = wgpu::TextureViewDimension::e2D,
-  };
-  auto attachmentTextureView = texture.CreateView(&textureViewDescriptor);
-  wgpu::TextureView sampleTextureView = attachmentTextureView;
-  return std::make_shared<TextureRef>(std::move(texture), std::move(sampleTextureView),
-                                      std::move(attachmentTextureView), size, wgpuFormat, 1, gxFormat);
+  return create_target_texture(
+      width, height, webgpu::g_graphicsConfig.surfaceConfiguration.format, gxFormat,
+      wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::RenderAttachment, label);
 }
 
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
   ZoneScoped;
+  return create_target_texture(width, height, to_wgpu(gxFormat), gxFormat,
+                               wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment, label);
+}
 
-  const auto wgpuFormat = to_wgpu(gxFormat);
-  const wgpu::Extent3D size{
-      .width = width,
-      .height = height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = label,
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = wgpuFormat,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  auto texture = g_device.CreateTexture(&textureDescriptor);
-
-  // Create texture view for color attachments
-  const auto viewLabel = fmt::format("{} view", label);
-  wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = viewLabel.c_str(),
-      .format = wgpuFormat,
-      .dimension = wgpu::TextureViewDimension::e2D,
-  };
-  auto attachmentTextureView = texture.CreateView(&textureViewDescriptor);
-  wgpu::TextureView sampleTextureView = attachmentTextureView;
-  return std::make_shared<TextureRef>(std::move(texture), std::move(sampleTextureView),
-                                      std::move(attachmentTextureView), size, wgpuFormat, 1, gxFormat);
+void shutdown_texture_pool() noexcept {
+  std::lock_guard lock{g_slabMutex};
+  g_slabs.clear();
 }
 
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
@@ -268,6 +489,10 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
     }
   }
 
+  if (ref.atlasCell) {
+    upload_atlas_texture(ref, data, "write_texture");
+    return;
+  }
   uint32_t offset = 0;
   for (uint32_t mip = 0; mip < ref.mipCount; ++mip) {
     const wgpu::Extent3D mipSize{
@@ -286,6 +511,7 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
     const wgpu::TexelCopyTextureInfo dstView{
         .texture = ref.texture,
         .mipLevel = mip,
+        .origin = {0, 0, ref.layer},
     };
     if constexpr (UseTextureBuffer) {
       queue_texture_upload_data(data.data() + offset, bytesPerRow, heightBlocks, std::move(dstView), physicalSize);
@@ -316,6 +542,13 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
     if (!mipsEnabled) {
       mipFilter = wgpu::MipmapFilterMode::Nearest;
     }
+  } else if (ref && ref->mipCount == 1 && mipFilter != wgpu::MipmapFilterMode::Undefined) {
+    // One level: the mip filter and LOD clamps cannot change the result, so
+    // share the sampler of a non-mipmapped texture (textures of one atlas
+    // class then share a sampler and a bind group).
+    mipFilter = wgpu::MipmapFilterMode::Undefined;
+    minLod = 0.f;
+    maxLod = 0.f;
   } else if (mipFilter == wgpu::MipmapFilterMode::Undefined) {
     minLod = 0.f;
     maxLod = 0.f;

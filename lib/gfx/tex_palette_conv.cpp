@@ -45,13 +45,13 @@ fn intensity(rgb: vec3f) -> f32 {
 // Direct: R16Sint index texture + TLUT -> RGBA8
 static constexpr std::string_view ShaderDirect = R"(
 @group(0) @binding(0) var src_samp: sampler;
-@group(0) @binding(1) var src: texture_2d<i32>;
+@group(0) @binding(1) var src: texture_2d_array<i32>;
 @group(0) @binding(2) var tlut: texture_2d<f32>;
 
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let texSize = vec2f(textureDimensions(src));
     let coord = vec2i(floor(in.uv * texSize));
-    let idx = textureLoad(src, coord, 0).r;
+    let idx = textureLoad(src, coord, 0, 0).r;
     return textureLoad(tlut, vec2i(idx, 0), 0);
 }
 )"sv;
@@ -59,13 +59,13 @@ static constexpr std::string_view ShaderDirect = R"(
 // FromFloat8: f32 texture (R8Unorm) -> 8-bit index -> TLUT -> RGBA8
 static constexpr std::string_view ShaderFromFloat8 = R"(
 @group(0) @binding(0) var src_samp: sampler;
-@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(1) var src: texture_2d_array<f32>;
 @group(0) @binding(2) var tlut: texture_2d<f32>;
 
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let texSize = vec2f(textureDimensions(src));
     let coord = vec2i(floor(in.uv * texSize));
-    let r = textureLoad(src, coord, 0).r;
+    let r = textureLoad(src, coord, 0, 0).r;
     return textureLoad(tlut, vec2i(i32(r * 255.0), 0), 0);
 }
 )"sv;
@@ -73,13 +73,13 @@ static constexpr std::string_view ShaderFromFloat8 = R"(
 // FromFloat4: f32 texture (R8Unorm) -> 4-bit index -> TLUT -> RGBA8
 static constexpr std::string_view ShaderFromFloat4 = R"(
 @group(0) @binding(0) var src_samp: sampler;
-@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(1) var src: texture_2d_array<f32>;
 @group(0) @binding(2) var tlut: texture_2d<f32>;
 
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let texSize = vec2f(textureDimensions(src));
     let coord = vec2i(floor(in.uv * texSize));
-    let r = textureLoad(src, coord, 0).r;
+    let r = textureLoad(src, coord, 0, 0).r;
     return textureLoad(tlut, vec2i(i32(r * 15.0), 0), 0);
 }
 )"sv;
@@ -124,7 +124,8 @@ static PipelineInfo create_pipeline(std::string_view fragBindingsAndShader, wgpu
           .texture =
               wgpu::TextureBindingLayout{
                   .sampleType = srcSampleType,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
+                  // EFB copies are single-layer 2D arrays like every GX texture
+                  .viewDimension = wgpu::TextureViewDimension::e2DArray,
               },
       },
       wgpu::BindGroupLayoutEntry{

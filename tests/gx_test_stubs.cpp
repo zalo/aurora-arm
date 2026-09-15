@@ -176,6 +176,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
 gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; }
 #endif
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
+bool resolve_sampled_textures(const ShaderInfo& info) noexcept { return false; }
 } // namespace aurora::gx
 
 // --- Buffer push stubs ---
@@ -259,11 +260,12 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept { return wg
 // --- Texture creation/write/replacement stubs ---
 namespace aurora::gfx {
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-                                    ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept {
+                                    ArrayRef<uint8_t> data, bool tlut, const char* label,
+                                    std::optional<TextureClass> textureClass) noexcept {
   return {};
 }
-TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-                                     const char* label) noexcept {
+TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat, const char* label,
+                                     std::optional<TextureClass> textureClass) noexcept {
   return {};
 }
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
