@@ -126,6 +126,9 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   if (g_config.maxTextureAnisotropy == 0) {
     g_config.maxTextureAnisotropy = 16;
   }
+  if (g_config.textureVerifyInterval == 0) {
+    g_config.textureVerifyInterval = 1;
+  }
   AURORA_ASSERT(window::initialize(), "Error initializing window");
 
   g_sdlCustomEventsStart = SDL_RegisterEvents(2);

@@ -116,6 +116,16 @@ typedef struct {
    * This can be set to 0 to disable allocating this region.
    */
   uint32_t mem2Size;
+
+  /*
+   * How often, in frames, the GX texture cache re-checks the source contents of a texture object it has already
+   * uploaded. Texture identities are derived from the object description, so an image rewritten in place without
+   * GXInitTexObjData is only caught by this sampled content check.
+   * 0 or 1 (default) checks every frame the object is resolved. A larger value checks at most once every N frames,
+   * which saves CPU on slow hosts but can show such an in-place rewrite up to N-1 frames late.
+   * GXInitTexObjData / GXInitTlutObjData changes always invalidate immediately.
+   */
+  uint32_t textureVerifyInterval;
 } AuroraConfig;
 
 typedef struct {
