@@ -97,6 +97,8 @@ struct RenderPass {
     Range uniformRange;
   };
   std::vector<ExtraResolve> extraResolves;
+  // Both UV transforms of a pass with one extra resolve (32 bytes), for the two-target conversion pass.
+  Range dualResolveUniformRange;
   wgpu::Texture snapshotColorDst;
   wgpu::TextureView snapshotDepthDst;
   float clearDepthValue = 1.f;
