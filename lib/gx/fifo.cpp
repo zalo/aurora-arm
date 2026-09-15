@@ -137,7 +137,10 @@ void init() {
   start_worker();
 }
 
-void shutdown() { stop_worker(); }
+void shutdown() {
+  stop_worker();
+  reset_pipeline_memo(); // command_processor; the pipeline cache is emptied after this
+}
 
 void begin_frame() noexcept { sFrameActive = true; }
 
