@@ -1,4 +1,7 @@
 #include "BackendBinding.hpp"
+#ifdef MELEE_MIYOO_FLIP
+extern "C" void* MeleeFlipNativeWindow();
+#endif
 
 #include <aurora/webgpu.hpp>
 
@@ -17,6 +20,11 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
 #if defined(SDL_PLATFORM_MACOS) || defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_TVOS)
   return SetupWindowAndGetSurfaceDescriptorCocoa(window);
 #else
+#ifdef MELEE_MIYOO_FLIP
+  auto desc = std::make_shared<wgpu::DawnSurfaceSourceEGLNativeWindow>();
+  desc->window = MeleeFlipNativeWindow();
+  return desc;
+#endif
   const auto props = SDL_GetWindowProperties(window);
 #if defined(SDL_PLATFORM_ANDROID)
   std::shared_ptr<wgpu::SurfaceSourceAndroidNativeWindow> desc =

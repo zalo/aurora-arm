@@ -9,6 +9,7 @@
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
 #include "../gx/fifo.hpp"
+#include "../internal.hpp"
 #include "../gx/gx.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -440,11 +441,17 @@ void initialize() {
   }
 
   {
-    constexpr std::array layoutEntries{
+    // With CPU vertex decoding the vertex stage reads no storage buffer (attributes arrive as
+    // vertex inputs), so the buffers are declared fragment-only. GLES devices that expose zero
+    // vertex-stage storage blocks (Mali-G52) can then create the layout under a
+    // maxStorageBuffersInVertexStage of 0.
+    const wgpu::ShaderStage vertexStorageStage =
+        g_config.cpuVertexDecode ? wgpu::ShaderStage::None : wgpu::ShaderStage::Vertex;
+    const std::array layoutEntries{
         // Vertex data buffer
         wgpu::BindGroupLayoutEntry{
             .binding = 0,
-            .visibility = wgpu::ShaderStage::Vertex,
+            .visibility = g_config.cpuVertexDecode ? wgpu::ShaderStage::Fragment : wgpu::ShaderStage::Vertex,
             .buffer =
                 wgpu::BufferBindingLayout{
                     .type = wgpu::BufferBindingType::ReadOnlyStorage,
@@ -453,7 +460,7 @@ void initialize() {
         // Storage data buffer
         wgpu::BindGroupLayoutEntry{
             .binding = 1,
-            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+            .visibility = vertexStorageStage | wgpu::ShaderStage::Fragment,
             .buffer =
                 wgpu::BufferBindingLayout{
                     .type = wgpu::BufferBindingType::ReadOnlyStorage,

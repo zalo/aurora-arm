@@ -8,7 +8,11 @@
 namespace aurora::gfx::detail {
 
 inline constexpr size_t FrameSlotCount = 2;
+#ifdef MELEE_MIYOO_FLIP
+inline constexpr size_t StagingBufferCount = FrameSlotCount + 1; // 1 GiB device: three 38 MiB staging maps
+#else
 inline constexpr size_t StagingBufferCount = FrameSlotCount + 3;
+#endif
 inline constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + IndexBufferSize +
                                               StorageBufferSize + (UseTextureBuffer ? TextureUploadSize : 0);
 

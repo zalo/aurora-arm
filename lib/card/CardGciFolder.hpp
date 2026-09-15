@@ -31,6 +31,7 @@ private:
   const GciFile* get_file(uint32_t idx) const;
   GciFile* get_open_file(const FileHandle& fh);
   const GciFile* get_open_file(const FileHandle& fh) const;
+  std::string gci_name(const char* filename) const;
 
 public:
   CardGciFolder();

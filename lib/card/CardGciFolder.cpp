@@ -71,7 +71,7 @@ void CardGciFolder::InitCard(const char* game, const char* maker) {
 ECardResult CardGciFolder::openFile(const char* filename, FileHandle& handleOut) {
   int idx = 0;
   for (auto& gciFile : m_files) {
-    if (strcmp(filename, gciFile.file.m_filename) == 0) {
+    if (strncmp(filename, gciFile.file.m_filename, std::size(gciFile.file.m_filename)) == 0) {
       gciFile.opened = true;
       if (gciFile.fileSize == 0)
         gciFile.fileSize = std::filesystem::file_size(m_folderPath / gciFile.filename);
@@ -82,7 +82,7 @@ ECardResult CardGciFolder::openFile(const char* filename, FileHandle& handleOut)
     idx++;
   }
 
-  return ECardResult::NOCARD;
+  return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::openFile(uint32_t fileno, FileHandle& handleOut) {
@@ -96,11 +96,16 @@ ECardResult CardGciFolder::openFile(uint32_t fileno, FileHandle& handleOut) {
     return ECardResult::READY;
   }
 
-  return ECardResult::NOCARD;
+  return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::createFile(const char* filename, size_t size, FileHandle& handleOut) {
-  std::string gciFilename = fmt::format("{}-{}-{}.gci", m_maker, m_game, filename);
+  for (const auto& existing : m_files) {
+    if (strncmp(filename, existing.file.m_filename, std::size(existing.file.m_filename)) == 0) {
+      return ECardResult::EXIST;
+    }
+  }
+  std::string gciFilename = gci_name(filename);
   uint16_t neededBlocks = ROUND_UP_8192(size) / BlockSize;
   size_t fileSize = sizeof(File) + size;
   constexpr uint16_t maxBlocks = ((uint16_t)ECardSize::Card2043Mb * MbitToBlocks) - FSTBlocks;
@@ -151,19 +156,53 @@ void CardGciFolder::deleteFile(const FileHandle& fh) {
     fileIO.deleteFile();
 }
 
-ECardResult CardGciFolder::deleteFile(const char* filename) { return ECardResult::NOCARD; }
+ECardResult CardGciFolder::deleteFile(const char* filename) {
+  for (uint32_t idx = 0; idx < m_files.size(); ++idx) {
+    if (strncmp(filename, m_files[idx].file.m_filename, std::size(m_files[idx].file.m_filename)) == 0) {
+      return deleteFile(idx);
+    }
+  }
+  return ECardResult::NOFILE;
+}
 
-ECardResult CardGciFolder::deleteFile(uint32_t fileno) { return ECardResult::NOCARD; }
+ECardResult CardGciFolder::deleteFile(uint32_t fileno) {
+  auto* file = get_file(fileno);
+  if (!file) {
+    return ECardResult::NOFILE;
+  }
+  FileIO fileIO(m_folderPath / file->filename);
+  if (fileIO && !fileIO.deleteFile()) {
+    return ECardResult::IOERROR;
+  }
+  m_bat.clear(file->file.m_firstBlock, file->file.m_blockCount);
+  m_files.erase(m_files.begin() + fileno);
+  return ECardResult::READY;
+}
+
+std::string CardGciFolder::gci_name(const char* filename) const {
+  return fmt::format("{}-{}-{}.gci", m_maker, m_game, filename);
+}
 
 ECardResult CardGciFolder::renameFile(const char* oldName, const char* newName) {
   for (auto& gciFile : m_files) {
-    if (strcmp(oldName, gciFile.file.m_filename) == 0) {
+    if (strncmp(oldName, gciFile.file.m_filename, std::size(gciFile.file.m_filename)) == 0) {
+      const std::string newHost = gci_name(newName);
+      std::error_code ec;
+      std::filesystem::rename(m_folderPath / gciFile.filename, m_folderPath / newHost, ec);
+      if (ec) {
+        Log.error("Failed to rename '{}' to '{}': {}", io::fs_path_to_string(m_folderPath / gciFile.filename), newHost,
+                  ec.message());
+        return ECardResult::IOERROR;
+      }
+      gciFile.filename = reinterpret_cast<const char8_t*>(newHost.c_str());
+      std::memset(gciFile.file.m_filename, 0, std::size(gciFile.file.m_filename));
       strncpy(gciFile.file.m_filename, newName, std::size(gciFile.file.m_filename));
+      commit();
       return ECardResult::READY;
     }
   }
 
-  return ECardResult::NOCARD;
+  return ECardResult::NOFILE;
 }
 
 ECardResult CardGciFolder::fileWrite(FileHandle& fh, const void* buf, size_t size) {

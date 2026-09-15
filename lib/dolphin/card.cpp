@@ -496,7 +496,7 @@ s32 CARDGetStatus(const s32 chan, s32 fileNo, CARDStat* stat) {
   if (res == aurora::card::ECardResult::READY)
     CopyKabuStatsToDolphin(kabuStat, stat);
   else
-    Log.error("Failed to get status of file at idx: {}", fileNo);
+    Log.debug("No directory entry at idx: {}", fileNo);
 
   return static_cast<s32>(res);
 }
@@ -539,6 +539,8 @@ s32 CARDOpen(const s32 chan, const char* fileName, CARDFileInfo* fileInfo) {
   const auto res = card->openFile(fileName, handle);
   if (res == aurora::card::ECardResult::READY)
     CopyKabuFileHandleToDolphin(chan, handle, fileInfo);
+  else if (res == aurora::card::ECardResult::NOFILE)
+    Log.info("No save file named '{}' on card {}", fileName, chan);
   else
     Log.error("Failed to open file: {}", fileName);
 
@@ -679,7 +681,7 @@ s32 CARDClose(CARDFileInfo* fileInfo) {
   const auto res = card->closeFile(handle);
 
   if (res != aurora::card::ECardResult::READY)
-    Log.error("Failed to close file at idx: {}", fileInfo->fileNo);
+    Log.debug("Close of unopened file at idx: {}", fileInfo->fileNo);
 
   return static_cast<s32>(res);
 }

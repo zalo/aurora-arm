@@ -1,4 +1,11 @@
 #include "gpu.hpp"
+#ifdef MELEE_MIYOO_FLIP
+// The Miyoo Flip presents through EGL on a GBM surface owned by the application (no SDL video
+// driver). It supplies Dawn's GL backend with its EGL display and function loader.
+#include <dawn/native/OpenGLBackend.h>
+extern "C" void* MeleeFlipEGLDisplay();
+extern "C" dawn::native::opengl::EGLFunctionPointerType MeleeFlipEGLProc(const char*);
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -247,6 +254,12 @@ wgpu::PresentMode select_present_mode(const wgpu::SurfaceCapabilities& capabilit
       return wgpu::PresentMode::FifoRelaxed;
     }
   } else {
+#ifdef MELEE_MIYOO_FLIP
+    // DRM page flips pace the panel; an Immediate swapchain sets EGL's swap interval to 0 once.
+    if (supports(wgpu::PresentMode::Immediate)) {
+      return wgpu::PresentMode::Immediate;
+    }
+#endif
     // Dawn only disables CAMetalLayer displaySyncEnabled for Immediate on Metal
     if (g_backendType != wgpu::BackendType::Metal && supports(wgpu::PresentMode::Mailbox)) {
       return wgpu::PresentMode::Mailbox;
@@ -784,7 +797,15 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     return false;
   }
   {
+#ifdef MELEE_MIYOO_FLIP
+    dawn::native::opengl::RequestAdapterOptionsGetGLProc glOptions;
+    glOptions.getProc = MeleeFlipEGLProc;
+    glOptions.display = MeleeFlipEGLDisplay();
+#endif
     const wgpu::RequestAdapterOptions options{
+#ifdef MELEE_MIYOO_FLIP
+        .nextInChain = &glOptions,
+#endif
         .featureLevel = wgpu::FeatureLevel::Compatibility,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
@@ -853,7 +874,13 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     wgpu::Limits supportedLimits{};
     g_adapter.GetLimits(&supportedLimits);
     wgpu::CompatibilityModeLimits compatibilityModeLimits{wgpu::CompatibilityModeLimits::Init{
+#ifdef MELEE_MIYOO_FLIP
+        // Mali-G52 GLES drivers (g13p0..g29p1) expose zero vertex-stage storage blocks. Vertex data
+        // must arrive through AuroraConfig::cpuVertexDecode on this device.
+        .maxStorageBuffersInVertexStage = 0,
+#else
         .maxStorageBuffersInVertexStage = 2,
+#endif
         .maxStorageBuffersInFragmentStage = 2,
     }};
     const wgpu::Limits requiredLimits{
@@ -868,6 +895,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         .maxTextureArrayLayers = supportedLimits.maxTextureArrayLayers == 0 ? WGPU_LIMIT_U32_UNDEFINED
                                                                             : supportedLimits.maxTextureArrayLayers,
         .maxStorageBuffersPerShaderStage = 2,
+#ifdef MELEE_MIYOO_FLIP
+        .maxUniformBufferBindingSize = supportedLimits.maxUniformBufferBindingSize,
+#endif
         .minUniformBufferOffsetAlignment =
             supportedLimits.minUniformBufferOffsetAlignment < 64 ? 64 : supportedLimits.minUniformBufferOffsetAlignment,
         .minStorageBufferOffsetAlignment =
