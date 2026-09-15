@@ -88,6 +88,8 @@ if (AURORA_ENABLE_GX)
     gx_dl_test.cpp
     # Resident display-list geometry
     gx_resident_test.cpp
+    # Instanced GX_POINTS sprites with CPU vertex decoding
+    gx_point_sprite_test.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE
