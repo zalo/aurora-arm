@@ -43,6 +43,11 @@ void end_frame() noexcept;
 void begin_frame_async(uint32_t frameSlot);
 void end_frame_async() noexcept;
 
+// Producer, between frames only (GXBegin/GXEnd patch offsets are buffer-relative): rewinds
+// the buffer once everything was consumed, otherwise drops a consumed prefix so a lagging
+// processor cannot make the buffer grow without bound. A no-op after drain().
+void recycle() noexcept;
+
 // Producer: runs `fn` on the processor thread right after it finishes the next frame.
 // Use it for readbacks that must observe a complete frame in the asynchronous mode.
 void run_after_frame(std::function<void()> fn);

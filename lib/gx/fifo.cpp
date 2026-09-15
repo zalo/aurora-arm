@@ -29,6 +29,9 @@ namespace {
 constexpr Module Log{"aurora::gx::fifo"};
 constexpr auto kProcessingMode = ProcessingMode::Thread;
 constexpr uint32_t kDrawBatchSize = 1;
+// recycle() only compacts once at least this much is consumed and it is at least half the
+// buffer, so the move is amortized against the bytes it reclaims.
+constexpr uint32_t kCompactionThreshold = 64 * 1024;
 
 bool sFrameActive = false;
 uint32_t sPendingDraws = 0;
@@ -189,6 +192,27 @@ void end_frame_async() noexcept {
   write_u16(GX_AURORA_FRAME_END);
   publish();
   sFrameActive = false;
+}
+
+void recycle() noexcept {
+  std::lock_guard lock{sBufferMutex};
+  const uint64_t processed = sProcessed.load(std::memory_order_acquire);
+  const uint64_t end = sStreamBase + detail::sBufferSize;
+  if (processed == end) {
+    sStreamBase = end;
+    detail::sBufferSize = 0;
+    sPendingDraws = 0;
+    return;
+  }
+  // The processor holds no pointers into the buffer between process() calls, and process()
+  // runs under sBufferMutex, so the consumed prefix can be dropped underneath it. Producer
+  // offsets are not affected: GXBegin/GXEnd patch offsets only live inside a draw.
+  const uint64_t consumed = processed - sStreamBase;
+  if (consumed >= kCompactionThreshold && consumed * 2 >= detail::sBufferSize) {
+    std::memmove(detail::sBufferData, detail::sBufferData + consumed, detail::sBufferSize - consumed);
+    sStreamBase += consumed;
+    detail::sBufferSize -= static_cast<uint32_t>(consumed);
+  }
 }
 
 void run_after_frame(std::function<void()> fn) {

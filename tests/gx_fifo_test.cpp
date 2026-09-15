@@ -158,6 +158,38 @@ TEST_F(GXFifoTest, AsyncFrameMarkersFinishTheFrameOnTheProcessor) {
   aurora::gx::fifo::shutdown();
 }
 
+TEST_F(GXFifoTest, RecycleRewindsConsumedBufferAndCompactsConsumedPrefix) {
+  const std::vector<u8> nops(128 * 1024, GX_NOP);
+  const std::array<u8, 5> bpWrite{GX_LOAD_BP_REG, 0x41, 0x12, 0x34, 0x56};
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  aurora::gx::fifo::write_data(nops.data(), static_cast<u32>(nops.size()));
+  aurora::gx::fifo::mark_draw_done();
+  aurora::gx::fifo::publish();
+  aurora::gx::fifo::wait_draw_done();
+  // publish() never rewinds the buffer; recycle() does once everything was consumed.
+  EXPECT_EQ(aurora::gx::fifo::get_buffer_size(), nops.size());
+  aurora::gx::fifo::recycle();
+  EXPECT_EQ(aurora::gx::fifo::get_buffer_size(), 0u);
+
+  aurora::gx::fifo::write_data(nops.data(), static_cast<u32>(nops.size()));
+  aurora::gx::fifo::mark_draw_done();
+  aurora::gx::fifo::publish();
+  aurora::gx::fifo::wait_draw_done();
+  // An unpublished tail keeps its bytes while the consumed prefix is dropped.
+  aurora::gx::fifo::write_data(bpWrite.data(), static_cast<u32>(bpWrite.size()));
+  aurora::gx::fifo::recycle();
+  ASSERT_EQ(aurora::gx::fifo::get_buffer_size(), bpWrite.size());
+  EXPECT_EQ(std::memcmp(aurora::gx::fifo::get_buffer_data(), bpWrite.data(), bpWrite.size()), 0);
+  EXPECT_FALSE(g_gxState.bpRegValid.test(0x41));
+  aurora::gx::fifo::publish();
+  aurora::gx::fifo::drain();
+  aurora::gx::fifo::end_frame();
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+  aurora::gx::fifo::shutdown();
+}
+
 TEST_F(GXFifoTest, WaitDrawDoneWaitsForTheLatestTokenOnly) {
   const std::array<u8, 5> bpWrite41{GX_LOAD_BP_REG, 0x41, 0x12, 0x34, 0x56};
   const std::array<u8, 5> bpWrite42{GX_LOAD_BP_REG, 0x42, 0x65, 0x43, 0x21};
