@@ -15,7 +15,8 @@
 //
 //   location  input            contents
 //   0         v_matrices vec3u one matrix index per byte (PNMTXIDX, TEX0..7MTXIDX), quad corner in
-//                              bits 24-31 of .z for lines
+//                              bits 24-31 of .z for lines, uniform record index in bits 8-23 of .z
+//                              when adjacent draws are batched (AuroraConfig::batchDraws)
 //   1         v_pos      vec3f
 //   2         v_nrm      vec3f
 //   3, 4      v_clr0/1   vec4f
@@ -85,9 +86,11 @@ const VertexLoader& vertex_loader(const ShaderConfig& config) noexcept;
 // Decodes `count` GX vertices of `loader.vtxStride` bytes each from `raw`, writing exactly
 // count * loader.layout.stride bytes to `out`. Indexed attributes read from `arrays`; indices
 // outside an array decode as zero. `currentPnMtx` fills the PN matrix index when the vertex does
-// not carry one.
+// not carry one. `matrixWordZ` is OR-ed into v_matrices.z (bits 8-23 are free for the draw's
+// uniform record index when adjacent draws are batched; bits 24-31 hold the line quad corner).
 void decode_vertices(const VertexLoader& loader, const u8* raw, size_t count, u8* out,
-                     const std::array<AttrArray, MaxVtxAttr>& arrays, u32 currentPnMtx) noexcept;
+                     const std::array<AttrArray, MaxVtxAttr>& arrays, u32 currentPnMtx,
+                     u32 matrixWordZ = 0) noexcept;
 
 // Number of quads produced by `vtxCount` vertices of a GX_LINES (1), GX_LINESTRIP (2) or GX_POINTS
 // (3) draw.

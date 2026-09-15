@@ -524,7 +524,7 @@ static void prepare_pipeline(GXPrimitive prim, GXVtxFmt fmt) noexcept {
 // instance and the draw renders one instance of a shared quad per point (see prepare_idx_buffer),
 // so a particle system emitting tens of thousands of GX_POINTS per frame writes each point once.
 static gfx::Range push_decoded_verts(GXPrimitive prim, GXVtxFmt fmt, std::span<const u8> vertexData, u16& vtxCount,
-                                     size_t alignment) noexcept {
+                                     size_t alignment, u32 matrixWordZ = 0) noexcept {
   ZoneScoped;
   prepare_pipeline(prim, fmt);
   const auto& state = g_gxState;
@@ -538,7 +538,7 @@ static gfx::Range push_decoded_verts(GXPrimitive prim, GXVtxFmt fmt, std::span<c
   if (config.lineMode == 0 || config.lineMode == 3) {
     const gfx::Range range = gfx::map_verts(static_cast<size_t>(vtxCount) * stride, alignment, out);
     if (out != nullptr) {
-      decode_vertices(loader, vertexData.data(), vtxCount, out, state.arrays, state.currentPnMtx);
+      decode_vertices(loader, vertexData.data(), vtxCount, out, state.arrays, state.currentPnMtx, matrixWordZ);
     }
     return range;
   }
@@ -547,7 +547,8 @@ static gfx::Range push_decoded_verts(GXPrimitive prim, GXVtxFmt fmt, std::span<c
   // Decode into local memory, then stream the expanded quads out; the destination is never read.
   static std::vector<u8> decoded;
   decoded.resize(static_cast<size_t>(vtxCount) * stride);
-  decode_vertices(loader, vertexData.data(), vtxCount, decoded.data(), state.arrays, state.currentPnMtx);
+  decode_vertices(loader, vertexData.data(), vtxCount, decoded.data(), state.arrays, state.currentPnMtx,
+                  matrixWordZ);
   vtxCount = static_cast<u16>(instances * 4);
   const gfx::Range range = gfx::map_verts(static_cast<size_t>(vtxCount) * stride, alignment, out);
   if (out != nullptr) {
@@ -556,25 +557,11 @@ static gfx::Range push_decoded_verts(GXPrimitive prim, GXVtxFmt fmt, std::span<c
   return range;
 }
 
-static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u32 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
-                         u32 numIndices, u32 residentArena = 0) noexcept {
+// Resolves pipeline, texture bind groups, uniform record and fog range table for the current GX state into
+// sDrawCache and fills the parts of the immediates derived from them.
+static void prepare_draw_state(GXPrimitive prim, GXVtxFmt fmt, DrawImmediateData& immediates) noexcept {
   auto& state = g_gxState;
   auto& cache = sDrawCache;
-
-  DrawImmediateData immediates{.vtxStart = vertRange.offset, .currentPnMtx = state.currentPnMtx};
-  if (!g_config.cpuVertexDecode) { // the CPU vertex decoder resolves indexed arrays itself
-    for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
-      if (state.vtxDesc[i] != GX_INDEX8 && state.vtxDesc[i] != GX_INDEX16) {
-        continue;
-      }
-      auto& array = state.arrays[i];
-      if (array.cachedRange.size == 0) {
-        array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
-      }
-      immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
-    }
-  }
-
   prepare_pipeline(prim, fmt);
 
   const bool bindGroupsValid =
@@ -608,6 +595,146 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u32 vtxCount, gfx::Rang
   immediates.fogRangeBase = cache.fogRange.offset / sizeof(u32);
 
   state.dirty &= ~DirtyImmediates;
+}
+
+// Adjacent draw batching (AuroraConfig::batchDraws). Consecutive GX draws usually differ only in their
+// uniform record (matrices, colors, texture LOD); with the uniform table the record index rides in the
+// decoded vertices, so draws that share a pipeline, texture bind group, destination alpha, fog range table
+// and uniform window merge into one draw call regardless of the state between them. Streamed draws append
+// vertices and rebased indices (points add instances); resident display lists carry no record in their
+// vertices and merge only with the same record.
+struct BatchStats {
+  uint64_t attempts = 0;
+  uint64_t merged = 0;
+  uint64_t noPrevious = 0;
+  uint64_t kind = 0; // previous draw is resident / streamed while this one is not
+  uint64_t pipeline = 0;
+  uint64_t texture = 0;
+  uint64_t dstAlpha = 0;
+  uint64_t fog = 0;
+  uint64_t window = 0;
+  uint64_t record = 0;
+  uint64_t limit = 0;
+  uint64_t gap = 0;
+};
+BatchStats sBatchStats;
+
+static void batch_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, std::span<const u8> vertexData,
+                       std::span<const u8> indexData) noexcept {
+  ZoneScoped;
+  auto& state = g_gxState;
+  auto& cache = sDrawCache;
+  DrawImmediateData immediates{.currentPnMtx = state.currentPnMtx};
+  prepare_draw_state(prim, fmt, immediates);
+  const u8 lineMode = line_mode_for_prim(prim);
+  const bool points = lineMode == 3;
+  const u32 record = uniform_record_index(cache.uniformRange.offset);
+  const u32 expandedCount = lineMode == 1 || lineMode == 2 ? line_instance_count(lineMode, vtxCount) * 4 : vtxCount;
+
+  auto& stats = sBatchStats;
+  ++stats.attempts;
+  auto* previous = gfx::get_last_draw_command<DrawData>();
+  bool merge = false;
+  // Same pipeline implies the same primitive class, so a point draw only ever meets a point draw here.
+  if (previous == nullptr) {
+    ++stats.noPrevious;
+  } else if (previous->residentArena != 0) {
+    ++stats.kind;
+  } else if (previous->pipeline != cache.pipelineRef) {
+    ++stats.pipeline;
+  } else if (previous->bindGroups.textureBindGroup != cache.bindGroups.textureBindGroup) {
+    ++stats.texture;
+  } else if (previous->dstAlpha != state.dstAlpha) {
+    ++stats.dstAlpha;
+  } else if (previous->immediateData.fogRangeBase != immediates.fogRangeBase) {
+    ++stats.fog;
+  } else if (uniform_window_index(previous->uniformRange.offset) != uniform_window_index(cache.uniformRange.offset)) {
+    ++stats.window;
+  } else if (previous->vtxCount + expandedCount > 0xFFFF) {
+    ++stats.limit;
+  } else if (!gfx::vertices_follow(previous->vertRange) || (!points && !gfx::indices_follow(previous->idxRange))) {
+    ++stats.gap;
+  } else {
+    merge = true;
+    ++stats.merged;
+  }
+
+  const gfx::Range vertRange = push_decoded_verts(prim, fmt, vertexData, vtxCount, merge ? 0 : 4, record << 8);
+  const u16 base = merge ? static_cast<u16>(previous->vtxCount) : 0;
+  static ByteBuffer indices;
+  indices.clear();
+  u32 numIndices = 0;
+  if (points) {
+    // One instance per point of the shared quad; merges add instances.
+    if (!merge) {
+      numIndices = prepare_idx_buffer(indices, GX_POINTS, 0, vtxCount);
+    }
+  } else if (!indexData.empty()) {
+    // GX_AURORA_DRAW_INDEXED: host-endian 16-bit indices relative to this draw's vertices.
+    numIndices = static_cast<u32>(indexData.size() / sizeof(u16));
+    indices.reserve_extra(indexData.size());
+    for (size_t i = 0; i < indexData.size(); i += sizeof(u16)) {
+      u16 index;
+      std::memcpy(&index, indexData.data() + i, sizeof(index));
+      AURORA_ASSERT(index < vtxCount, "GX index {} outside the draw's {} vertices", index, vtxCount);
+      indices.append(static_cast<u16>(base + index));
+    }
+  } else {
+    numIndices = prepare_idx_buffer(indices, prim, base, vtxCount);
+  }
+  gfx::Range idxRange;
+  if (numIndices != 0) {
+    idxRange = gfx::push_indices(indices.data(), indices.size(), merge ? 0 : 4);
+  }
+  cache.lastDrawFmt = fmt;
+  if (merge) {
+    previous->vertRange.size += vertRange.size;
+    previous->vtxCount += vtxCount;
+    if (points) {
+      previous->instanceCount += vtxCount;
+    } else {
+      previous->idxRange.size += idxRange.size;
+      previous->indexCount += numIndices;
+    }
+    gfx::detail::increment_merged_draw_count();
+    return;
+  }
+  immediates.vtxStart = vertRange.offset;
+  gfx::push_draw_command(DrawData{
+      .pipeline = cache.pipelineRef,
+      .vertRange = vertRange,
+      .idxRange = idxRange,
+      .uniformRange = cache.uniformRange,
+      .immediateData = immediates,
+      .vtxCount = vtxCount,
+      .indexCount = numIndices,
+      .instanceCount = points ? vtxCount : 1u,
+      .bindGroups = cache.bindGroups,
+      .dstAlpha = state.dstAlpha,
+      .residentArena = 0,
+  });
+}
+
+static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u32 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
+                         u32 numIndices, u32 residentArena = 0) noexcept {
+  auto& state = g_gxState;
+  auto& cache = sDrawCache;
+
+  DrawImmediateData immediates{.vtxStart = vertRange.offset, .currentPnMtx = state.currentPnMtx};
+  if (!g_config.cpuVertexDecode) { // the CPU vertex decoder resolves indexed arrays itself
+    for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+      if (state.vtxDesc[i] != GX_INDEX8 && state.vtxDesc[i] != GX_INDEX16) {
+        continue;
+      }
+      auto& array = state.arrays[i];
+      if (array.cachedRange.size == 0) {
+        array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+      }
+      immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
+    }
+  }
+
+  prepare_draw_state(prim, fmt, immediates);
 
   // Points draw one instance per point; lines one per segment, unless the CPU vertex decoder
   // already expanded them into quads.
@@ -664,6 +791,11 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
+
+  if (batch_draws_enabled()) {
+    batch_draw(prim, fmt, vtxCount, reader.take(totalVtxBytes), {});
+    return;
+  }
 
   // Consecutive draws with unchanged state merge: triangle primitives by appending indices, and
   // CPU-decoded points (one record per point, instanced over a shared quad) by adding instances.
@@ -747,6 +879,64 @@ static void push_resident_draw(const resident::Entry& entry, GXVtxFmt fmt) noexc
   const auto* indexData = reinterpret_cast<const u8*>(entry.indices.data());
   const size_t indexBytes = entry.indices.size() * sizeof(u32);
   const auto indexCount = static_cast<u32>(entry.indices.size());
+
+  if (batch_draws_enabled()) {
+    // Resident vertices carry no record index: merge with the previous resident draw of the same arena
+    // whenever pipeline, textures, record, destination alpha and fog table match, whatever changed between.
+    DrawImmediateData immediates{.vtxStart = 0, .currentPnMtx = state.currentPnMtx};
+    prepare_draw_state(GX_TRIANGLES, fmt, immediates);
+    auto& stats = sBatchStats;
+    ++stats.attempts;
+    auto* lastDraw = gfx::get_last_draw_command<DrawData>();
+    bool merge = false;
+    if (lastDraw == nullptr) {
+      ++stats.noPrevious;
+    } else if (lastDraw->residentArena != arena || lastDraw->instanceCount != 1) {
+      ++stats.kind;
+    } else if (lastDraw->pipeline != cache.pipelineRef) {
+      ++stats.pipeline;
+    } else if (lastDraw->bindGroups.textureBindGroup != cache.bindGroups.textureBindGroup) {
+      ++stats.texture;
+    } else if (lastDraw->uniformRange.offset != cache.uniformRange.offset) {
+      ++stats.record;
+    } else if (lastDraw->dstAlpha != state.dstAlpha) {
+      ++stats.dstAlpha;
+    } else if (lastDraw->immediateData.fogRangeBase != immediates.fogRangeBase) {
+      ++stats.fog;
+    } else if (!gfx::indices_follow(lastDraw->idxRange)) {
+      ++stats.gap;
+    } else {
+      merge = true;
+      ++stats.merged;
+    }
+    const gfx::Range idxRange = gfx::push_indices(indexData, indexBytes, merge ? 0 : 4);
+    cache.lastDrawFmt = fmt;
+    if (merge) {
+      lastDraw->idxRange.size += idxRange.size;
+      lastDraw->indexCount += indexCount;
+      lastDraw->vtxCount += entry.vertexCount;
+      const u32 begin = std::min(lastDraw->vertRange.offset, vertRange.offset);
+      const u32 end =
+          std::max(lastDraw->vertRange.offset + lastDraw->vertRange.size, vertRange.offset + vertRange.size);
+      lastDraw->vertRange = {begin, end - begin};
+      gfx::detail::increment_merged_draw_count();
+      return;
+    }
+    gfx::push_draw_command(DrawData{
+        .pipeline = cache.pipelineRef,
+        .vertRange = vertRange,
+        .idxRange = idxRange,
+        .uniformRange = cache.uniformRange,
+        .immediateData = immediates,
+        .vtxCount = entry.vertexCount,
+        .indexCount = indexCount,
+        .instanceCount = 1,
+        .bindGroups = cache.bindGroups,
+        .dstAlpha = state.dstAlpha,
+        .residentArena = arena,
+    });
+    return;
+  }
 
   const bool cleanState = state.dirty == 0 && fmt == cache.lastDrawFmt && cache.lineMode == 0;
   auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
@@ -1000,7 +1190,6 @@ void handle_aurora(ByteReader& reader) noexcept {
     const size_t idxBytes = static_cast<size_t>(indexCount) * sizeof(u16);
     // Index data is always host-endian; push it to the GPU buffer as-is
     const auto indexData = reader.take(idxBytes);
-    const gfx::Range idxRange = gfx::push_indices(indexData.data(), indexData.size(), 4);
     u32 vtxSize;
     if (g_gxState.lastVtxFmt == fmt) {
       vtxSize = g_gxState.lastVtxSize;
@@ -1008,6 +1197,14 @@ void handle_aurora(ByteReader& reader) noexcept {
       vtxSize = calc_vtx_size(fmt);
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
+    if (batch_draws_enabled()) {
+      const auto vertexData = reader.take(totalVtxBytes);
+      if (indexCount != 0) {
+        batch_draw(prim, fmt, vtxCount, vertexData, indexData);
+      }
+      return;
+    }
+    const gfx::Range idxRange = gfx::push_indices(indexData.data(), indexData.size(), 4);
     const auto vertexData = reader.take(totalVtxBytes);
     const gfx::Range vertRange = g_config.cpuVertexDecode ? push_decoded_verts(prim, fmt, vertexData, vtxCount, 4)
                                                           : gfx::push_verts(vertexData.data(), vertexData.size(), 4);

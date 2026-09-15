@@ -1479,6 +1479,23 @@ Range push_uniform(const uint8_t* data, size_t length) {
   return push(current_frame_packet().uniforms, data, length, resources().limits.minUniformBufferOffsetAlignment);
 }
 
+Range push_table_uniform(const uint8_t* data, size_t length) {
+  ZoneScoped;
+  if (!check_recording("push_table_uniform")) {
+    return {};
+  }
+  // A 4 KiB-aligned record never straddles a 64 KiB window.
+  return push(current_frame_packet().uniforms, data, length, gx::UniformRecordStride);
+}
+
+bool vertices_follow(Range previous) {
+  return g_recorder.active() && current_frame_packet().verts.size() == previous.offset + previous.size;
+}
+
+bool indices_follow(Range previous) {
+  return g_recorder.active() && current_frame_packet().indices.size() == previous.offset + previous.size;
+}
+
 Range push_storage(const uint8_t* data, size_t length) {
   ZoneScoped;
   if (!check_recording("push_storage")) {

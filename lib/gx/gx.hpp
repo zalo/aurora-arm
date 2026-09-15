@@ -67,6 +67,22 @@ constexpr u32 MaxVtxFmt = GX_MAX_VTXFMT;
 constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
 constexpr u32 MaxUniformSize = 3840;
+// Uniform table (AuroraConfig::uniformTable): every GX uniform record occupies a 4 KiB slot and sixteen
+// consecutive slots share one 64 KiB uniform buffer binding (the window). Shaders index the record within
+// the bound window; see uniform_record_index / uniform_window_index.
+constexpr u32 UniformRecordStride = 4096;
+constexpr u32 UniformWindowSize = 65536;
+constexpr u32 UniformRecordsPerWindow = UniformWindowSize / UniformRecordStride;
+static_assert(MaxUniformSize <= UniformRecordStride);
+constexpr u32 uniform_record_index(u32 uniformOffset) noexcept {
+  return (uniformOffset % UniformWindowSize) / UniformRecordStride;
+}
+constexpr u32 uniform_window_index(u32 uniformOffset) noexcept { return uniformOffset / UniformWindowSize; }
+inline bool uniform_table_enabled() noexcept { return g_config.uniformTable; }
+// Adjacent draw batching needs the record index in the decoded vertices and the table it indexes.
+inline bool batch_draws_enabled() noexcept {
+  return g_config.batchDraws && g_config.uniformTable && g_config.cpuVertexDecode;
+}
 constexpr u32 XfRegCount = 0x58; // 0x1000-0x1057
 
 enum DirtyFlag : u8 {
@@ -493,7 +509,9 @@ struct ShaderConfig {
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
   u8 fogRangeEnabled : 1 = false;
   u8 cpuVertexDecode : 1 = false; // attributes arrive as vertex inputs (see vertex_loader.hpp)
-  u8 pad1 : 4 = 0;
+  u8 uniformTable : 1 = false;    // the record is indexed within a 64 KiB uniform window (uniformTable)
+  u8 batchDraws : 1 = false;      // the record index comes from the vertex matrix word (batchDraws)
+  u8 pad1 : 2 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;

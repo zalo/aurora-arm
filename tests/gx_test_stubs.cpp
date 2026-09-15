@@ -176,6 +176,8 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   config.shaderConfig = {};
   config.shaderConfig.cpuVertexDecode = g_config.cpuVertexDecode;
+  config.shaderConfig.uniformTable = uniform_table_enabled();
+  config.shaderConfig.batchDraws = batch_draws_enabled();
   u8 vtxOffset = 0;
   for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
     const auto attr = static_cast<GXAttr>(i);
@@ -247,7 +249,10 @@ Range map_verts(size_t length, size_t alignment, uint8_t*& data) {
 Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   return append_stream(g_testIndexStream, data, length, alignment);
 }
+bool vertices_follow(Range previous) { return g_testVertexStream.size() == previous.offset + previous.size; }
+bool indices_follow(Range previous) { return g_testIndexStream.size() == previous.offset + previous.size; }
 Range push_uniform(const uint8_t* data, size_t length) { return {}; }
+Range push_table_uniform(const uint8_t* data, size_t length) { return {}; }
 Range push_storage(const uint8_t* data, size_t length) { return {}; }
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }

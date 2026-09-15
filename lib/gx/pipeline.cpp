@@ -58,9 +58,20 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   } else if (g_config.cpuVertexDecode) {
     pass.SetVertexBuffer(0, resources.vertexBuffer, data.vertRange.offset, data.vertRange.size);
   }
-  pass.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
-  const std::array offsets{data.uniformRange.offset};
-  pass.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
+  auto immediates = data.immediateData;
+  uint32_t uniformOffset = data.uniformRange.offset;
+  const wgpu::BindGroup* uniformGroup = &resources.uniformBindGroup;
+  if (uniform_table_enabled()) {
+    // Bind the record's 64 KiB window and let the shader index the record: streamed batched draws carry
+    // it in their vertices, resident geometry and unbatched draws take it from the immediates.
+    const uint32_t record = uniform_record_index(uniformOffset);
+    immediates._pad = !batch_draws_enabled() || data.residentArena != 0 ? record : 0;
+    uniformOffset = uniform_window_index(uniformOffset) * UniformWindowSize;
+    uniformGroup = &resources.uniformWindowBindGroup;
+  }
+  pass.SetImmediates(0, &immediates, sizeof(immediates));
+  const std::array offsets{uniformOffset};
+  pass.SetBindGroup(1, *uniformGroup, offsets.size(), offsets.data());
   if (data.bindGroups.textureBindGroup) {
     pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
   }

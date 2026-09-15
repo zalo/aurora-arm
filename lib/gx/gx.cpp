@@ -369,6 +369,8 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   config.shaderConfig.fogType = g_gxState.fog.type;
   config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
   config.shaderConfig.cpuVertexDecode = g_config.cpuVertexDecode;
+  config.shaderConfig.uniformTable = uniform_table_enabled();
+  config.shaderConfig.batchDraws = batch_draws_enabled();
   u8 vtxOffset = 0;
   for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
     const auto attr = static_cast<GXAttr>(i);

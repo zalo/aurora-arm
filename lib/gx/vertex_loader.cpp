@@ -470,11 +470,12 @@ const VertexLoader& vertex_loader(const ShaderConfig& config) noexcept {
 }
 
 void decode_vertices(const VertexLoader& loader, const u8* raw, size_t count, u8* out,
-                     const std::array<AttrArray, MaxVtxAttr>& arrays, u32 currentPnMtx) noexcept {
+                     const std::array<AttrArray, MaxVtxAttr>& arrays, u32 currentPnMtx,
+                     u32 matrixWordZ) noexcept {
   const size_t stride = loader.layout.stride;
   if (loader.hasMatrices) {
     u8* dst = out + loader.matrixOffset;
-    const u32 words[3] = {currentPnMtx, 0u, 0u};
+    const u32 words[3] = {currentPnMtx, 0u, matrixWordZ};
     for (size_t i = 0; i < count; ++i, dst += stride) {
       std::memcpy(dst, words, sizeof(words));
     }

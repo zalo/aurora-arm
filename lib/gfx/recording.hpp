@@ -82,6 +82,11 @@ Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
 Range push_uniform(const uint8_t* data, size_t length);
+// Uniform table (gx::UniformRecordStride): a GX record in its own 4 KiB slot so sixteen share one binding.
+Range push_table_uniform(const uint8_t* data, size_t length);
+// Whether the next vertex / index push lands directly behind `previous` (adjacent draw batching).
+bool vertices_follow(Range previous);
+bool indices_follow(Range previous);
 template <typename T>
 Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));

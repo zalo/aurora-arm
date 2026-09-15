@@ -525,6 +525,15 @@ void initialize() {
         .entries = entries.data(),
     };
     g_resources.uniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+    if (gx::uniform_table_enabled()) {
+      static_assert(UniformBufferSize % gx::UniformWindowSize == 0);
+      auto windowEntries = entries;
+      windowEntries[0].size = gx::UniformWindowSize;
+      auto windowDescriptor = bindGroupDescriptor;
+      windowDescriptor.label = "Uniform window bind group";
+      windowDescriptor.entries = windowEntries.data();
+      g_resources.uniformWindowBindGroup = g_device.CreateBindGroup(&windowDescriptor);
+    }
   }
 
   gx::initialize();
@@ -581,6 +590,7 @@ void shutdown() {
   g_resources.staticBindGroup = {};
   g_resources.staticBindGroupLayout = {};
   g_resources.uniformBindGroup = {};
+  g_resources.uniformWindowBindGroup = {};
   g_resources.uniformBindGroupLayout = {};
   g_frameIndex = UINT32_MAX;
   g_frameSlots.reset();

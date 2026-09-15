@@ -915,6 +915,39 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
 absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
 } // namespace
 
+// Uniform table (AuroraConfig::uniformTable): the draw's record is one of sixteen 4 KiB slots of the bound
+// 64 KiB window, so the uniform binding changes once per window instead of once per draw. The record is
+// selected by `record_index`: from the immediates for unbatched draws, or (batchDraws) from bits 8-23 of
+// the vertex's matrix word plus the immediates, streamed vertices carrying the index and resident geometry
+// carrying zero there and taking it from the immediates. A wrapper struct fixes the slot stride without
+// duplicating Uniform's WGSL layout.
+void apply_uniform_table(std::string& source, const ShaderConfig& config) {
+  const auto replace = [&](std::string_view from, std::string_view to) {
+    size_t pos = 0;
+    while ((pos = source.find(from, pos)) != std::string::npos) {
+      source.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+  };
+  replace("@group(1) @binding(0)\nvar<uniform> ubuf: Uniform;",
+          fmt::format("struct UniformRecord {{ @size({}) value: Uniform }};\n@group(1) @binding(0)\nvar<uniform> "
+                      "uniform_table: array<UniformRecord, {}>;",
+                      UniformRecordStride, UniformRecordsPerWindow));
+  replace("ubuf.", "uniform_table[record_index].value.");
+  replace("struct VertexOutput {", "var<private> record_index: u32;\nstruct VertexOutput {");
+  if (config.batchDraws) {
+    replace("var out: VertexOutput;",
+            "var out: VertexOutput;\n    record_index = ((v_matrices.z >> 8u) & 15u) + (imm._pad & 15u);\n    "
+            "out.record = record_index;");
+    replace("fn fs_main(in: VertexOutput) -> @location(0) vec4f {",
+            "fn fs_main(in: VertexOutput) -> @location(0) vec4f {\n    record_index = in.record;");
+  } else {
+    replace("var out: VertexOutput;", "var out: VertexOutput;\n    record_index = imm._pad & 15u;");
+    replace("fn fs_main(in: VertexOutput) -> @location(0) vec4f {",
+            "fn fs_main(in: VertexOutput) -> @location(0) vec4f {\n    record_index = imm._pad & 15u;");
+  }
+}
+
 std::string build_shader_source(const ShaderConfig& config) noexcept {
   ZoneScoped;
   const auto hash = xxh3_hash(config);
@@ -1024,6 +1057,10 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
       vtxInAttrs += ",\n    @builtin(instance_index) iidx: u32";
     }
   }
+  if (config.batchDraws) {
+    // Batched draws: the fragment stage learns the vertex's uniform record through a flat varying.
+    vtxOutAttrs += fmt::format("\n    @location({}) @interpolate(flat, either) record: u32,", vtxOutIdx++);
+  }
 
   // Load points for line/point expansion
   std::string_view vidxAttr = "vidx"sv;
@@ -1072,7 +1109,12 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     }
     vidxAttr = "in_vidx"sv;
   } else if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
-    vtxXfrAttrsPre += "\n    let in_pnmtxidx = imm.current_pnmtx;";
+    if (config.batchDraws) {
+      // Batched draws may differ in their current PN matrix: the decoder bakes it into the record.
+      vtxXfrAttrsPre += "\n    let in_pnmtxidx = v_matrices.x & 255u;";
+    } else {
+      vtxXfrAttrsPre += "\n    let in_pnmtxidx = imm.current_pnmtx;";
+    }
   }
 
   // Load vertex attributes
@@ -1727,7 +1769,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
 
-  const auto shaderSource = fmt::format(R"""(
+  auto shaderSource = fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -2096,6 +2138,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
 )""",
                                         uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
                                         fragmentFnPre, vtxXfrAttrsPre, uniformPre);
+  if (config.uniformTable) {
+    apply_uniform_table(shaderSource, config);
+  }
   if (EnableDebugPrints) {
     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
   }

@@ -515,6 +515,9 @@ gfx::Range build_uniform(const ShaderInfo& info) noexcept {
   static ByteBuffer buf;
   buf.clear();
   fill_uniform(buf, info);
+  if (uniform_table_enabled()) {
+    return gfx::push_table_uniform(buf.data(), buf.size());
+  }
   return gfx::push_uniform(buf.data(), buf.size());
 }
 } // namespace aurora::gx

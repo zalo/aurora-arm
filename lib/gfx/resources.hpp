@@ -30,6 +30,8 @@ struct Resources {
   wgpu::BindGroup staticBindGroup;
   wgpu::BindGroupLayout uniformBindGroupLayout;
   wgpu::BindGroup uniformBindGroup;
+  // Uniform table: the uniform buffer bound as 64 KiB windows (gx::UniformWindowSize) at dynamic offsets.
+  wgpu::BindGroup uniformWindowBindGroup;
   wgpu::Limits limits;
   AuroraStats stats{};
 };

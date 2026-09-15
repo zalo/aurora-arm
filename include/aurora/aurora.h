@@ -172,6 +172,23 @@ typedef struct {
    * (at a frame boundary). 0 selects the default of 64 MiB.
    */
   uint32_t residentGeometryBudget;
+
+  /*
+   * Place each GX draw's uniform record in a 4 KiB slot of a 64 KiB uniform window and bind one
+   * window per sixteen records instead of re-binding the uniform buffer at a new dynamic offset for
+   * every draw; the shader indexes the record within the window. Removes most per-draw buffer
+   * binding work on GLES drivers and is required by batchDraws. Bit-exact.
+   */
+  bool uniformTable;
+
+  /*
+   * Merge adjacent GX draws that share a pipeline, texture bind group, destination alpha, fog range
+   * table and uniform window into one draw call, even when their uniform records differ (requires
+   * uniformTable and cpuVertexDecode: the record index travels in bits 8-23 of each decoded vertex's
+   * matrix word). Bit-exact; on a Mali-G52 handheld running Melee this roughly halves the draw
+   * calls of a frame.
+   */
+  bool batchDraws;
 } AuroraConfig;
 
 typedef struct {
