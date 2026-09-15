@@ -236,6 +236,24 @@ const AuroraEvent* update() noexcept {
   return window::poll_events();
 }
 
+#ifdef AURORA_ENABLE_GX
+// The Drain processing mode only translates at drain(), which asynchronous frames never call.
+bool async_frames() noexcept {
+  return g_config.asyncFrames && gx::fifo::processing_mode() != gx::fifo::ProcessingMode::Drain;
+}
+
+void finish_frame(gfx::EndFrameCallback callback) {
+  if (async_frames()) {
+    // The processor finishes the frame and hands the callback to the render worker when it
+    // reaches the end marker; store the callback before the marker is published.
+    gfx::defer_end_frame(std::move(callback));
+    gx::fifo::end_frame_async();
+  } else {
+    gfx::end_frame(std::move(callback));
+  }
+}
+#endif
+
 bool begin_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
@@ -256,10 +274,20 @@ bool begin_frame() noexcept {
   }
 
   imgui::new_frame(window::get_window_size());
-  if (!gfx::begin_frame()) {
-    return false;
+  gx::fifo::recycle();
+  if (async_frames()) {
+    // The processor begins recording into the slot when it reaches the marker.
+    uint32_t frameSlot;
+    if (!gfx::reserve_frame(frameSlot)) {
+      return false;
+    }
+    gx::fifo::begin_frame_async(frameSlot);
+  } else {
+    if (!gfx::begin_frame()) {
+      return false;
+    }
+    gx::fifo::begin_frame();
   }
-  gx::fifo::begin_frame();
 #endif
   return true;
 }
@@ -267,10 +295,13 @@ bool begin_frame() noexcept {
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
-  gx::fifo::drain();
-  gx::fifo::end_frame();
-  gx::texture::end_frame();
-  gfx::finish();
+  const bool asyncFrame = async_frames();
+  if (!asyncFrame) {
+    gx::fifo::drain();
+    gx::fifo::end_frame();
+    gx::texture::end_frame();
+    gfx::finish();
+  }
   auto imguiDrawData = imgui::freeze();
 
   const auto& presentSource = webgpu::present_source();
@@ -282,15 +313,18 @@ void end_frame() noexcept {
   bool rmlOverlay = false;
 #if AURORA_ENABLE_RMLUI
   if (rmlui::is_initialized()) {
+    if (asyncFrame) {
+      // RmlUi records into the frame from this thread: let the processor catch up first.
+      gx::fifo::drain();
+    }
     auto rmlFrame = rmlui::record_frame(viewport);
     rmlBindGroup = std::move(rmlFrame.bindGroup);
     rmlOverlay = rmlFrame.overlay;
   }
 #endif
 
-  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
-                  imguiDrawData = std::move(imguiDrawData)](
-                     wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
+  finish_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport, imguiDrawData = std::move(imguiDrawData)](
+                   wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;

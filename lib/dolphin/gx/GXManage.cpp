@@ -270,8 +270,13 @@ void GXDrawDone() {
 void GXSetDrawDone() {
   GXFlush();
   GX_WRITE_RAS_REG(kDrawDoneCommand);
+  aurora::gx::fifo::mark_draw_done();
   aurora::gx::fifo::publish();
 }
+
+// Waits for the most recent GXSetDrawDone token only, as the hardware interrupt does;
+// GXDrawDone still waits for the whole stream.
+void GXWaitDrawDone() { aurora::gx::fifo::wait_draw_done(); }
 
 GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb) { return aurora::gx::fifo::set_draw_done_callback(cb); }
 

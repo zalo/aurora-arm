@@ -96,6 +96,14 @@ extern "C" {
  */
 #define GX_AURORA_DRAW_INDEXED 0x0041
 
+/**
+ * Asynchronous frame markers (AuroraConfig::asyncFrames). FRAME_BEGIN is followed by the
+ * u32 frame slot the processor records into; FRAME_END has no payload and finishes the
+ * frame on the processor thread.
+ */
+#define GX_AURORA_FRAME_BEGIN 0x0042
+#define GX_AURORA_FRAME_END 0x0043
+
 #define GX2_SET_POLYGON_OFFSET 0x1000
 
 

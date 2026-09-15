@@ -35,6 +35,14 @@ void initialize();
 void shutdown();
 bool begin_frame();
 void end_frame(EndFrameCallback callback);
+// Asynchronous frames: the producer only reserves the frame; recording begins and ends on
+// the FIFO processor when it reaches the frame's GX_AURORA_FRAME_BEGIN / FRAME_END markers.
+// The producer stores the presentation callback with defer_end_frame() before writing the
+// end marker; end_deferred_frame() hands it to the render worker.
+bool reserve_frame(uint32_t& frameSlot);
+void begin_reserved_frame(uint32_t frameSlot);
+void defer_end_frame(EndFrameCallback callback);
+void end_deferred_frame();
 uint32_t current_frame() noexcept;
 void after_submit() noexcept;
 void gpu_synchronize();

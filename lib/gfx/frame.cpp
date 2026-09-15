@@ -8,6 +8,7 @@
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
+#include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -49,12 +50,16 @@ enum class BufferMapState {
 
 std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
 std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
-uint32_t g_frameIndex = UINT32_MAX;
+// Read by the render worker and, with asynchronous frames, advanced on the FIFO processor.
+std::atomic<uint32_t> g_frameIndex{UINT32_MAX};
 
 std::array<FramePacket, FrameSlotCount> g_framePackets;
 uint64_t g_nextFrameId = 1;
 render_worker::FrameSlotPool g_frameSlots{FrameSlotCount};
 render_worker::FrameSlotPool g_stagingSlots{StagingBufferCount};
+// Asynchronous frames: presentation callbacks in frame order, consumed at each end marker.
+std::mutex g_deferredEndFrameMutex;
+std::deque<EndFrameCallback> g_deferredEndFrames;
 
 struct RuntimeDrawType {
   std::string label;
@@ -117,7 +122,7 @@ std::atomic_bool g_processEventsQueued = false;
 std::atomic_int64_t g_lastPresentNs = 0;
 std::atomic_int64_t g_presentPeriodNs = 0;
 std::atomic_int64_t g_cpuFrameTimeNs = 0;
-PresentClock::time_point g_cpuFrameStart;
+std::atomic_int64_t g_cpuFrameStartNs = 0;
 constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{2};
 constexpr auto MaxPacingSample = std::chrono::milliseconds{250};
 constexpr uint32_t PacingEmaWeight = 8;
@@ -379,10 +384,14 @@ void initialize() {
   g_lastPresentNs.store(0, std::memory_order_release);
   g_presentPeriodNs.store(0, std::memory_order_release);
   g_cpuFrameTimeNs.store(0, std::memory_order_release);
-  g_cpuFrameStart = {};
+  g_cpuFrameStartNs.store(0, std::memory_order_release);
   {
     std::lock_guard lock{g_presentStatsMutex};
     g_presentTimes.clear();
+  }
+  {
+    std::lock_guard lock{g_deferredEndFrameMutex};
+    g_deferredEndFrames.clear();
   }
   render_worker::initialize();
   // This appears to take a while and blocks the render thread for periods of time
@@ -525,10 +534,14 @@ void shutdown() {
   g_lastPresentNs.store(0, std::memory_order_release);
   g_presentPeriodNs.store(0, std::memory_order_release);
   g_cpuFrameTimeNs.store(0, std::memory_order_release);
-  g_cpuFrameStart = {};
+  g_cpuFrameStartNs.store(0, std::memory_order_release);
   {
     std::lock_guard lock{g_presentStatsMutex};
     g_presentTimes.clear();
+  }
+  {
+    std::lock_guard lock{g_deferredEndFrameMutex};
+    g_deferredEndFrames.clear();
   }
   shutdown_pipeline_cache();
   depth_peek::shutdown();
@@ -612,10 +625,10 @@ std::optional<size_t> acquire_mapped_staging_buffer() {
   }
 }
 
-bool begin_frame() {
+bool reserve_frame(uint32_t& frameSlot) {
   ZoneScoped;
   // pace_frame_start();
-  const size_t frameSlot = acquire_frame_slot();
+  frameSlot = static_cast<uint32_t>(acquire_frame_slot());
   const auto stagingSlot = acquire_mapped_staging_buffer();
   if (!stagingSlot) {
     g_frameSlots.release(frameSlot);
@@ -625,7 +638,6 @@ bool begin_frame() {
   auto& frame = g_framePackets[frameSlot];
   frame = {};
   frame.frameId = g_nextFrameId++;
-  frame.frameIndex = g_frameIndex;
   frame.stagingBuffer = *stagingSlot;
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
@@ -643,7 +655,14 @@ bool begin_frame() {
   if constexpr (UseTextureBuffer) {
     mapBuffer(frame.textureUpload, TextureUploadSize);
   }
+  g_cpuFrameStartNs.store(timestamp_ns(PresentClock::now()), std::memory_order_release);
+  return true;
+}
 
+void begin_reserved_frame(uint32_t frameSlot) {
+  CHECK(frameSlot < FrameSlotCount, "Invalid frame slot {}", frameSlot);
+  auto& frame = g_framePackets[frameSlot];
+  frame.frameIndex = g_frameIndex;
   begin_recording(frame, frameSlot);
   begin_pipeline_frame();
   render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
@@ -651,17 +670,39 @@ bool begin_frame() {
     g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
     webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
   });
-  g_cpuFrameStart = PresentClock::now();
+}
+
+bool begin_frame() {
+  uint32_t frameSlot;
+  if (!reserve_frame(frameSlot)) {
+    return false;
+  }
+  begin_reserved_frame(frameSlot);
   return true;
+}
+
+void defer_end_frame(EndFrameCallback callback) {
+  std::lock_guard lock{g_deferredEndFrameMutex};
+  g_deferredEndFrames.push_back(std::move(callback));
+}
+
+void end_deferred_frame() {
+  EndFrameCallback callback;
+  {
+    std::lock_guard lock{g_deferredEndFrameMutex};
+    CHECK(!g_deferredEndFrames.empty(), "Frame end marker without a deferred end frame callback");
+    callback = std::move(g_deferredEndFrames.front());
+    g_deferredEndFrames.pop_front();
+  }
+  end_frame(std::move(callback));
 }
 
 void end_frame(EndFrameCallback callback) {
   ZoneScoped;
-  if (g_cpuFrameStart.time_since_epoch().count() != 0) {
-    const auto cpuFrameTime = PresentClock::now() - g_cpuFrameStart;
-    update_ema(g_cpuFrameTimeNs, duration_ns(cpuFrameTime));
-    const double cpuFrameTimeMs = std::chrono::duration<double, std::milli>{cpuFrameTime}.count();
-    TracyPlot("aurora: cpuFrameTimeMs", cpuFrameTimeMs);
+  if (const int64_t cpuFrameStartNs = g_cpuFrameStartNs.load(std::memory_order_acquire); cpuFrameStartNs != 0) {
+    const int64_t cpuFrameTimeNs = timestamp_ns(PresentClock::now()) - cpuFrameStartNs;
+    update_ema(g_cpuFrameTimeNs, cpuFrameTimeNs);
+    TracyPlot("aurora: cpuFrameTimeMs", static_cast<double>(cpuFrameTimeNs) / 1'000'000.0);
   }
   const auto recorded = end_recording();
   auto& frame = *recorded.packet;
@@ -700,7 +741,12 @@ uint32_t current_frame() noexcept { return g_frameIndex; }
 
 void after_submit() noexcept { depth_peek::after_submit(); }
 
-void gpu_synchronize() { render_worker::synchronize(); }
+void gpu_synchronize() {
+  // The FIFO processor feeds the render worker; with asynchronous frames it may still be
+  // translating the previous frame when the surface is reconfigured.
+  gx::fifo::synchronize();
+  render_worker::synchronize();
+}
 
 void synchronize() { render_worker::synchronize(); }
 

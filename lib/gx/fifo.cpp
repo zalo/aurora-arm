@@ -2,12 +2,15 @@
 
 #include "../thread.hpp"
 #include "command_processor.hpp"
+#include "dolphin/gx/GXAurora.h"
+#include "dolphin/gx/GXCommandList.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <vector>
 
 #include <tracy/Tracy.hpp>
 
@@ -26,6 +29,9 @@ namespace {
 constexpr Module Log{"aurora::gx::fifo"};
 constexpr auto kProcessingMode = ProcessingMode::Thread;
 constexpr uint32_t kDrawBatchSize = 1;
+// recycle() only compacts once at least this much is consumed and it is at least half the
+// buffer, so the move is amortized against the bytes it reclaims.
+constexpr uint32_t kCompactionThreshold = 64 * 1024;
 
 bool sFrameActive = false;
 uint32_t sPendingDraws = 0;
@@ -36,6 +42,9 @@ std::mutex sBufferMutex;
 std::atomic<uint32_t> sWorkerWake{0};
 thread::Thread sWorkerThread;
 std::atomic<DrawDoneCallback> sDrawDoneCallback{nullptr};
+std::atomic<uint64_t> sDrawDoneTarget{0};
+std::mutex sAfterFrameMutex;
+std::vector<std::function<void()>> sAfterFrame;
 
 void dispatch_draw_done() noexcept {
   if (const auto callback = sDrawDoneCallback.load(std::memory_order_acquire); callback != nullptr) {
@@ -70,6 +79,14 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
     processed += result.bytesProcessed;
     sProcessed.store(processed, order);
     sProcessed.notify_all();
+  }
+}
+
+void wait_for_processed(uint64_t target) noexcept {
+  uint64_t processed = sProcessed.load(std::memory_order_acquire);
+  while (processed < target) {
+    sProcessed.wait(processed, std::memory_order_acquire);
+    processed = sProcessed.load(std::memory_order_acquire);
   }
 }
 
@@ -133,6 +150,11 @@ void init() {
   sPublished.store(0, std::memory_order_relaxed);
   sProcessed.store(0, std::memory_order_relaxed);
   sWorkerWake.store(0, std::memory_order_relaxed);
+  sDrawDoneTarget.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard lock{sAfterFrameMutex};
+    sAfterFrame.clear();
+  }
 
   start_worker();
 }
@@ -147,6 +169,102 @@ void begin_frame() noexcept { sFrameActive = true; }
 void end_frame() noexcept {
   sFrameActive = false;
   clear_draw_cache(); // command_processor
+}
+
+void begin_frame_async(uint32_t frameSlot) {
+  AURORA_ASSERT(!detail::sInDisplayList, "fifo::begin_frame_async: called while recording a display list");
+  sFrameActive = true;
+  // Commands written since the previous frame ended are still unpublished (publish() is a
+  // no-op outside a frame), so nothing below the pending range is touched here and the
+  // processor never reads it. Append the marker, then rotate it ahead of the pending
+  // commands so recording has begun by the time the processor reaches them.
+  const auto pendingStart = static_cast<uint32_t>(sPublished.load(std::memory_order_relaxed) - sStreamBase);
+  const uint32_t pendingEnd = detail::sBufferSize;
+  write_u8(GX_AURORA);
+  write_u16(GX_AURORA_FRAME_BEGIN);
+  write_u32(frameSlot);
+  if (pendingEnd != pendingStart) {
+    std::rotate(detail::sBufferData + pendingStart, detail::sBufferData + pendingEnd,
+                detail::sBufferData + detail::sBufferSize);
+  }
+  publish();
+}
+
+void end_frame_async() noexcept {
+  write_u8(GX_AURORA);
+  write_u16(GX_AURORA_FRAME_END);
+  publish();
+  sFrameActive = false;
+}
+
+void recycle() noexcept {
+  std::lock_guard lock{sBufferMutex};
+  const uint64_t processed = sProcessed.load(std::memory_order_acquire);
+  const uint64_t end = sStreamBase + detail::sBufferSize;
+  if (processed == end) {
+    sStreamBase = end;
+    detail::sBufferSize = 0;
+    sPendingDraws = 0;
+    return;
+  }
+  // The processor holds no pointers into the buffer between process() calls, and process()
+  // runs under sBufferMutex, so the consumed prefix can be dropped underneath it. Producer
+  // offsets are not affected: GXBegin/GXEnd patch offsets only live inside a draw.
+  const uint64_t consumed = processed - sStreamBase;
+  if (consumed >= kCompactionThreshold && consumed * 2 >= detail::sBufferSize) {
+    std::memmove(detail::sBufferData, detail::sBufferData + consumed, detail::sBufferSize - consumed);
+    sStreamBase += consumed;
+    detail::sBufferSize -= static_cast<uint32_t>(consumed);
+  }
+}
+
+void run_after_frame(std::function<void()> fn) {
+  std::lock_guard lock{sAfterFrameMutex};
+  sAfterFrame.push_back(std::move(fn));
+}
+
+void dispatch_after_frame() {
+  std::vector<std::function<void()>> pending;
+  {
+    std::lock_guard lock{sAfterFrameMutex};
+    pending.swap(sAfterFrame);
+  }
+  for (auto& fn : pending) {
+    fn();
+  }
+}
+
+void mark_draw_done() noexcept { sDrawDoneTarget.store(sStreamBase + detail::sBufferSize, std::memory_order_release); }
+
+void wait_draw_done() noexcept {
+  const uint64_t target = sDrawDoneTarget.load(std::memory_order_acquire);
+  if (target == 0 || sProcessed.load(std::memory_order_acquire) >= target) {
+    return;
+  }
+  ZoneScoped;
+  // GXSetDrawDone published the token unless it was written outside a frame.
+  if (sPublished.load(std::memory_order_relaxed) < target) {
+    sPublished.store(target, std::memory_order_release);
+  }
+  if (kProcessingMode == ProcessingMode::Thread) {
+    wake_worker();
+    wait_for_processed(target);
+  } else {
+    process_to(target, std::memory_order_relaxed);
+  }
+}
+
+void synchronize() noexcept {
+  const uint64_t published = sPublished.load(std::memory_order_acquire);
+  if (sProcessed.load(std::memory_order_acquire) >= published) {
+    return;
+  }
+  ZoneScoped;
+  if (kProcessingMode == ProcessingMode::Thread && sWorkerThread.joinable()) {
+    wait_for_processed(published);
+  } else {
+    process_to(published, std::memory_order_relaxed);
+  }
 }
 
 void write_data_grow(const void* data, uint32_t length) {
@@ -251,14 +369,7 @@ void drain() {
   case ProcessingMode::Thread: {
     sPublished.store(target, std::memory_order_release);
     wake_worker();
-
-    uint64_t processed = sProcessed.load(std::memory_order_acquire);
-    if (processed < target) {
-      do {
-        sProcessed.wait(processed, std::memory_order_acquire);
-        processed = sProcessed.load(std::memory_order_acquire);
-      } while (processed < target);
-    }
+    wait_for_processed(target);
     break;
   }
   }

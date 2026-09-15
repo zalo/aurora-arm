@@ -126,6 +126,13 @@ typedef struct {
    * GXInitTexObjData / GXInitTlutObjData changes always invalidate immediately.
    */
   uint32_t textureVerifyInterval;
+   * Translate GX commands asynchronously to the game thread: aurora_end_frame() no longer
+   * waits for the FIFO processor, so the CPU frame time becomes the slowest of the game
+   * thread, the FIFO processor and the render worker instead of game + translation.
+   * The game thread may then run up to one frame ahead of translation; GXSetDrawDone /
+   * GXWaitDrawDone and AuroraGXSync wait for a specific point of the stream.
+   */
+  bool asyncFrames;
 } AuroraConfig;
 
 typedef struct {

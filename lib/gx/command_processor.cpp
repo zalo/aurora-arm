@@ -2,10 +2,12 @@
 
 #include "../gfx/depth_peek.hpp"
 #include "../gfx/hash.hpp"
+#include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
 #include "dolphin/gx/GXAurora.h"
+#include "fifo.hpp"
 #include "gx.hpp"
 #include "pipeline.hpp"
 #include "regs.hpp"
@@ -843,6 +845,16 @@ void handle_aurora(ByteReader& reader) noexcept {
     if (indexCount != 0) {
       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
     }
+  } else if (subCmd == GX_AURORA_FRAME_BEGIN) {
+    gfx::begin_reserved_frame(reader.read<u32>());
+  } else if (subCmd == GX_AURORA_FRAME_END) {
+    // Asynchronous frames: the producer does not join the processor, so the per-frame work
+    // aurora::end_frame() performs after drain() runs here, on the thread that owns the state.
+    clear_draw_cache();
+    texture::end_frame();
+    gfx::finish();
+    gfx::end_deferred_frame();
+    dispatch_after_frame();
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
     auto label = reader.read_string();
     gfx::push_debug_group(std::move(label));

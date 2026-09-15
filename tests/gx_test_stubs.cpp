@@ -14,6 +14,7 @@
 #include "gfx/clear.hpp"
 #include "gfx/resources.hpp"
 #include "gfx/depth_peek.hpp"
+#include "gfx/frame.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/tex_copy_conv.hpp"
 #include "gfx/tex_palette_conv.hpp"
@@ -27,6 +28,8 @@
 
 #include <atomic>
 #include <cstdio>
+#include <functional>
+#include <thread>
 #include <fmt/format.h>
 
 // --- aurora::g_config ---
@@ -291,7 +294,33 @@ void begin_offscreen(uint32_t width, uint32_t height) {
 }
 void end_offscreen() { testing::endOffscreenCount.fetch_add(1, std::memory_order_release); }
 bool is_offscreen() noexcept { return false; }
+
+// --- Asynchronous frame markers ---
+namespace testing {
+std::atomic<uint32_t> reservedFrameBeginCount{0};
+std::atomic<uint32_t> reservedFrameBeginSlot{UINT32_MAX};
+std::atomic<uint32_t> reservedFrameBeginBpReg41{0};
+std::atomic<uint32_t> deferredFrameEndCount{0};
+std::atomic<uint32_t> finishCount{0};
+std::atomic<size_t> deferredFrameEndThreadHash{0};
+} // namespace testing
+
+void begin_reserved_frame(uint32_t frameSlot) {
+  testing::reservedFrameBeginSlot.store(frameSlot, std::memory_order_relaxed);
+  testing::reservedFrameBeginBpReg41.store(gx::g_gxState.bpRegCache[0x41], std::memory_order_relaxed);
+  testing::reservedFrameBeginCount.fetch_add(1, std::memory_order_release);
+}
+void finish() { testing::finishCount.fetch_add(1, std::memory_order_release); }
+void end_deferred_frame() {
+  testing::deferredFrameEndThreadHash.store(std::hash<std::thread::id>{}(std::this_thread::get_id()),
+                                            std::memory_order_relaxed);
+  testing::deferredFrameEndCount.fetch_add(1, std::memory_order_release);
+}
 } // namespace aurora::gfx
+
+namespace aurora::gx::texture {
+void end_frame() noexcept {}
+} // namespace aurora::gx::texture
 
 namespace aurora::gfx::depth_peek {
 namespace {
