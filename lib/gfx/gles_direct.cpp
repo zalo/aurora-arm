@@ -1786,6 +1786,11 @@ void shutdown() {
   sMapped = nullptr;
 }
 #else
+namespace {
+std::atomic_bool sSceneOnSurfaceBlocked = false;
+std::string sDriverNotice;
+std::atomic_bool sDriverNoticeReady = false;
+} // namespace
 bool encode_pass_resources(const wgpu::RenderPassEncoder&, detail::RenderPass& pass, std::string_view label) {
   pass.directLabel = label;
   return false;
