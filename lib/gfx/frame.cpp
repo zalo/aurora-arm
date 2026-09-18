@@ -53,6 +53,27 @@ enum class BufferMapState {
 
 std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
 std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
+StagingLayout g_stagingLayout;
+
+StagingLayout make_staging_layout(bool streams) {
+  StagingLayout layout{.streams = streams};
+  uint64_t offset = 0;
+  const auto place = [&](uint64_t& region, uint64_t size) {
+    region = offset;
+    offset += size;
+  };
+  if (streams) {
+    place(layout.vertex, VertexBufferSize);
+    place(layout.uniform, UniformBufferSize);
+    place(layout.index, IndexBufferSize);
+  }
+  place(layout.storage, StorageBufferSize);
+  if constexpr (UseTextureBuffer) {
+    place(layout.textureUpload, TextureUploadSize);
+  }
+  layout.size = offset;
+  return layout;
+}
 // Read by the render worker and, with asynchronous frames, advanced on the FIFO processor.
 std::atomic<uint32_t> g_frameIndex{UINT32_MAX};
 
@@ -254,7 +275,7 @@ void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion) {
   }
 
   g_stagingBuffers[slot].MapAsync(
-      wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
+      wgpu::MapMode::Write, 0, g_stagingLayout.size, wgpu::CallbackMode::AllowSpontaneous,
       [slot, releaseSlotOnCompletion](wgpu::MapAsyncStatus status, wgpu::StringView message) {
         if (status == wgpu::MapAsyncStatus::CallbackCancelled || status == wgpu::MapAsyncStatus::Aborted) {
           Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
@@ -279,6 +300,8 @@ namespace detail {
 Resources& resources() noexcept { return g_resources; }
 
 const wgpu::Buffer& staging_buffer(size_t slot) { return g_stagingBuffers[slot]; }
+
+const StagingLayout& staging_layout() noexcept { return g_stagingLayout; }
 
 std::optional<RegisteredDrawType> find_runtime_draw_type(DrawTypeId id) {
   std::lock_guard lock{g_runtimeTypeMutex};
@@ -456,9 +479,21 @@ void initialize() {
                "Shared Index Buffer");
   createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
                "Shared Storage Buffer");
+  // The persistently mapped GL streams are created now, before the staging buffers, so those can leave out
+  // the stream regions they would never receive (StagingLayout). Dawn's GL interop makes the context current
+  // on this thread for the call; the render worker has not issued GL work yet.
+  if (gles_direct::mapped_streams_enabled()) {
+    gles_direct::create_mapped_slots(StagingBufferCount);
+  }
+  g_stagingLayout = make_staging_layout(!gles_direct::mapped_slots_ready());
+  if (!g_stagingLayout.streams) {
+    Log.info("frame streams live in mapped GL storage; {} staging buffers of {} MiB hold storage and texture uploads only "
+             "(instead of {} MiB each)",
+             StagingBufferCount, g_stagingLayout.size / (1024 * 1024), StagingBufferSize / (1024 * 1024));
+  }
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     const auto label = fmt::format("Staging Buffer {}", i);
-    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
+    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, g_stagingLayout.size,
                  label.c_str());
   }
   for (auto& state : g_mappingStates) {
@@ -688,31 +723,32 @@ bool reserve_frame(uint32_t& frameSlot) {
   frame = {};
   frame.frameId = g_nextFrameId++;
   frame.stagingBuffer = *stagingSlot;
-  size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
-  const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {
+  const auto& layout = g_stagingLayout;
+  const auto mapBuffer = [&](ByteBuffer& buf, uint64_t offset, uint64_t size) {
     if (size <= 0) {
       return;
     }
-    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
-    bufferOffset += size;
+    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(offset, size)), static_cast<size_t>(size)};
   };
   if (const auto* mapped = gles_direct::mapped_slot(*stagingSlot); mapped != nullptr) {
-    // Persistently mapped GL streams: the staging ranges of these three streams stay unused (the staging
-    // layout is fixed, so their offsets are still skipped) and the slot is free, its fence having signalled.
+    // Persistently mapped GL streams: the slot is free, its fence having signalled. The staging buffers were
+    // created without the stream regions (or, when the slots came late, those regions stay unused).
     frame.verts = ByteBuffer{mapped->vertexData, static_cast<size_t>(VertexBufferSize)};
     frame.uniforms = ByteBuffer{mapped->uniformData, static_cast<size_t>(UniformBufferSize)};
     frame.indices = ByteBuffer{mapped->indexData, static_cast<size_t>(IndexBufferSize)};
     frame.mappedStreams = true;
-    bufferOffset += VertexBufferSize + UniformBufferSize + IndexBufferSize;
   } else {
-    mapBuffer(frame.verts, VertexBufferSize);
-    mapBuffer(frame.uniforms, UniformBufferSize);
-    mapBuffer(frame.indices, IndexBufferSize);
+    AURORA_ASSERT(layout.streams, "staging buffers were sized without stream regions, but mapped GL stream slot {} is "
+                                  "unavailable",
+                  *stagingSlot);
+    mapBuffer(frame.verts, layout.vertex, VertexBufferSize);
+    mapBuffer(frame.uniforms, layout.uniform, UniformBufferSize);
+    mapBuffer(frame.indices, layout.index, IndexBufferSize);
   }
-  mapBuffer(frame.storage, StorageBufferSize);
+  mapBuffer(frame.storage, layout.storage, StorageBufferSize);
   if constexpr (UseTextureBuffer) {
-    mapBuffer(frame.textureUpload, TextureUploadSize);
+    mapBuffer(frame.textureUpload, layout.textureUpload, TextureUploadSize);
   }
   g_cpuFrameStartNs.store(timestamp_ns(PresentClock::now()), std::memory_order_release);
   return true;
@@ -784,6 +820,7 @@ void end_frame(EndFrameCallback callback) {
         gles_direct::create_mapped_slots(StagingBufferCount);
       }
       if (mappedStreams) {
+        aurora_render_phase = "flush-slot";
         gles_direct::flush_mapped_slot(packet);
       }
       gles_direct::prepare_frame(packet);

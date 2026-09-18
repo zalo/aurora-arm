@@ -397,12 +397,6 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   }
 }
 
-constexpr uint64_t VertexStagingOffset = 0;
-constexpr uint64_t UniformStagingOffset = VertexStagingOffset + VertexBufferSize;
-constexpr uint64_t IndexStagingOffset = UniformStagingOffset + UniformBufferSize;
-constexpr uint64_t StorageStagingOffset = IndexStagingOffset + IndexBufferSize;
-constexpr uint64_t TextureUploadStagingOffset = StorageStagingOffset + StorageBufferSize;
-
 constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
 
 void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
@@ -436,19 +430,20 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
   const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
   const auto& highWater = op.highWater;
   auto& res = resources();
+  const auto& layout = staging_layout();
   if (frame.mappedStreams) {
     // Recorded straight into mapped GL storage: the direct path binds it, and frames with a pass on the WebGPU
     // path are uploaded whole at frame end (gles_direct::prepare_frame).
     frame.copied.verts = std::max(frame.copied.verts, highWater.verts);
     frame.copied.uniforms = std::max(frame.copied.uniforms, highWater.uniforms);
     frame.copied.indices = std::max(frame.copied.indices, highWater.indices);
+  } else {
+    AURORA_ASSERT(layout.streams, "frame {} was staged, but the staging buffers have no stream regions", frame.frameId);
   }
-  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, res.vertexBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
-                            res.uniformBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, res.indexBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
-                            res.storageBuffer);
+  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, layout.vertex, res.vertexBuffer);
+  copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, layout.uniform, res.uniformBuffer);
+  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, layout.index, res.indexBuffer);
+  copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, layout.storage, res.storageBuffer);
 
   if constexpr (UseTextureBuffer) {
     for (size_t i = frame.copied.textureUploadCount; i < op.textureUploads.size(); ++i) {
@@ -456,7 +451,7 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
       const wgpu::TexelCopyBufferInfo buf{
           .layout =
               wgpu::TexelCopyBufferLayout{
-                  .offset = item.buffer ? item.layout.offset : item.layout.offset + TextureUploadStagingOffset,
+                  .offset = item.buffer ? item.layout.offset : item.layout.offset + layout.textureUpload,
                   .bytesPerRow = AURORA_ALIGN(item.layout.bytesPerRow, 256),
                   .rowsPerImage = item.layout.rowsPerImage,
               },

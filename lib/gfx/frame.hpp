@@ -17,6 +17,22 @@ inline constexpr size_t StagingBufferCount = FrameSlotCount + 3;
 inline constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + IndexBufferSize +
                                               StorageBufferSize + (UseTextureBuffer ? TextureUploadSize : 0);
 
+// Where each stream lives in a staging buffer. When the frame streams are recorded into persistently
+// mapped GL storage (gles_direct mapped streams, decided in initialize()) the vertex, uniform and index
+// regions are never written and are left out (streams = false): Mesa/Panfrost backs every page of a
+// buffer when it is created, so on a 1 GiB device the three unused 22 MiB regions cost 66 MiB of pinned
+// memory that pushed the RK3326 and RK3566 into swap-less thrashing.
+struct StagingLayout {
+  uint64_t vertex = 0;
+  uint64_t uniform = 0;
+  uint64_t index = 0;
+  uint64_t storage = 0;
+  uint64_t textureUpload = 0;
+  uint64_t size = 0;
+  bool streams = true;
+};
+const StagingLayout& staging_layout() noexcept;
+
 const wgpu::Buffer& staging_buffer(size_t slot);
 
 struct RegisteredDrawType {
