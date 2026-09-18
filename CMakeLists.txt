@@ -18,6 +18,10 @@ option(AURORA_DEEP_TIMERS "Compile in the sampled nested CPU timers of lib/gfx/p
 set(AURORA_VERTEX_BUFFER_MIB 5 CACHE STRING "Per-frame vertex stream size in MiB (raise for cpuVertexDecode titles with heavy streamed geometry)")
 set(AURORA_UNIFORM_WINDOW_KIB 64 CACHE STRING "Uniform-table window size in KiB; set to 16 for GLES devices whose GL_MAX_UNIFORM_BLOCK_SIZE is the 16 KiB GLES minimum (e.g. Mali-G31)")
 
+include(CMakeDependentOption)
+cmake_dependent_option(AURORA_ENABLE_EXAMPLES "Enable examples" ON "CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR" OFF)
+cmake_dependent_option(AURORA_ENABLE_TESTS "Enable tests" ON "NOT CMAKE_CROSSCOMPILING" OFF)
+
 # Dependency versions
 include(cmake/AuroraDependencyVersions.cmake)
 
@@ -74,11 +78,11 @@ if (AURORA_ENABLE_DVD)
   include(cmake/aurora_dvd.cmake)
 endif ()
 
-if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+if (AURORA_ENABLE_EXAMPLES)
   add_subdirectory(examples)
 endif ()
 
-if (NOT CMAKE_CROSSCOMPILING)
+if (AURORA_ENABLE_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif ()
