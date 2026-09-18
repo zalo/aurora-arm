@@ -288,7 +288,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   // handed to the presentation callback with the packet.
   SceneSource scene{passInfo.copySourceTexture, passInfo.copySourceView};
   bool sceneOnSurface = false;
-  if (g_config.sceneOnSurface && passInfo.msaaSamples == 1 && passInfo.colorAttachmentCount == 1) {
+  if (g_config.sceneOnSurface && gles_direct::scene_on_surface_allowed() && passInfo.msaaSamples == 1 && passInfo.colorAttachmentCount == 1) {
     const auto& color = passInfo.colorAttachments[SceneColorAttachmentIndex];
     const auto& surfaceConfig = webgpu::g_graphicsConfig.surfaceConfiguration;
     if (color.view && color.view.Get() == webgpu::g_frameBuffer.view.Get() && color.size.width == surfaceConfig.width &&

@@ -53,6 +53,13 @@ struct CachedTextureEntry {
   uint64_t replacementId = 0;
   uint64_t lastUsedFrame = 0;
   uint64_t contentSample = 0; // sampled source fingerprint, checked on object-cache hits
+  // The object's data was replaced through GXInitTexObjData, so it owns a texture outside the content cache that
+  // later version bumps overwrite in place (movie planes rewritten every frame).
+  bool streaming = false;
+  // Streaming uploads rotate through standalone textures, so an upload never lands in a texture (or a shared pool
+  // slab) that a queued frame still samples; Mali stalls on those writes.
+  std::array<gfx::TextureHandle, 3> streamRing;
+  uint8_t streamNext = 0;
   uint64_t lastVerifiedFrame = 0;
 };
 
@@ -741,6 +748,33 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
           content_matches(entry, [&] { return sample_texture_content(obj, nullptr); })) {
         entry.lastUsedFrame = s_frameCount;
         ++s_stats.objectHits;
+        return entry.handle;
+      }
+      if (entry.handle && entry.texDataVersion != obj.texDataVersion && obj.texDataVersion > 1 &&
+          entry.tlutObjId == 0 && entry.replacementId == 0 && !obj.no_cache()) {
+        const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
+        const ArrayRef<uint8_t> source{static_cast<const uint8_t*>(obj.data), sourceBytes};
+        if (!entry.streaming) {
+          entry.streamRing = {};
+          entry.streamNext = 0;
+          entry.streaming = true;
+        }
+        auto& slot = entry.streamRing[entry.streamNext];
+        entry.streamNext = (entry.streamNext + 1) % entry.streamRing.size();
+        if (slot && slot->size.width == obj.width() && slot->size.height == obj.height() &&
+            slot->mipCount == obj.mip_count() && slot->gxFormat == obj.format()) {
+          gfx::write_texture(*slot, source);
+        } else {
+          slot = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(), source, false,
+                                            "GX Streaming Texture", std::nullopt);
+        }
+        entry.handle = slot;
+        ++s_stats.misses;
+        s_stats.uploadBytes += sourceBytes;
+        entry.texDataVersion = obj.texDataVersion;
+        entry.lastUsedFrame = s_frameCount;
+        entry.contentSample = sample_texture_content(obj, nullptr);
+        entry.lastVerifiedFrame = s_frameCount;
         return entry.handle;
       }
     }

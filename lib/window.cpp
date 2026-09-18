@@ -31,7 +31,13 @@ extern "C" void Android_UnlockActivityMutex(void);
 #include <atomic>
 #include <deque>
 #include <string>
+#include <utility>
 #include <vector>
+
+#ifdef MELEE_MIYOO_FLIP
+// Degrees the application's present worker rotates each frame onto the panel (portrait-mounted panels).
+extern "C" int MeleeFlipRotation();
+#endif
 
 #include "rmlui.hpp"
 #include "time_internal.hpp"
@@ -451,6 +457,14 @@ AuroraWindowSize get_window_size() {
   AURORA_ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
   AURORA_ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
          SDL_GetError());
+#ifdef MELEE_MIYOO_FLIP
+  // A quarter-turn present maps the frame's width onto the panel's height: render at the rotated size so the
+  // landscape game fills the panel instead of being letterboxed into the portrait mode first.
+  if (const int rotation = (MeleeFlipRotation() % 360 + 360) % 360; rotation == 90 || rotation == 270) {
+    std::swap(width, height);
+    std::swap(native_fb_w, native_fb_h);
+  }
+#endif
 
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;

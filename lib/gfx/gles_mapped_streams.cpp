@@ -124,11 +124,19 @@ void check_fence_gl(void* data) {
     query.done = true;
     return;
   }
+  aurora_render_phase = query.block ? "fence-wait-block" : "fence-poll";
   GLenum status;
+  int timeouts = 0;
   do {
     status = glClientWaitSync(static_cast<GLsync>(query.slot->fence), GL_SYNC_FLUSH_COMMANDS_BIT,
                               query.block ? 1000000000 : 0);
-  } while (query.block && status == GL_TIMEOUT_EXPIRED);
+  } while (query.block && status == GL_TIMEOUT_EXPIRED && ++timeouts < 3);
+  // Mali r13p0 can leave a fence unsignalled forever (the RG froze on the Nintendo logo); after three seconds the
+  // slot is released anyway, risking one torn frame instead of a hang.
+  if (query.block && status == GL_TIMEOUT_EXPIRED) {
+    Log.warn("mapped-slot fence not signalled after {}s; releasing the slot", timeouts);
+    status = GL_WAIT_FAILED;
+  }
   query.done = status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED || status == GL_WAIT_FAILED;
   if (query.done) {
     glDeleteSync(static_cast<GLsync>(query.slot->fence));

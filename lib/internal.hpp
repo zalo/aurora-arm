@@ -4,6 +4,9 @@
 
 #include <aurora/aurora.h>
 
+// The render worker's current GL-side step, readable from a debugger when a frame never completes.
+extern "C" const char* aurora_render_phase;
+
 #include <array>
 #include <cassert>
 #include <cstdint>

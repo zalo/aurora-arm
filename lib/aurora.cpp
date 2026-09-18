@@ -16,6 +16,7 @@
 #include "gx/gx.hpp"
 #include "gx/texture.hpp"
 #include "imgui.hpp"
+#include <imgui.h>
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
 #include <webgpu/webgpu_cpp.h>
@@ -35,6 +36,8 @@
 
 #include "system_info.hpp"
 #include "tracy/Tracy.hpp"
+
+const char* aurora_render_phase = "idle";
 
 namespace aurora {
 AuroraConfig g_config;
@@ -242,6 +245,33 @@ const AuroraEvent* update() noexcept {
 }
 
 #ifdef AURORA_ENABLE_GX
+// The GL driver probe (gfx/gles_direct.hpp) found a driver bug: show its notice over the game for a while.
+void draw_driver_notice() noexcept {
+  static constexpr double NoticeSeconds = 20.0;
+  static std::chrono::steady_clock::time_point shownSince{};
+  const char* notice = gfx::gles_direct::driver_notice();
+  if (notice == nullptr) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (shownSince == std::chrono::steady_clock::time_point{}) {
+    shownSince = now;
+  }
+  if (std::chrono::duration<double>(now - shownSince).count() > NoticeSeconds) {
+    return;
+  }
+  const ImVec2 display = ImGui::GetIO().DisplaySize;
+  ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.06f), ImGuiCond_Always, ImVec2(0.5f, 0.f));
+  ImGui::SetNextWindowSize(ImVec2(display.x * 0.9f, 0.f), ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.85f);
+  if (ImGui::Begin("##driver-notice", nullptr,
+                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
+                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+    ImGui::TextWrapped("%s", notice);
+  }
+  ImGui::End();
+}
+
 // The Drain processing mode only translates at drain(), which asynchronous frames never call.
 bool async_frames() noexcept {
   return g_config.asyncFrames && gx::fifo::processing_mode() != gx::fifo::ProcessingMode::Drain;
@@ -307,6 +337,7 @@ void end_frame() noexcept {
     gx::texture::end_frame();
     gfx::finish();
   }
+  draw_driver_notice();
   auto imguiDrawData = imgui::freeze();
 
   const auto& presentSource = webgpu::present_source();
@@ -468,7 +499,9 @@ void end_frame() noexcept {
       ZoneScopedN("Queue Submit");
       // OpenGL ES direct submission: the render pass callback is live only while this command buffer executes.
       gfx::gles_direct::install_frame();
+      aurora_render_phase = "submit";
       g_queue.Submit(1, &buffer);
+      aurora_render_phase = "after-submit";
       gfx::gles_direct::uninstall_frame();
     }
     phase(sSubmitMs);
@@ -479,7 +512,9 @@ void end_frame() noexcept {
       {
         window::SurfaceLock surfaceLock;
         if (window::is_presentable()) {
+          aurora_render_phase = "present";
           status = g_surface.Present();
+          aurora_render_phase = "after-present";
         }
       }
       phase(sPresentMs);

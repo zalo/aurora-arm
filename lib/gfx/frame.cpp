@@ -805,8 +805,11 @@ void end_frame(EndFrameCallback callback) {
     }
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
+    aurora_render_phase = "release-slot";
     release_staging_slot(stagingSlot, mappedStreams);
+    aurora_render_phase = "process-events";
     process_events();
+    aurora_render_phase = "idle";
   });
 }
 

@@ -45,6 +45,11 @@ bool available() noexcept;
 void configure(wgpu::BackendType backend);
 bool enabled() noexcept;
 bool mapped_streams_enabled() noexcept;
+// False once the GL driver is known to mishandle rendering the scene into the presented texture.
+bool scene_on_surface_allowed() noexcept;
+// Non-null once the startup driver probe found a GL driver that drops draws (and enabled the per-draw
+// workaround): a user-facing message. Written once by the render worker; readable from any thread.
+const char* driver_notice() noexcept;
 
 // Encode time. Records only the resources Dawn must keep tracking for the pass and marks it for direct
 // submission; returns false, recording nothing, when the pass must take the WebGPU path.

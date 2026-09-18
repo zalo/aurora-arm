@@ -14,6 +14,7 @@ extern "C" dawn::native::opengl::EGLFunctionPointerType MeleeFlipEGLProc(const c
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 #include <string>
 #include <string_view>
@@ -987,9 +988,11 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         "enable_immediate_error_handling",
         "gl_allow_context_on_multi_threads",
     };
-    if (gfx::gles_direct::enabled()) {
+    const char* cacheFramebuffers = std::getenv("AURORA_GLES_CACHE_FRAMEBUFFERS");
+    if (gfx::gles_direct::enabled() && (cacheFramebuffers == nullptr || cacheFramebuffers[0] != '0')) {
       // Framebuffer objects cached by attachment identity (Dawn's native GL interop extension): +2 ms per
       // frame with the direct path on a Mali-G52, a regression when Dawn executes the passes itself.
+      // AURORA_GLES_CACHE_FRAMEBUFFERS=0 keeps per-pass framebuffers (diagnostic).
       enableToggles.push_back("gl_cache_framebuffers");
     }
     if (g_config.renderStats && g_backendType == wgpu::BackendType::OpenGLES) {

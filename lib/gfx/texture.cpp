@@ -40,6 +40,7 @@ bool setup_swizzle(wgpu::TextureComponentSwizzleDescriptor& swizzle, u32 format)
   }
 
   switch (format) {
+  case GX_TF_I8:
   case GX_TF_R8_PC:
     swizzle.swizzle.r = wgpu::ComponentSwizzle::R;
     swizzle.swizzle.g = wgpu::ComponentSwizzle::R;

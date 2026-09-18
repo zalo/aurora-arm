@@ -648,7 +648,10 @@ void initialize() {
   g_blitPipeline = create_pipeline(
       {GX_TF_RGBA8, FragPassthrough, webgpu::g_graphicsConfig.surfaceConfiguration.format, "TexCopyConv Blit"},
       ShaderPreamble, g_bindGroupLayout);
-  for (const auto& conv : ConvPipelines) {
+  for (auto conv : ConvPipelines) {
+    // I8 copies land in an R8 target when views can swizzle (see to_wgpu).
+    conv.outputFormat = to_wgpu(conv.fmt) == wgpu::TextureFormat::R8Unorm ? wgpu::TextureFormat::R8Unorm
+                                                                           : conv.outputFormat;
     g_pipelines[conv.fmt] = create_pipeline(conv, ShaderPreamble, g_bindGroupLayout);
     if (conv.outputFormat != to_wgpu(conv.fmt)) {
       Log.fatal("Output format mismatch for {}", conv.fmt);

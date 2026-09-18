@@ -28,6 +28,9 @@ inline wgpu::TextureFormat to_wgpu(u32 gxFormat) noexcept {
     return uses_direct_texture_upload(gxFormat) ? wgpu::TextureFormat::R8Unorm : wgpu::TextureFormat::RGBA8Unorm;
   case GX_TF_RG8_PC:
     return uses_direct_texture_upload(gxFormat) ? wgpu::TextureFormat::RG8Unorm : wgpu::TextureFormat::RGBA8Unorm;
+  case GX_TF_I8:
+    // One byte per texel, expanded to intensity on every channel by the view swizzle.
+    return webgpu::g_textureComponentSwizzleSupported ? wgpu::TextureFormat::R8Unorm : wgpu::TextureFormat::RGBA8Unorm;
   case GX_TF_C4:
   case GX_TF_C8:
   case GX_TF_C14X2:

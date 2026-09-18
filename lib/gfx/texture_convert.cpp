@@ -221,6 +221,18 @@ struct TextureDecoderI4 {
   }
 };
 
+// I8 into an R8Unorm texture (intensity restored by the view swizzle): only the 8x4 tile order is undone.
+struct TextureDecoderI8R8 {
+  using Source = uint8_t;
+  using Target = uint8_t;
+
+  static constexpr uint32_t Frac = 1;
+  static constexpr uint32_t BlockWidth = 8;
+  static constexpr uint32_t BlockHeight = 4;
+
+  static void decode_texel(Target* target, const Source* in, const uint32_t x) { target[x] = in[x]; }
+};
+
 struct TextureDecoderI8 {
   using Source = uint8_t;
   using Target = RGBA8;
@@ -603,7 +615,11 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     converted = DecodeTiled<TextureDecoderI4>(width, height, mips, data);
     break;
   case GX_TF_I8:
-    converted = DecodeTiled<TextureDecoderI8>(width, height, mips, data);
+    if (webgpu::g_textureComponentSwizzleSupported) {
+      converted = DecodeTiled<TextureDecoderI8R8>(width, height, mips, data);
+    } else {
+      converted = DecodeTiled<TextureDecoderI8>(width, height, mips, data);
+    }
     break;
   case GX_TF_IA4:
     converted = DecodeTiled<TextureDecoderIA4>(width, height, mips, data);
