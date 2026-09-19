@@ -332,6 +332,12 @@ void CARDInit(const char* game, const char* maker) {
       cardPaths[i] =
           get_card_full_path(cardWorkingDir, game, selected_card_type(), static_cast<aurora::card::ECardSlot>(i));
     }
+    // AURORA_CARD_PATH_A/B: use this directory (GCI folder) or file instead, whichever way the path was
+    // derived. The application uses it to play one session on a copy of another save.
+    if (const char* override = std::getenv(i == 0 ? "AURORA_CARD_PATH_A" : "AURORA_CARD_PATH_B"); override != nullptr && *override) {
+      cardPaths[i] = override;
+      Log.info("Card {} path from the environment: {}", i == 0 ? 'A' : 'B', override);
+    }
 
     const auto& curPath = cardPaths[i];
 
