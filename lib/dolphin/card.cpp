@@ -287,6 +287,14 @@ void CARDSetBasePath(const char* path, const s32 chan) {
     cardPaths[1] =
         get_card_full_path(filePath, aurora::g_gameName, selected_card_type(), aurora::card::ECardSlot::SlotB);
   }
+  // AURORA_CARD_PATH_A/B: use this directory (GCI folder) or file instead of the derived one. The
+  // application uses it to play one session on a copy of another save without touching its own.
+  for (int slot = 0; slot < 2; ++slot) {
+    if (const char* override = std::getenv(slot == 0 ? "AURORA_CARD_PATH_A" : "AURORA_CARD_PATH_B"); override != nullptr && *override) {
+      cardPaths[slot] = override;
+      Log.info("Card {} path from the environment: {}", slot == 0 ? 'A' : 'B', override);
+    }
+  }
 }
 
 void CARDSetLoadType(CARDFileType type) { SelectedFileType = type; }
