@@ -37,6 +37,8 @@ extern "C" void Android_UnlockActivityMutex(void);
 #ifdef MELEE_MIYOO_FLIP
 // Degrees the application's present worker rotates each frame onto the panel (portrait-mounted panels).
 extern "C" int MeleeFlipRotation();
+// The SDL window the application's display code already created, or null when Aurora should make one.
+extern "C" SDL_Window* MeleeFlipSdlWindow();
 #endif
 
 #include "rmlui.hpp"
@@ -48,6 +50,7 @@ namespace {
 constexpr Module Log{"aurora::window"};
 
 SDL_Window* g_window;
+bool g_windowExternal = false; // g_window belongs to the application, not to Aurora
 SDL_Renderer* g_renderer;
 float g_frameBufferScale = 0.f;
 bool g_frameBufferAspectFit = false;
@@ -323,6 +326,16 @@ const AuroraEvent* poll_events() {
 }
 
 bool create_window(AuroraBackend backend) {
+#ifdef MELEE_MIYOO_FLIP
+  // The application's display code may already own the SDL window (it created it to set up its
+  // presentation path before Aurora started). Reuse it: on CFW display stacks reached through an
+  // SDL2 shim, a second window is not guaranteed to exist, and events must target the real one.
+  if (SDL_Window* external = MeleeFlipSdlWindow(); external != nullptr) {
+    g_window = external;
+    g_windowExternal = true;
+    return true;
+  }
+#endif
   SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
@@ -400,8 +413,11 @@ void destroy_window() {
     g_renderer = nullptr;
   }
   if (g_window != nullptr) {
-    SDL_DestroyWindow(g_window);
+    if (!g_windowExternal) {
+      SDL_DestroyWindow(g_window);
+    }
     g_window = nullptr;
+    g_windowExternal = false;
   }
 }
 
