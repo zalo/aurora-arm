@@ -279,6 +279,12 @@ uint64_t aurora_render_stats_fifo_process_ns(void);
 uint64_t aurora_render_stats_render_worker_busy_ns(void);
 uint64_t aurora_render_stats_pipeline_wait_ns(void);
 uint64_t aurora_render_stats_pipeline_wait_count(void);
+/*
+ * Non-NULL once the GL driver probe found a driver that drops draws and switched the renderer to per-draw
+ * texture-fetch barriers (correct but several times slower): the user-facing notice Aurora also draws on
+ * screen. Lets the application log or report the degraded mode. NULL on other backends and healthy drivers.
+ */
+const char* aurora_gl_driver_notice(void);
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();

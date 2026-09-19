@@ -245,7 +245,10 @@ const AuroraEvent* update() noexcept {
 }
 
 #ifdef AURORA_ENABLE_GX
-// The GL driver probe (gfx/gles_direct.hpp) found a driver bug: show its notice over the game for a while.
+// The GL driver probe (gfx/gles_direct.hpp) found a driver bug: show its full notice over the game for a
+// while (it trips a few seconds after launch, during the intro movie), then keep a one-line banner at the
+// bottom edge for the rest of the run so the slow, worked-around rendering is never mistaken for the port's
+// normal speed.
 void draw_driver_notice() noexcept {
   static constexpr double NoticeSeconds = 20.0;
   static std::chrono::steady_clock::time_point shownSince{};
@@ -257,17 +260,24 @@ void draw_driver_notice() noexcept {
   if (shownSince == std::chrono::steady_clock::time_point{}) {
     shownSince = now;
   }
-  if (std::chrono::duration<double>(now - shownSince).count() > NoticeSeconds) {
+  const ImVec2 display = ImGui::GetIO().DisplaySize;
+  constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                         ImGuiWindowFlags_NoNav;
+  if (std::chrono::duration<double>(now - shownSince).count() <= NoticeSeconds) {
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.06f), ImGuiCond_Always, ImVec2(0.5f, 0.f));
+    ImGui::SetNextWindowSize(ImVec2(display.x * 0.9f, 0.f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    if (ImGui::Begin("##driver-notice", nullptr, flags)) {
+      ImGui::TextWrapped("%s", notice);
+    }
+    ImGui::End();
     return;
   }
-  const ImVec2 display = ImGui::GetIO().DisplaySize;
-  ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.06f), ImGuiCond_Always, ImVec2(0.5f, 0.f));
-  ImGui::SetNextWindowSize(ImVec2(display.x * 0.9f, 0.f), ImGuiCond_Always);
-  ImGui::SetNextWindowBgAlpha(0.85f);
-  if (ImGui::Begin("##driver-notice", nullptr,
-                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
-                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
-    ImGui::TextWrapped("%s", notice);
+  ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y - 2.f), ImGuiCond_Always, ImVec2(0.5f, 1.f));
+  ImGui::SetNextWindowBgAlpha(0.6f);
+  if (ImGui::Begin("##driver-banner", nullptr, flags | ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::TextUnformatted(gfx::gles_direct::driver_banner());
   }
   ImGui::End();
 }
@@ -597,12 +607,14 @@ uint64_t aurora_render_stats_fifo_process_ns() { return aurora::gx::fifo::proces
 uint64_t aurora_render_stats_render_worker_busy_ns() { return aurora::gfx::render_worker::busy_ns(); }
 uint64_t aurora_render_stats_pipeline_wait_ns() { return aurora::gfx::pipeline_wait_ns(); }
 uint64_t aurora_render_stats_pipeline_wait_count() { return aurora::gfx::pipeline_wait_count(); }
+const char* aurora_gl_driver_notice() { return aurora::gfx::gles_direct::driver_notice(); }
 #else
 uint64_t aurora_render_stats_fifo_wait_ns() { return 0; }
 uint64_t aurora_render_stats_fifo_process_ns() { return 0; }
 uint64_t aurora_render_stats_render_worker_busy_ns() { return 0; }
 uint64_t aurora_render_stats_pipeline_wait_ns() { return 0; }
 uint64_t aurora_render_stats_pipeline_wait_count() { return 0; }
+const char* aurora_gl_driver_notice() { return nullptr; }
 #endif
 const AuroraEvent* aurora_update() { return aurora::update(); }
 bool aurora_begin_frame() { return aurora::begin_frame(); }

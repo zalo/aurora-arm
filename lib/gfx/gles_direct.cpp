@@ -57,9 +57,11 @@ namespace {
 extern std::atomic_bool sSceneOnSurfaceBlocked;
 extern std::atomic_bool sDriverNoticeReady;
 extern std::string sDriverNotice;
+extern std::string sDriverBanner;
 } // namespace
 bool scene_on_surface_allowed() noexcept { return !sSceneOnSurfaceBlocked; }
 const char* driver_notice() noexcept { return sDriverNoticeReady ? sDriverNotice.c_str() : nullptr; }
+const char* driver_banner() noexcept { return sDriverNoticeReady ? sDriverBanner.c_str() : nullptr; }
 
 void configure(wgpu::BackendType backend) {
   auto& config = g_config;
@@ -1300,6 +1302,7 @@ DriverProbe sProbe;
 constexpr uint32_t ProbeMinDraws = 8;
 constexpr uint64_t ProbeSpacingFrames = 20;
 std::string sDriverNotice;
+std::string sDriverBanner;
 std::atomic_bool sDriverNoticeReady = false;
 
 void release_probe_target() {
@@ -1410,6 +1413,8 @@ void probe_driver(const PassPlan& plan, uint32_t passIndex) {
                       (slow ? ", so the game runs slowly." : ".") +
                       " Updating the GPU driver restores correct, full-speed rendering.\n\nDriver: " +
                       (version != nullptr ? version : "unknown");
+      sDriverBanner = slow ? "GPU driver bug: workaround active, rendering slowly. Update the GPU driver for full speed."
+                           : "GPU driver bug: workaround active. Update the GPU driver.";
       sDriverNoticeReady = true;
       finished = true;
     } else if (--policy.probes == 0) {
@@ -1789,6 +1794,7 @@ void shutdown() {
 namespace {
 std::atomic_bool sSceneOnSurfaceBlocked = false;
 std::string sDriverNotice;
+std::string sDriverBanner;
 std::atomic_bool sDriverNoticeReady = false;
 } // namespace
 bool encode_pass_resources(const wgpu::RenderPassEncoder&, detail::RenderPass& pass, std::string_view label) {
