@@ -607,6 +607,9 @@ uint64_t aurora_render_stats_fifo_process_ns() { return aurora::gx::fifo::proces
 uint64_t aurora_render_stats_render_worker_busy_ns() { return aurora::gfx::render_worker::busy_ns(); }
 uint64_t aurora_render_stats_pipeline_wait_ns() { return aurora::gfx::pipeline_wait_ns(); }
 uint64_t aurora_render_stats_pipeline_wait_count() { return aurora::gfx::pipeline_wait_count(); }
+// Total render pipelines created this session. The cache never evicts them at run time, so a growing
+// value is a candidate for the long-session out-of-memory kill on low-RAM devices.
+uint64_t aurora_render_stats_created_pipelines() { return aurora::gfx::detail::resources().stats.createdPipelines; }
 const char* aurora_gl_driver_notice() { return aurora::gfx::gles_direct::driver_notice(); }
 #else
 uint64_t aurora_render_stats_fifo_wait_ns() { return 0; }
@@ -614,6 +617,7 @@ uint64_t aurora_render_stats_fifo_process_ns() { return 0; }
 uint64_t aurora_render_stats_render_worker_busy_ns() { return 0; }
 uint64_t aurora_render_stats_pipeline_wait_ns() { return 0; }
 uint64_t aurora_render_stats_pipeline_wait_count() { return 0; }
+uint64_t aurora_render_stats_created_pipelines() { return 0; }
 const char* aurora_gl_driver_notice() { return nullptr; }
 #endif
 const AuroraEvent* aurora_update() { return aurora::update(); }

@@ -279,6 +279,7 @@ uint64_t aurora_render_stats_fifo_process_ns(void);
 uint64_t aurora_render_stats_render_worker_busy_ns(void);
 uint64_t aurora_render_stats_pipeline_wait_ns(void);
 uint64_t aurora_render_stats_pipeline_wait_count(void);
+uint64_t aurora_render_stats_created_pipelines(void);
 /*
  * Non-NULL once the GL driver probe found a driver that drops draws and switched the renderer to per-draw
  * texture-fetch barriers (correct but several times slower): the user-facing notice Aurora also draws on
