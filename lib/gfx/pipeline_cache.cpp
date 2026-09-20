@@ -16,11 +16,14 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <thread>
 
 #include <SDL3/SDL_iostream.h>
@@ -1138,14 +1141,46 @@ namespace detail::testing {
 void suppress_pipeline_creation(bool suppress) noexcept { g_suppressPipelineCreation = suppress; }
 } // namespace detail::testing
 
+// Some OpenGL drivers crash when a render pipeline (and its GL program) is created on the pipeline
+// compilation thread's context and then bound on the main thread's context: their cross-context
+// object sharing is unsafe. Compiling on the main thread instead trades a brief hitch when new
+// shaders first appear (e.g. entering a match) for not crashing. AURORA_PIPELINE_SYNC forces the
+// choice either way (1 = main thread, 0 = worker thread); with it unset, the driver is autodetected.
+static bool string_view_contains(const wgpu::StringView& s, std::string_view needle) {
+  if (s.IsUndefined() || s.data == nullptr) {
+    return false;
+  }
+  size_t length = s.length;
+  // Guard against the "null-terminated" sentinel and stray lengths before making a view.
+  if (length > 4096) {
+    const void* terminator = std::memchr(s.data, '\0', 4096);
+    length = terminator != nullptr ? static_cast<size_t>(static_cast<const char*>(terminator) - s.data) : 4096;
+  }
+  return std::string_view(s.data, length).find(needle) != std::string_view::npos;
+}
+
+static bool synchronous_pipeline_compilation() {
+  if (const char* value = std::getenv("AURORA_PIPELINE_SYNC")) {
+    return value[0] != '\0' && value[0] != '0';
+  }
+  // Broadcom V3D (Raspberry Pi, Mesa) is the known crasher: it segfaults in libgallium at match
+  // start when the main thread binds a program the worker thread compiled. The device string reads
+  // e.g. "V3D 7.1.10.2"; the driver description carries "V3D" as well on some Mesa builds.
+  return string_view_contains(webgpu::g_adapterInfo.device, "V3D") ||
+         string_view_contains(webgpu::g_adapterInfo.vendor, "V3D") ||
+         string_view_contains(webgpu::g_adapterInfo.description, "V3D");
+}
+
 void initialize_pipeline_cache() {
   g_pipelineCacheBroken = false;
   g_pipelineCacheWriterStop = false;
   g_pipelineThreadEnd = false;
   g_gpuCachePrunePending = false;
 
-  if (webgpu::g_backendType == wgpu::BackendType::WebGPU) {
+  if (webgpu::g_backendType == wgpu::BackendType::WebGPU || synchronous_pipeline_compilation()) {
+    // Main-thread compilation: WebGPU already serializes it, and the fragile GL drivers above must.
     g_hasPipelineThread = false;
+    Log.info("Pipeline compilation runs on the main thread (synchronous)");
   } else {
     g_hasPipelineThread = true;
     g_pipelineThread = std::thread(pipeline_worker);
