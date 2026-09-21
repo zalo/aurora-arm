@@ -151,6 +151,8 @@ GLuint sVao = 0;
 GLuint sClearProgram = 0;
 GLuint sPassEbo = 0;
 uint32_t sEnabledAttributes = 0;
+bool sRecordAttribEnabled = false; // vertex location RecordLocation (binding 1) currently enabled
+GLuint sLastRecordBuffer = Unknown; // GL buffer currently bound to vertex binding 1 (resident records)
 uint64_t sFrameNumber = 0;
 
 // Per-frame GL call counts (renderStats, [gles-direct-gl-calls]).
@@ -207,6 +209,21 @@ GLuint resident_gl_buffer(uint32_t arena) {
   uint64_t size = 0;
   const auto& buffer = gx::resident::arena_buffer(arena - 1, size);
   // The arena buffer is replaced when it grows; look the GL name up again then.
+  if (entry.buffer != buffer.Get() || entry.name == 0) {
+    entry.buffer = buffer.Get();
+    entry.name = buffer ? dawn::native::opengl::GetGLInteropBuffer(buffer.Get()) : 0;
+  }
+  return entry.name;
+}
+// Per-arena per-vertex record buffer (AuroraConfig::residentRecords), bound as vertex binding 1.
+std::vector<ResidentArenaGL> sResidentRecordGL;
+GLuint record_gl_buffer(uint32_t arena) {
+  if (sResidentRecordGL.size() < arena) {
+    sResidentRecordGL.resize(arena);
+  }
+  auto& entry = sResidentRecordGL[arena - 1];
+  uint64_t size = 0;
+  const auto& buffer = gx::resident::record_buffer(arena - 1, size);
   if (entry.buffer != buffer.Get() || entry.name == 0) {
     entry.buffer = buffer.Get();
     entry.name = buffer ? dawn::native::opengl::GetGLInteropBuffer(buffer.Get()) : 0;
@@ -951,10 +968,53 @@ void bind_draw_resources(const gx::DrawData& d, PreparedPipeline& p) {
       sBindingDivisor = divisor;
     }
     }
+    // Binding 1: per-vertex resident record index (AuroraConfig::residentRecords variant). Fetched with the
+    // same index as binding 0, so a merged resident draw can mix records within one uniform window.
+    const bool wantRecords = d.residentArena != 0 && p.config.shaderConfig.residentRecords;
+    if (wantRecords) {
+      const GLuint recordBuf = record_gl_buffer(d.residentArena);
+      if (vertex_attrib_pointers()) {
+        // Diagnostic client-array path: no persistent binding state, so reconfigure every draw.
+        glBindBuffer(GL_ARRAY_BUFFER, recordBuf);
+        glVertexAttribIPointer(gx::RecordLocation, 1, GL_UNSIGNED_INT, sizeof(uint32_t), nullptr);
+        glVertexAttribDivisor(gx::RecordLocation, 0);
+        glEnableVertexAttribArray(gx::RecordLocation);
+        sRecordAttribEnabled = true;
+        sLastVertexBuffer = Unknown; // GL_ARRAY_BUFFER moved; force binding 0 to rebind next draw
+        ++sGlCalls.vbos;
+      } else {
+        // Binding-path: the format/binding are persistent VAO state and the buffer rarely changes (one
+        // record buffer per arena), so only reconfigure on a real change — a per-draw rebind of binding 1
+        // costs a descriptor rebuild on this Mali and would erase the merge's savings.
+        if (!sRecordAttribEnabled) {
+          glVertexAttribIFormat(gx::RecordLocation, 1, GL_UNSIGNED_INT, 0);
+          glVertexAttribBinding(gx::RecordLocation, 1);
+          glEnableVertexAttribArray(gx::RecordLocation);
+          sRecordAttribEnabled = true;
+        }
+        if (sLastRecordBuffer != recordBuf) {
+          glBindVertexBuffer(1, recordBuf, 0, static_cast<GLsizei>(sizeof(uint32_t)));
+          sLastRecordBuffer = recordBuf;
+          ++sGlCalls.vbos;
+        }
+      }
+    } else if (sRecordAttribEnabled) {
+      // RecordLocation aliases v_line_end (15). If this draw legitimately uses that location from binding 0
+      // (a line draw), the binding-0 setup above already configured and enabled it — leave it alone; only
+      // tear the record attribute down when nothing else claims the location this draw.
+      if ((used & (1u << gx::RecordLocation)) == 0) {
+        glDisableVertexAttribArray(gx::RecordLocation);
+      }
+      sRecordAttribEnabled = false;
+      sLastRecordBuffer = Unknown; // location 15 / binding 1 state no longer ours; reconfigure on re-entry
+    }
   }
   if (p.immediates >= 0) {
-    // Batched shaders read only _pad (record base): streamed draws pass 0, resident draws their record.
-    const uint32_t pad = d.residentArena != 0 ? gx::uniform_record_index(d.uniformRange.offset) : 0;
+    // Batched shaders read only _pad (record base): streamed draws pass 0, resident draws their record — but
+    // the residentRecords variant reads the record per-vertex (binding 1), so it passes 0.
+    const uint32_t pad = (d.residentArena != 0 && !p.config.shaderConfig.residentRecords)
+                             ? gx::uniform_record_index(d.uniformRange.offset)
+                             : 0;
     if (!p.immediatesUnused || p.lastImmediatePad != pad) {
       auto immediates = d.immediateData;
       immediates._pad = pad;

@@ -16,6 +16,11 @@ struct Arena {
   u32 stride = 0;
   size_t used = 0; // bytes decoded so far
   std::vector<gfx::ArenaUpload> pending;
+  // Per-vertex uniform record indices for AuroraConfig::residentRecords (one u32 per arena vertex), and the
+  // [min, max] vertex range written this frame so only that slice is uploaded.
+  std::vector<u32> records;
+  u32 recordMin = UINT32_MAX;
+  u32 recordMax = 0;
 };
 
 struct Cache {
@@ -284,6 +289,41 @@ std::vector<gfx::ArenaUpload> take_uploads() {
       uploads.push_back(std::move(upload));
     }
     arena.pending.clear();
+  }
+  return uploads;
+}
+
+void set_record(u32 arena, u32 firstVertex, u32 vertexCount, u32 record) noexcept {
+  auto& arenas = cache().arenas;
+  if (arena >= arenas.size() || vertexCount == 0) {
+    return;
+  }
+  auto& a = arenas[arena];
+  const u32 end = firstVertex + vertexCount;
+  if (a.records.size() < end) {
+    a.records.resize(end);
+  }
+  for (u32 v = firstVertex; v < end; ++v) {
+    a.records[v] = record;
+  }
+  a.recordMin = std::min(a.recordMin, firstVertex);
+  a.recordMax = std::max(a.recordMax, end - 1);
+}
+
+std::vector<gfx::ArenaUpload> take_record_uploads() {
+  std::vector<gfx::ArenaUpload> uploads;
+  for (u32 i = 0; i < cache().arenas.size(); ++i) {
+    auto& a = cache().arenas[i];
+    if (a.recordMin > a.recordMax) {
+      continue;
+    }
+    const u32 count = a.recordMax - a.recordMin + 1;
+    gfx::ArenaUpload upload{.arena = i, .offset = a.recordMin * static_cast<u32>(sizeof(u32))};
+    upload.data.resize(static_cast<size_t>(count) * sizeof(u32));
+    std::memcpy(upload.data.data(), a.records.data() + a.recordMin, upload.data.size());
+    uploads.push_back(std::move(upload));
+    a.recordMin = UINT32_MAX;
+    a.recordMax = 0;
   }
   return uploads;
 }

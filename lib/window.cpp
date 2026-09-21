@@ -501,6 +501,18 @@ AuroraWindowSize get_window_size() {
       fb_h = fitH;
     }
   }
+  // Internal render-resolution divisor (AuroraConfig::renderScale): shrink the scene/EFB framebuffer only;
+  // native_fb_* (the presented surface) is left at full resolution and present upscales the smaller EFB.
+  // 0 = auto: quarter-res only when the presented surface is >=1080p, so high-res panels (desktop/TV, e.g. a
+  // Raspberry Pi on a 1080p/4K monitor) get the fill/present relief while low-res CFW handhelds stay full-res.
+  int scaleDiv = static_cast<int>(g_config.renderScale);
+  if (scaleDiv == 0) {
+    scaleDiv = (native_fb_w >= 1920 || native_fb_h >= 1080) ? 4 : 1;
+  }
+  if (scaleDiv > 1) {
+    fb_w = std::max(1, fb_w / scaleDiv);
+    fb_h = std::max(1, fb_h / scaleDiv);
+  }
 
   const float scale = SDL_GetWindowDisplayScale(g_window);
   return {

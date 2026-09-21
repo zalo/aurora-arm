@@ -306,6 +306,7 @@ FrameOp capture_frame_op(FramePacket& frame, FrameOpType type, uint32_t index) {
     op.textureUploads.push_back(&frame.textureUploads[i]);
   }
   op.arenaUploads = gx::resident::take_uploads();
+  op.recordUploads = gx::resident::take_record_uploads();
   return op;
 }
 

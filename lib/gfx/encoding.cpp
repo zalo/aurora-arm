@@ -469,6 +469,7 @@ namespace detail {
 void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
   copy_staging_to_high_water(cmd, frame, op);
   gx::resident::encode_uploads(cmd, op.arenaUploads);
+  gx::resident::encode_record_uploads(cmd, op.recordUploads);
   switch (op.type) {
   case FrameOpType::RenderPass:
     if (op.renderPass != nullptr) {

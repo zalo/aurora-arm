@@ -935,7 +935,14 @@ void apply_uniform_table(std::string& source, const ShaderConfig& config) {
                       UniformRecordStride, UniformRecordsPerWindow));
   replace("ubuf.", "uniform_table[record_index].value.");
   replace("struct VertexOutput {", "var<private> record_index: u32;\nstruct VertexOutput {");
-  if (config.batchDraws) {
+  if (config.residentRecords) {
+    // Resident variant: the per-vertex record index rides a dedicated vertex input (binding 1); imm._pad is 0.
+    replace("var out: VertexOutput;",
+            fmt::format("var out: VertexOutput;\n    record_index = (v_record & {0}u) + (imm._pad & {0}u);\n    "
+                        "out.record = record_index;", UniformRecordsPerWindow - 1));
+    replace("fn fs_main(in: VertexOutput) -> @location(0) vec4f {",
+            "fn fs_main(in: VertexOutput) -> @location(0) vec4f {\n    record_index = in.record;");
+  } else if (config.batchDraws) {
     replace("var out: VertexOutput;",
             fmt::format("var out: VertexOutput;\n    record_index = ((v_matrices.z >> 8u) & {0}u) + (imm._pad & {0}u);\n    "
                         "out.record = record_index;", UniformRecordsPerWindow - 1));
@@ -1050,6 +1057,11 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
       if (decoded_vertex_has_location(config, i)) {
         vtxInAttrs += fmt::format("{}\n    @location({}) {}", vtxInAttrs.empty() ? "" : ",", i, DecodedInputs[i]);
       }
+    }
+    if (config.residentRecords) {
+      // Resident geometry's per-vertex record index (second vertex binding); see apply_uniform_table.
+      vtxInAttrs += fmt::format("{}\n    @location({}) v_record: u32", vtxInAttrs.empty() ? "" : ",",
+                                RecordLocation);
     }
   } else {
     vtxInAttrs += "\n    @builtin(vertex_index) vidx: u32";

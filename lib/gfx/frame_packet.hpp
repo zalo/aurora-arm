@@ -205,6 +205,7 @@ struct FrameOp {
   StagingHighWater highWater;
   std::vector<const TextureUpload*> textureUploads;
   std::vector<ArenaUpload> arenaUploads;
+  std::vector<ArenaUpload> recordUploads; // AuroraConfig::residentRecords: per-frame resident record indices
 };
 
 using RenderPassList = std::deque<RenderPass>;

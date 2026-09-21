@@ -91,6 +91,8 @@ inline bool uniform_table_enabled() noexcept { return g_config.uniformTable; }
 inline bool batch_draws_enabled() noexcept {
   return g_config.batchDraws && g_config.uniformTable && g_config.cpuVertexDecode;
 }
+// Per-vertex records for resident geometry: needs the batch machinery (window binding + per-vertex record).
+inline bool resident_records_enabled() noexcept { return g_config.residentRecords && batch_draws_enabled(); }
 constexpr u32 XfRegCount = 0x58; // 0x1000-0x1057
 
 enum DirtyFlag : u8 {
@@ -520,7 +522,7 @@ struct ShaderConfig {
   u8 uniformTable : 1 = false;    // the record is indexed within a 64 KiB uniform window (uniformTable)
   u8 batchDraws : 1 = false;      // the record index comes from the vertex matrix word (batchDraws)
   u8 spriteAccumulate : 1 = false; // half-resolution sprite pass variant: premultiplied accumulation blend
-  u8 pad1 : 1 = 0;
+  u8 residentRecords : 1 = false;  // resident variant: per-vertex record from binding 1 (AuroraConfig::residentRecords)
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;

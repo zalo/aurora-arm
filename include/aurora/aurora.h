@@ -253,6 +253,28 @@ typedef struct {
    * into a small reflection every frame.
    */
   uint32_t smallCopyPassInterval;
+
+  /*
+   * Give resident display-list geometry a per-vertex uniform record index (requires batchDraws) so that
+   * consecutive resident draws which differ only in their uniform record merge into one draw call, the same
+   * way streamed geometry already does. The record travels in a per-arena, per-frame u32 buffer bound as a
+   * second vertex binding (the arena's decoded vertices are shared across frames and cannot hold the
+   * per-frame record). A resident display list drawn more than once in a frame falls back to the per-draw
+   * record path for its later draws. Off by default. Measured on a Mali-G31: resident stage geometry with
+   * ~376 distinct records collapses toward ~96 (one per uniform window).
+   */
+  bool residentRecords;
+
+  /*
+   * Internal render-resolution divisor: render the 3D scene / EFB at (window framebuffer / renderScale) and
+   * upscale to the full window on present. 0 = auto (quarter-res when the presented surface is >=1080p, else
+   * native); 1 = native; 2 = half (quarter the fragment work); 4 = quarter (a sixteenth). The presented
+   * surface, HUD present pass and letterboxing stay at native resolution; only the scene's fragment shading
+   * is reduced. Helps fill/present-bound GPUs at high panel resolutions (an Adreno at 1080p, or a Raspberry
+   * Pi V3D on a 1080p/4K monitor) while leaving low-res CFW handhelds full-res. The game's logical 640x480
+   * framebuffer is unchanged, so geometry still maps correctly.
+   */
+  uint32_t renderScale;
 } AuroraConfig;
 
 typedef struct {

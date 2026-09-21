@@ -18,6 +18,7 @@
 #include "vertex_loader.hpp"
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
@@ -621,8 +622,47 @@ struct BatchStats {
   uint64_t record = 0;
   uint64_t limit = 0;
   uint64_t gap = 0;
+  uint64_t distinct = 0; // summed count of distinct merge-key tuples seen per frame (floor with perfect reorder)
+  uint64_t residentRecords = 0; // summed distinct resident uniform-record offsets per frame
+  uint64_t residentWindows = 0; // summed distinct resident uniform-window indices per frame
 };
 BatchStats sBatchStats;
+// Per-frame distinct resident record offsets / window indices. If records ≈ windows, sorting resident draws
+// by record merges them (few records interleaved); if records >> windows, per-vertex records are needed.
+static absl::flat_hash_set<uint32_t> sFrameResidentRecords;
+static absl::flat_hash_set<uint32_t> sFrameResidentWindows;
+// Per-frame set of distinct merge keys (pipeline, texture, dstAlpha, fog, window). Reset each frame in
+// clear_draw_cache; a new key bumps sBatchStats.distinct, so distinct/frames is the drawcall floor a
+// record-time reorder could reach for this scene.
+static absl::flat_hash_set<uint64_t> sFrameDrawKeys;
+
+// Pipeline-variance analysis: the distinct PipelineConfigs seen over a 300-frame window. At print time a
+// leave-one-field-out pass reports how many distinct pipelines survive if each config group is canonicalised
+// away, so a small collapse means the group barely varies and a large collapse means generalising that one
+// group (e.g. a partial ubershader over TEV) accounts for most of the variety. Keyed by full-config hash.
+static absl::flat_hash_map<uint64_t, PipelineConfig> sVariancePipelines;
+
+// Distinct configs after zeroing one field group. group: 0 none, 1 render-state (non-shader), 2 tev,
+// 3 attrs, 4 tcg, 5 color-channels, 6 alpha-compare, 7 fog, 8 ind-stages.
+static uint64_t variance_zeroed_hash(PipelineConfig c, int group) noexcept {
+  auto& s = c.shaderConfig;
+  switch (group) {
+  case 1:
+    c.depthFunc = {}; c.cullMode = {}; c.blendMode = {}; c.blendFacSrc = {}; c.blendFacDst = {};
+    c.blendOp = {}; c.dstAlpha = 0; c.polygonOffsetBits = 0; c.polygonOffsetScaleBits = 0;
+    c.polygonOffsetClampBits = 0; c.depthCompare = c.depthUpdate = c.alphaUpdate = c.colorUpdate = false;
+    break;
+  case 2: s.tevStages = {}; s.tevStageCount = 0; s.tevSwapTable = {}; break;
+  case 3: s.attrs = {}; s.vtxStride = 0; break;
+  case 4: s.tcgs = {}; break;
+  case 5: s.colorChannels = {}; break;
+  case 6: s.alphaCompare = {}; break;
+  case 7: s.fogType = 0; s.fogRangeEnabled = 0; break;
+  case 8: s.indStages = {}; s.numIndStages = 0; break;
+  default: break;
+  }
+  return aurora::xxh3_hash(c);
+}
 
 // Pipeline variant for point draws recorded into the half-resolution sprite pass: same shader, premultiplied
 // accumulation blend (ShaderConfig::spriteAccumulate).
@@ -637,6 +677,22 @@ static gfx::PipelineRef sprite_pipeline_variant(const DrawCache& cache) {
   memo.emplace(cache.pipelineRef, ref);
   return ref;
 }
+
+// Resident variant (AuroraConfig::residentRecords): same shader with a per-vertex record input (binding 1).
+static gfx::PipelineRef resident_records_variant(const DrawCache& cache) {
+  static absl::flat_hash_map<gfx::PipelineRef, gfx::PipelineRef> memo;
+  if (const auto it = memo.find(cache.pipelineRef); it != memo.end()) {
+    return it->second;
+  }
+  auto variant = cache.config;
+  variant.shaderConfig.residentRecords = true;
+  const auto ref = gfx::pipeline_ref(variant);
+  memo.emplace(cache.pipelineRef, ref);
+  return ref;
+}
+// First-draw-this-frame set for resident entries; a repeated entry falls back to the exact-record path so it
+// never clobbers the shared per-arena record buffer. Cleared each frame in clear_draw_cache.
+static absl::flat_hash_set<uint64_t> sResidentDrawnEntries;
 
 static void batch_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, std::span<const u8> vertexData,
                        std::span<const u8> indexData) noexcept {
@@ -662,6 +718,20 @@ static void batch_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, std::span<c
 
   auto& stats = sBatchStats;
   ++stats.attempts;
+  if (g_config.renderStats) {
+    uint64_t key = static_cast<uint64_t>(drawPipeline) * 0x9E3779B97F4A7C15ull;
+    key ^= static_cast<uint64_t>(cache.bindGroups.textureBindGroup) + 0x165667B19E3779F9ull + (key << 6) + (key >> 2);
+    key ^= static_cast<uint64_t>(state.dstAlpha) + 0x9E3779B97F4A7C15ull + (key << 6) + (key >> 2);
+    key ^= static_cast<uint64_t>(immediates.fogRangeBase) + 0x27D4EB2F165667C5ull + (key << 6) + (key >> 2);
+    key ^= static_cast<uint64_t>(uniform_window_index(cache.uniformRange.offset)) + 0x2545F4914F6CDD1Dull + (key << 6) + (key >> 2);
+    if (sFrameDrawKeys.insert(key).second) {
+      ++stats.distinct;
+    }
+    if (sVariancePipelines.size() < 4096) {
+      const uint64_t cfgHash = aurora::xxh3_hash(cache.config);
+      sVariancePipelines.try_emplace(cfgHash, cache.config);
+    }
+  }
   auto* previous = gfx::get_last_draw_command<DrawData>();
   bool merge = false;
   // Same pipeline implies the same primitive class, so a point draw only ever meets a point draw here.
@@ -928,17 +998,36 @@ static void push_resident_draw(const resident::Entry& entry, GXVtxFmt fmt) noexc
     prepare_draw_state(GX_TRIANGLES, fmt, immediates);
     auto& stats = sBatchStats;
     ++stats.attempts;
+    if (g_config.renderStats) {
+      if (sFrameResidentRecords.insert(cache.uniformRange.offset).second) {
+        ++stats.residentRecords;
+      }
+      if (sFrameResidentWindows.insert(uniform_window_index(cache.uniformRange.offset)).second) {
+        ++stats.residentWindows;
+      }
+    }
+    // Resident per-vertex records: only the first draw of an entry in a frame writes the shared record
+    // buffer; a repeated entry falls back to the exact-record path so it cannot clobber that buffer.
+    const uint64_t entryKey = (static_cast<uint64_t>(arena) << 32) | entry.firstVertex;
+    const bool useRecords = resident_records_enabled() && sResidentDrawnEntries.insert(entryKey).second;
+    const gfx::PipelineRef drawPipeline = useRecords ? resident_records_variant(cache) : cache.pipelineRef;
+    if (useRecords) {
+      resident::set_record(entry.arena, entry.firstVertex, entry.vertexCount,
+                           uniform_record_index(cache.uniformRange.offset));
+    }
     auto* lastDraw = gfx::get_last_draw_command<DrawData>();
     bool merge = false;
     if (lastDraw == nullptr) {
       ++stats.noPrevious;
     } else if (lastDraw->residentArena != arena || lastDraw->instanceCount != 1) {
       ++stats.kind;
-    } else if (lastDraw->pipeline != cache.pipelineRef) {
+    } else if (lastDraw->pipeline != drawPipeline) {
       ++stats.pipeline;
     } else if (lastDraw->bindGroups.textureBindGroup != cache.bindGroups.textureBindGroup) {
       ++stats.texture;
-    } else if (lastDraw->uniformRange.offset != cache.uniformRange.offset) {
+    } else if (useRecords ? (uniform_window_index(lastDraw->uniformRange.offset) !=
+                             uniform_window_index(cache.uniformRange.offset))
+                          : (lastDraw->uniformRange.offset != cache.uniformRange.offset)) {
       ++stats.record;
     } else if (lastDraw->dstAlpha != state.dstAlpha) {
       ++stats.dstAlpha;
@@ -964,7 +1053,7 @@ static void push_resident_draw(const resident::Entry& entry, GXVtxFmt fmt) noexc
       return;
     }
     gfx::push_draw_command(DrawData{
-        .pipeline = cache.pipelineRef,
+        .pipeline = drawPipeline,
         .vertRange = vertRange,
         .idxRange = idxRange,
         .uniformRange = cache.uniformRange,
@@ -1293,16 +1382,38 @@ void clear_draw_cache() noexcept {
       const auto& s = sBatchStats;
       std::fprintf(stderr,
                    "[gx-batch] frames=300 attempts=%llu merged=%llu no-previous=%llu kind=%llu pipeline=%llu "
-                   "texture=%llu dst-alpha=%llu fog=%llu window=%llu record=%llu limit=%llu gap=%llu\n",
+                   "texture=%llu dst-alpha=%llu fog=%llu window=%llu record=%llu limit=%llu gap=%llu distinct/f=%.1f "
+                   "res-records/f=%.1f res-windows/f=%.1f\n",
                    static_cast<unsigned long long>(s.attempts), static_cast<unsigned long long>(s.merged),
                    static_cast<unsigned long long>(s.noPrevious), static_cast<unsigned long long>(s.kind),
                    static_cast<unsigned long long>(s.pipeline), static_cast<unsigned long long>(s.texture),
                    static_cast<unsigned long long>(s.dstAlpha), static_cast<unsigned long long>(s.fog),
                    static_cast<unsigned long long>(s.window), static_cast<unsigned long long>(s.record),
-                   static_cast<unsigned long long>(s.limit), static_cast<unsigned long long>(s.gap));
+                   static_cast<unsigned long long>(s.limit), static_cast<unsigned long long>(s.gap),
+                   s.distinct / 300.0, s.residentRecords / 300.0, s.residentWindows / 300.0);
       sBatchStats = {};
+      // Leave-one-field-out: distinct pipeline count when each group is canonicalised. Smallest survivor =
+      // the single generalisation that collapses the most pipelines (base is the full distinct count).
+      uint32_t loo[9] = {0};
+      absl::flat_hash_set<uint64_t> tmp;
+      for (int g = 0; g < 9; ++g) {
+        tmp.clear();
+        for (const auto& [h, cfg] : sVariancePipelines) {
+          tmp.insert(variance_zeroed_hash(cfg, g));
+        }
+        loo[g] = static_cast<uint32_t>(tmp.size());
+      }
+      std::fprintf(stderr,
+                   "[gx-variance] pipelines=%zu | ignore render-state=%u tev=%u attrs=%u tcg=%u colch=%u "
+                   "alpha=%u fog=%u ind=%u\n",
+                   sVariancePipelines.size(), loo[1], loo[2], loo[3], loo[4], loo[5], loo[6], loo[7], loo[8]);
+      sVariancePipelines.clear();
     }
   }
+  sFrameDrawKeys.clear();
+  sFrameResidentRecords.clear();
+  sFrameResidentWindows.clear();
+  sResidentDrawnEntries.clear();
   sDrawCache.bindGeneration = 0;
   sDrawCache.uniformRange = {};
   sDrawCache.fogRange = {};

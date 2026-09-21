@@ -39,6 +39,11 @@
 namespace aurora::gx {
 
 constexpr u32 MaxDecodedVertexAttrs = 16;
+// Per-vertex uniform record index for resident geometry (AuroraConfig::residentRecords): a u32 on a second
+// vertex binding. It reuses location 15 (v_line_end), which is only ever present for GX_LINES/GX_LINESTRIP;
+// resident geometry is always triangles (the resident cache rejects lineMode != 0), so the two never
+// coexist. GL_MAX_VERTEX_ATTRIBS is 16 on the target Mali blobs, so a 17th location (16) fails to link.
+constexpr u32 RecordLocation = 15;
 // Size of a record with every location present.
 constexpr u32 MaxDecodedVertexStride = 12 + 12 + 12 + 16 * 2 + 8 * 8 + 12 + 12 + 16;
 

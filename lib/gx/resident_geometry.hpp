@@ -86,6 +86,12 @@ Stats& stats() noexcept;
 
 // Bytes decoded since the previous call, for the frame op about to be recorded.
 std::vector<gfx::ArenaUpload> take_uploads();
+
+// AuroraConfig::residentRecords: record the per-vertex uniform record index for a resident draw's vertex
+// range this frame (arena/firstVertex/vertexCount from its Entry). Written on the FIFO thread.
+void set_record(u32 arena, u32 firstVertex, u32 vertexCount, u32 record) noexcept;
+// The per-frame record slice per arena, for the frame op about to be recorded (mirrors take_uploads).
+std::vector<gfx::ArenaUpload> take_record_uploads();
 // Frame boundary (processor idle): performs a reset requested by an over-budget decode.
 void end_frame() noexcept;
 // Every index entry names an existing entry that depends on its pointer, and each dependency is
@@ -97,6 +103,9 @@ void shutdown() noexcept;
 void encode_uploads(wgpu::CommandEncoder& encoder, const std::vector<gfx::ArenaUpload>& uploads);
 // Buffer of an arena (null before its first upload) and its size in bytes.
 const wgpu::Buffer& arena_buffer(u32 arena, uint64_t& size) noexcept;
+// AuroraConfig::residentRecords: per-frame upload / binding of the per-arena record-index buffer.
+void encode_record_uploads(wgpu::CommandEncoder& encoder, const std::vector<gfx::ArenaUpload>& uploads);
+const wgpu::Buffer& record_buffer(u32 arena, uint64_t& size) noexcept;
 void release_buffers() noexcept;
 
 } // namespace aurora::gx::resident
