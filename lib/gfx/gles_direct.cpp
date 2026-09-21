@@ -1036,6 +1036,7 @@ struct DrawBarrierPolicy {
   bool flush = false;  // AURORA_GLES_DRAW_BARRIER=flush: glFlush at the end of each render pass
   // Startup driver probes left (AURORA_GLES_DRIVER_PROBE=N, 0 = none); none with an explicit barrier override.
   uint32_t probes = 0;
+  bool overridden = false; // AURORA_GLES_DRAW_BARRIER was set explicitly: never auto-probe.
 };
 // Forces a barrier after every draw while the driver probe renders its reference image.
 bool sProbeBarrier = false;
@@ -1054,6 +1055,7 @@ DrawBarrierPolicy& draw_barrier_policy() {
   if (!sBarrierPolicyResolved) {
     sBarrierPolicyResolved = true;
     const char* override = std::getenv("AURORA_GLES_DRAW_BARRIER");
+    policy.overridden = override != nullptr && *override != '\0';
     const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
     const char* surfaceOverride = std::getenv("AURORA_GLES_SCENE_ON_SURFACE");
     if (surfaceOverride != nullptr ? std::strcmp(surfaceOverride, "0") == 0
@@ -1361,6 +1363,11 @@ struct DriverProbe {
 DriverProbe sProbe;
 constexpr uint32_t ProbeMinDraws = 8;
 constexpr uint64_t ProbeSpacingFrames = 20;
+// The startup budget probes the first busy scenes; afterwards a probe still runs whenever a pass appears that
+// is materially heavier than any already cleared (sMaxProbedDraws) - a heavier scene entered later, such as
+// Fountain of Dreams, whose busy passes a driver may drop draws in even though the earlier scenes were clean.
+uint32_t sMaxProbedDraws = 0;  // draws of the heaviest pass a probe has cleared without a fault
+bool sProbingDisabled = false; // set once a fault is found (barrier on) or the probe target is unusable
 std::string sDriverNotice;
 std::string sDriverBanner;
 std::atomic_bool sDriverNoticeReady = false;
@@ -1444,6 +1451,7 @@ void probe_driver(const PassPlan& plan, uint32_t passIndex) {
   if (!bind_probe_target(plan.width, plan.height)) {
     Log.warn("Driver probe: framebuffer incomplete; probe skipped");
     finished = true;
+    sProbingDisabled = true;
   } else {
     const double plainMs = render_probe_image(plan, passIndex, false, sProbe.plain);
     const double barrierMs = render_probe_image(plan, passIndex, true, sProbe.reference);
@@ -1477,9 +1485,14 @@ void probe_driver(const PassPlan& plan, uint32_t passIndex) {
                            : "GPU driver bug: workaround active. Update the GPU driver.";
       sDriverNoticeReady = true;
       finished = true;
-    } else if (--policy.probes == 0) {
-      Log.info("Driver probe: no rendering fault found");
-      finished = true;
+      sProbingDisabled = true;
+    } else {
+      // This pass is clean on this driver. Remember it as the heaviest cleared so far, so only a still-heavier
+      // pass triggers another probe; keep watching after the startup budget is spent.
+      sMaxProbedDraws = std::max(sMaxProbedDraws, plan.draws);
+      if (policy.probes != 0 && --policy.probes == 0) {
+        Log.info("Driver probe: no fault in the first busy scenes; will re-probe any heavier scene");
+      }
     }
     sProbe.nextFrame = sFrameNumber + ProbeSpacingFrames;
   }
@@ -1772,12 +1785,22 @@ void prepare_frame(FramePacket& frame) {
   }
   // The render worker resolves the policy on the first direct pass; probes start from the frame after.
   sProbePlan = SIZE_MAX;
-  if (draw_barrier_policy_resolved() && draw_barrier_policy().probes != 0 && sFrameNumber >= sProbe.nextFrame) {
-    uint32_t most = ProbeMinDraws - 1;
-    for (size_t i = 0; i < sPlans.size(); ++i) {
-      if (sPlans[i].eligible && sPlans[i].draws > most && sPlans[i].width != 0 && sPlans[i].height != 0) {
-        most = sPlans[i].draws;
-        sProbePlan = i;
+  if (draw_barrier_policy_resolved()) {
+    auto& policy = draw_barrier_policy();
+    // Auto mode only (no explicit AURORA_GLES_DRAW_BARRIER), and only until a fault turns the barrier on.
+    if (!policy.overridden && !sProbingDisabled && sFrameNumber >= sProbe.nextFrame) {
+      uint32_t most = ProbeMinDraws - 1;
+      size_t best = SIZE_MAX;
+      for (size_t i = 0; i < sPlans.size(); ++i) {
+        if (sPlans[i].eligible && sPlans[i].draws > most && sPlans[i].width != 0 && sPlans[i].height != 0) {
+          most = sPlans[i].draws;
+          best = i;
+        }
+      }
+      // While the startup budget lasts, probe the busiest pass each spacing window; afterwards, re-probe only
+      // when the busiest pass is materially heavier than any already cleared (a heavier scene entered later).
+      if (best != SIZE_MAX && (policy.probes != 0 || most > sMaxProbedDraws + sMaxProbedDraws / 4)) {
+        sProbePlan = best;
       }
     }
   }
