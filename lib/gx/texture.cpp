@@ -677,15 +677,41 @@ size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noex
 
 size_t tlut_source_size(u16 numEntries) noexcept { return static_cast<size_t>(numEntries) * sizeof(u16); }
 
+// Content fingerprint of a texture's source bytes: small sources are hashed whole, larger ones through
+// 32 spread 64-byte samples plus the tail. The object identities below are derived from CONTENT rather
+// than the source pointer, which is what makes them stable when HSD moves the buffer between frames
+// (so a moved texture is a cache HIT instead of a fresh upload -> no per-frame RSS leak) and distinct
+// when the game frees a texture and reuses its address for different image data (so an icon/glyph no
+// longer aliases another's cached GPU texture -> no flashing/swapping, and no colliding id resolving
+// to a stale/empty texture -> no black floor).
+static uint64_t content_fingerprint(const void* data, size_t bytes) noexcept {
+  if (data == nullptr || bytes == 0) {
+    return 0;
+  }
+  constexpr size_t kSamples = 32, kSample = 64;
+  if (bytes <= kSamples * kSample) {
+    return XXH3_64bits(data, bytes);
+  }
+  const auto* p = static_cast<const uint8_t*>(data);
+  uint8_t gathered[kSamples * kSample + kSample];
+  const size_t stride = (bytes - kSample) / (kSamples - 1);
+  for (size_t i = 0; i < kSamples; ++i) {
+    std::memcpy(gathered + i * kSample, p + i * stride, kSample);
+  }
+  std::memcpy(gathered + kSamples * kSample, p + bytes - kSample, kSample);
+  return XXH3_64bits(gathered, sizeof(gathered));
+}
+
 u32 texture_object_identity(const GXTexObj_& obj) noexcept {
-  // The top byte of mode0 / mode1 is the BP register address written by GXLoadTexObj, not object state. Everything
-  // else that reaches the sampler (wrap, filters, LOD bias / clamp, anisotropy, min / max LOD) must be part of the
-  // identity: the bound-texture cache keeps the object descriptor, so two objects for the same image with different
-  // sampler state must not alias.
-  const auto address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(obj.data));
+  // Everything that reaches the sampler (wrap, filters, LOD bias / clamp, anisotropy, min / max LOD)
+  // must be part of the identity: the bound-texture cache keeps the object descriptor, so two objects
+  // for the same image with different sampler state must not alias. The image itself is identified by a
+  // content fingerprint (not obj.data's address) - see content_fingerprint above.
+  const uint64_t content =
+      content_fingerprint(obj.data, texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count()));
   const std::array<u32, 9> key{
-      static_cast<u32>(address),
-      static_cast<u32>(address >> 32),
+      static_cast<u32>(content),
+      static_cast<u32>(content >> 32),
       obj.width(),
       obj.height(),
       obj.format(),
@@ -700,10 +726,10 @@ u32 texture_object_identity(const GXTexObj_& obj) noexcept {
 }
 
 u32 tlut_object_identity(const GXTlutObj_& tlut) noexcept {
-  const auto address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tlut.data));
+  const uint64_t content = content_fingerprint(tlut.data, tlut_source_size(tlut.numEntries));
   const std::array<u32, 4> key{
-      static_cast<u32>(address),
-      static_cast<u32>(address >> 32),
+      static_cast<u32>(content),
+      static_cast<u32>(content >> 32),
       static_cast<u32>(tlut.format),
       tlut.numEntries,
   };
