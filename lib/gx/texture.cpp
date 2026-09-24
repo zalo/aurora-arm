@@ -16,6 +16,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <list>
 #include <optional>
@@ -142,7 +144,64 @@ absl::flat_hash_map<SourceKeyCacheKey, SourceKeyCacheEntry> s_sourceKeyCache;
 absl::flat_hash_map<uint64_t, absl::flat_hash_set<u32>> s_replacementUsers;
 std::list<TextureContentKey> s_contentLru;
 uint64_t s_contentCacheBytes = 0;
-uint64_t s_contentCacheBudgetBytes = texture::ContentCacheBudgetBytes;
+// Content-cache GPU budget and texture-object idle-sweep window are tunable at runtime so memory-
+// constrained CFWs (e.g. the 1 GB Miyoo Flip) can trim the GPU working set that OOM-kills heavy
+// stages like Onett. Both cap texture GPU memory: a smaller budget keeps fewer decoded textures
+// resident, and a shorter idle window stops texObj entries from pinning budget-evicted textures.
+uint64_t env_u64_or(const char* name, uint64_t fallback) noexcept {
+  if (const char* v = std::getenv(name)) {
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(v, &end, 10);
+    if (end != v && parsed > 0) {
+      return static_cast<uint64_t>(parsed);
+    }
+  }
+  return fallback;
+}
+// Best-effort device RAM (kB); 0 if it cannot be read.
+uint64_t device_mem_total_kb() noexcept {
+  uint64_t kb = 0;
+  if (FILE* f = std::fopen("/proc/meminfo", "re")) {
+    char line[256];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+      unsigned long long v = 0;
+      if (std::sscanf(line, "MemTotal: %llu kB", &v) == 1) {
+        kb = static_cast<uint64_t>(v);
+        break;
+      }
+    }
+    std::fclose(f);
+  }
+  return kb;
+}
+// On a ~1 GB handheld (Miyoo Flip, RG35XX/SP, RG351) the full 128 MB budget + 10 s idle window pins a
+// ~790 MB GPU working set that OOM-kills the game on heavy stages (Onett); measured 64 MB/2 s keeps it
+// to ~584 MB AND quadruples FPS (no memory-pressure thrashing). Scale both by RAM; env still overrides.
+uint64_t default_content_cache_mb() noexcept {
+  const uint64_t memKb = device_mem_total_kb();
+  if (memKb != 0 && memKb <= 1300000ull) {
+    return 64;
+  }
+  if (memKb != 0 && memKb <= 3000000ull) {
+    return 96;
+  }
+  return texture::ContentCacheBudgetBytes / (1024ull * 1024ull);
+}
+uint64_t default_object_idle_frames() noexcept {
+  const uint64_t memKb = device_mem_total_kb();
+  if (memKb != 0 && memKb <= 1300000ull) {
+    return 120;
+  }
+  if (memKb != 0 && memKb <= 3000000ull) {
+    return 300;
+  }
+  return texture::ObjectCacheIdleFrames;
+}
+uint64_t initial_content_cache_budget() noexcept {
+  return env_u64_or("MELEE_TEXTURE_CACHE_MB", default_content_cache_mb()) * 1024ull * 1024ull;
+}
+uint64_t s_contentCacheBudgetBytes = initial_content_cache_budget();
+uint64_t s_objectCacheIdleFrames = env_u64_or("MELEE_TEXOBJ_IDLE_FRAMES", default_object_idle_frames());
 uint64_t s_frameCount = 0;
 uint64_t s_bindGeneration = 1;
 std::atomic<uint64_t> s_pendingInvalidations = 0;
@@ -578,7 +637,7 @@ void touch_bound_texture(const GXTexObj_& obj) {
 
 void sweep_object_caches() {
   const auto expired = [](uint64_t lastUsedFrame) {
-    return s_frameCount > lastUsedFrame && s_frameCount - lastUsedFrame > texture::ObjectCacheIdleFrames;
+    return s_frameCount > lastUsedFrame && s_frameCount - lastUsedFrame > s_objectCacheIdleFrames;
   };
 
   for (auto it = s_textureObjectCaches.begin(); it != s_textureObjectCaches.end();) {
@@ -688,10 +747,16 @@ static uint64_t content_fingerprint(const void* data, size_t bytes) noexcept {
   if (data == nullptr || bytes == 0) {
     return 0;
   }
-  constexpr size_t kSamples = 32, kSample = 64;
-  if (bytes <= kSamples * kSample) {
+  // Hash the WHOLE image for the identity. GameCube textures are small (they live in ~1 MiB of TMEM),
+  // so a full XXH3 is cheap - and it is necessary: an earlier sampled fingerprint let two different
+  // large textures share a value (deterministic id collision -> wrong texture / a colliding id
+  // resolving to an empty texture, e.g. the floor going black whenever Bowser's shell was on screen).
+  constexpr size_t kFullHashLimit = 1u << 20; // 1 MiB - larger than any real GX texture
+  if (bytes <= kFullHashLimit) {
     return XXH3_64bits(data, bytes);
   }
+  // Pathologically large source: fall back to 32 spread samples plus the tail rather than hash MiBs.
+  constexpr size_t kSamples = 32, kSample = 64;
   const auto* p = static_cast<const uint8_t*>(data);
   uint8_t gathered[kSamples * kSample + kSample];
   const size_t stride = (bytes - kSample) / (kSamples - 1);
@@ -934,7 +999,7 @@ void shutdown() noexcept {
   s_contentLru.clear();
   s_sourceKeyCache.clear();
   s_contentCacheBytes = 0;
-  s_contentCacheBudgetBytes = ContentCacheBudgetBytes;
+  s_contentCacheBudgetBytes = initial_content_cache_budget();
   s_frameCount = 0;
   s_bindGeneration = 1;
   s_pendingInvalidations.store(0, std::memory_order_release);
