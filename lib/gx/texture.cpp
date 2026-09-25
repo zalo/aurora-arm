@@ -174,23 +174,25 @@ uint64_t device_mem_total_kb() noexcept {
   }
   return kb;
 }
-// The OOM that killed heavy stages (Onett) on ~1 GB handhelds was the 600-frame (10 s) idle window
-// below pinning a ~790 MB GPU working set, NOT the content budget: once the idle sweep is 120 frames
-// the live working set is bounded and the content budget barely moves peak RSS. Measured on two ~1 GB
-// handhelds (Flip g29p1, RG351 G31), Onett Kirby-v-Kirby holds ~520-550 MB RSS with 130-210 MB free
-// at every budget from 64 to 256 MB - and a bigger budget keeps more textures decoded, which cut the
-// per-frame pipeline-lookup churn errors from ~94 (64 MB) to ~5 (128 MB) on the RG. So spend the
-// headroom: 192 MB on ~1 GB devices leaves a comfortable margin even on the tighter AmberELEC r13p0.
-// env (MELEE_TEXTURE_CACHE_MB) still overrides.
+// On a ~1 GB handheld (Miyoo Flip, RG35XX/SP, RG351) the full 128 MB budget + 10 s idle window pins a
+// ~790 MB GPU working set that OOM-kills the game on heavy stages (Onett); measured 64 MB/2 s keeps it
+// to ~584 MB AND quadruples FPS (no memory-pressure thrashing). Scale both by RAM; env still overrides.
+//
+// NOTE (2026-09-25): a sustained-warm-match sweep suggested the budget barely moved peak RSS, so it was
+// briefly raised to 192/256/512 - that OOM-killed/froze all three ~1 GB devices on COLD start (fresh
+// pipeline cache + heavy first match: GPU alloc hit ~420 MB on top of ~510 MB RSS on the Flip). The
+// warm sweep missed the cold-start transient. Reverted to the proven 64/96/128. Do NOT raise the ~1 GB
+// tier again without a COLD-start Onett test on a real device (bundling a pipeline cache would remove
+// the cold spike and is the right prerequisite for any future increase).
 uint64_t default_content_cache_mb() noexcept {
   const uint64_t memKb = device_mem_total_kb();
   if (memKb != 0 && memKb <= 1300000ull) {
-    return 192;
+    return 64;
   }
   if (memKb != 0 && memKb <= 3000000ull) {
-    return 256;
+    return 96;
   }
-  return 512;
+  return texture::ContentCacheBudgetBytes / (1024ull * 1024ull);
 }
 uint64_t default_object_idle_frames() noexcept {
   const uint64_t memKb = device_mem_total_kb();
