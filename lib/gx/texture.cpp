@@ -174,18 +174,23 @@ uint64_t device_mem_total_kb() noexcept {
   }
   return kb;
 }
-// On a ~1 GB handheld (Miyoo Flip, RG35XX/SP, RG351) the full 128 MB budget + 10 s idle window pins a
-// ~790 MB GPU working set that OOM-kills the game on heavy stages (Onett); measured 64 MB/2 s keeps it
-// to ~584 MB AND quadruples FPS (no memory-pressure thrashing). Scale both by RAM; env still overrides.
+// The OOM that killed heavy stages (Onett) on ~1 GB handhelds was the 600-frame (10 s) idle window
+// below pinning a ~790 MB GPU working set, NOT the content budget: once the idle sweep is 120 frames
+// the live working set is bounded and the content budget barely moves peak RSS. Measured on two ~1 GB
+// handhelds (Flip g29p1, RG351 G31), Onett Kirby-v-Kirby holds ~520-550 MB RSS with 130-210 MB free
+// at every budget from 64 to 256 MB - and a bigger budget keeps more textures decoded, which cut the
+// per-frame pipeline-lookup churn errors from ~94 (64 MB) to ~5 (128 MB) on the RG. So spend the
+// headroom: 192 MB on ~1 GB devices leaves a comfortable margin even on the tighter AmberELEC r13p0.
+// env (MELEE_TEXTURE_CACHE_MB) still overrides.
 uint64_t default_content_cache_mb() noexcept {
   const uint64_t memKb = device_mem_total_kb();
   if (memKb != 0 && memKb <= 1300000ull) {
-    return 64;
+    return 192;
   }
   if (memKb != 0 && memKb <= 3000000ull) {
-    return 96;
+    return 256;
   }
-  return texture::ContentCacheBudgetBytes / (1024ull * 1024ull);
+  return 512;
 }
 uint64_t default_object_idle_frames() noexcept {
   const uint64_t memKb = device_mem_total_kb();
