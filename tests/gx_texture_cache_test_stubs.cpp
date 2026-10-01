@@ -1,8 +1,10 @@
 #include "gx/texture.hpp"
 
+#include "gfx/resources.hpp"
 #include "gfx/tex_palette_conv.hpp"
 #include "gfx/texture_convert.hpp"
 #include "gfx/texture_replacement.hpp"
+#include "gx/resident_geometry.hpp"
 #include "internal.hpp"
 
 #include <algorithm>
@@ -112,7 +114,29 @@ GXTexFmt tlut_texture_format(GXTlutFmt format) noexcept { return GX_TF_RGBA8_PC;
 void queue_palette_conv(tex_palette_conv::ConvRequest req) { ++s_paletteConversions; }
 
 void on_copy_texture_sampled(const TextureHandle& handle) noexcept {}
+
+void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {}
+void trim_texture_pool() noexcept {}
+TexturePoolStats texture_pool_stats() noexcept { return {}; }
+const StreamSizes& stream_sizes() noexcept {
+  static const StreamSizes sizes;
+  return sizes;
+}
+StreamUsage& stream_usage() noexcept {
+  static StreamUsage usage;
+  return usage;
+}
 } // namespace aurora::gfx
+
+namespace aurora::gx::resident {
+size_t used_bytes() noexcept { return 0; }
+size_t live_bytes() noexcept { return 0; }
+size_t entry_count() noexcept { return 0; }
+void buffer_bytes(uint64_t& arenas, uint64_t& records) noexcept {
+  arenas = 0;
+  records = 0;
+}
+} // namespace aurora::gx::resident
 
 namespace aurora::gfx::texture_replacement {
 StreamingStats process_streaming() noexcept { return {}; }

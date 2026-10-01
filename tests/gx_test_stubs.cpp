@@ -403,7 +403,12 @@ void end_deferred_frame() {
 
 namespace aurora::gx::texture {
 void end_frame() noexcept {}
+void touch_copy_texture(const gfx::TextureHandle& handle) noexcept {}
 } // namespace aurora::gx::texture
+
+namespace aurora::gfx {
+uint64_t pipeline_cache_generation() noexcept { return 0; }
+} // namespace aurora::gfx
 
 namespace aurora::gfx::depth_peek {
 namespace {

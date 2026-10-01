@@ -1174,8 +1174,12 @@ bool render_draw(const gx::DrawData& d, uint32_t passIndex, uint32_t drawIndex) 
   profile::Scope drawProfile("gl_draw_total");
   auto* prepared = prepare_pipeline(d.pipeline);
   if (prepared == nullptr) {
-    std::fprintf(stderr, "[gles-direct-error] frame=%llu pass=%u draw=%u section=pipeline-lookup\n",
-                 static_cast<unsigned long long>(sFrameNumber), passIndex, drawIndex);
+    // Still compiling (or evicted and compiling again): the draw is skipped until the pipeline is ready.
+    stream_usage().pendingPipelineDraws.fetch_add(1, std::memory_order_relaxed);
+    if (stats_enabled()) {
+      std::fprintf(stderr, "[gles-direct] frame=%llu pass=%u draw=%u skipped: pipeline not ready\n",
+                   static_cast<unsigned long long>(sFrameNumber), passIndex, drawIndex);
+    }
     return false;
   }
   const auto& native = prepared->gl;
@@ -1453,8 +1457,13 @@ void probe_driver(const PassPlan& plan, uint32_t passIndex) {
     finished = true;
     sProbingDisabled = true;
   } else {
+    const auto& skippedDraws = stream_usage().pendingPipelineDraws;
+    const uint64_t skippedBefore = skippedDraws.load(std::memory_order_relaxed);
     const double plainMs = render_probe_image(plan, passIndex, false, sProbe.plain);
     const double barrierMs = render_probe_image(plan, passIndex, true, sProbe.reference);
+    // A draw skipped because its pipeline was still compiling may be drawn in the second image only, which would
+    // read as a driver fault: such a pass proves nothing, a later one is probed instead.
+    const bool conclusive = skippedDraws.load(std::memory_order_relaxed) == skippedBefore;
     size_t differing = 0;
     for (size_t i = 0; i < sProbe.plain.size(); i += 4) {
       for (size_t c = 0; c < 4; ++c) {
@@ -1465,11 +1474,14 @@ void probe_driver(const PassPlan& plan, uint32_t passIndex) {
       }
     }
     const size_t pixels = static_cast<size_t>(plan.width) * plan.height;
-    const bool faulty = differing > std::max<size_t>(64, pixels / 1000);
+    const bool faulty = conclusive && differing > std::max<size_t>(64, pixels / 1000);
     Log.info("Driver probe: frame {} pass {} ({}x{}, {} draws): {} of {} pixels differ; {:.1f} ms plain, {:.1f} ms "
-             "with per-draw barriers",
-             sFrameNumber, passIndex, plan.width, plan.height, plan.draws, differing, pixels, plainMs, barrierMs);
-    if (faulty) {
+             "with per-draw barriers{}",
+             sFrameNumber, passIndex, plan.width, plan.height, plan.draws, differing, pixels, plainMs, barrierMs,
+             conclusive ? "" : "; inconclusive, pipelines were still compiling");
+    if (!conclusive) {
+      // Neither a fault nor a cleared pass.
+    } else if (faulty) {
       const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
       policy.every = 1;
       const bool slow = barrierMs > plainMs * 1.5 && barrierMs - plainMs > 4.0;
@@ -1619,11 +1631,18 @@ bool encode_pass_resources(const wgpu::RenderPassEncoder& encoder, RenderPass& p
     hasDraw = true;
     if (seenPipelines.insert(d.pipeline).second) {
       gx::PipelineConfig c;
-      wgpu::RenderPipeline p;
-      if (!get_pipeline(d.pipeline, p) || !gx::find_pipeline_config(d.pipeline, c) || !pipeline_eligible(c)) {
+      if (!gx::find_pipeline_config(d.pipeline, c) || !pipeline_eligible(c)) {
         return false;
       }
-      pipelines.push_back(std::move(p));
+      // A pipeline that is still compiling does not send the pass to Dawn: prepare_frame() plans the pass for
+      // the direct path from the configs alone, which then skips that draw exactly as gx::render() would. Dawn
+      // recording it anyway cost the whole pass's encoding plus a copy of the frame's streams into Dawn's
+      // buffers (each write to a buffer the previous frames still use makes Mali reallocate all of it), every
+      // frame for as long as shaders compiled, for commands the direct path then intercepted.
+      wgpu::RenderPipeline p;
+      if (get_pipeline(d.pipeline, p)) {
+        pipelines.push_back(std::move(p));
+      }
     }
     if (d.residentArena != 0) {
       arenas.insert(d.residentArena);
@@ -1646,7 +1665,9 @@ bool encode_pass_resources(const wgpu::RenderPassEncoder& encoder, RenderPass& p
   encoder.SetVertexBuffer(0, res.vertexBuffer);
   encoder.SetIndexBuffer(res.indexBuffer, wgpu::IndexFormat::Uint16);
   encoder.SetBindGroup(0, res.staticBindGroup);
-  encoder.SetPipeline(pipelines.front());
+  if (!pipelines.empty()) {
+    encoder.SetPipeline(pipelines.front());
+  }
   pass.directResourcesOnly = true;
   return true;
 }
@@ -1683,9 +1704,13 @@ void prepare_frame(FramePacket& frame) {
   }
   sMapped = mapped_slot(frame);
   bool streamsNeeded = false; // some consumer reads the streams through Dawn's buffers
+  const auto count_reason = [](StreamUsage::DawnPassReason reason) {
+    stream_usage().dawnPassReasons[reason].fetch_add(1, std::memory_order_relaxed);
+  };
   for (const auto& task : frame.encoderTasks) {
     if (!stream_independent_task(task.type)) {
       streamsNeeded = true;
+      count_reason(StreamUsage::EncoderTask);
     }
   }
   static unsigned sSortRuns = 0, sSortedDraws = 0, sSortFrames = 0;
@@ -1702,6 +1727,7 @@ void prepare_frame(FramePacket& frame) {
         .eligible = pass.msaaSamples == 1 && pass.colorAttachmentCount == 1,
     };
     bool hasGxDraw = false;
+    bool noConfig = false, vertexPath = false, fogRange = false, offsetClamp = false;
     uint32_t gxDraws = 0, clearDraws = 0, otherDraws = 0, customDraws = 0;
     for (const auto& command : pass.commands) {
       PlanCommand out{.type = command.type};
@@ -1714,8 +1740,14 @@ void prepare_frame(FramePacket& frame) {
           hasGxDraw = true;
           ++gxDraws;
           gx::PipelineConfig config;
-          if (!gx::find_pipeline_config(out.draw.pipeline, config) || !pipeline_eligible(config)) {
+          if (!gx::find_pipeline_config(out.draw.pipeline, config)) {
             plan.eligible = false;
+            noConfig = true;
+          } else if (!pipeline_eligible(config)) {
+            plan.eligible = false;
+            vertexPath |= !config.shaderConfig.cpuVertexDecode || !config.shaderConfig.batchDraws;
+            fogRange |= config.shaderConfig.fogRangeEnabled;
+            offsetClamp |= std::bit_cast<float>(config.polygonOffsetClampBits) != 0.f;
           } else {
             out.sortable = config.depthCompare && config.depthUpdate &&
                            (config.depthFunc == GX_LESS || config.depthFunc == GX_LEQUAL) &&
@@ -1738,9 +1770,29 @@ void prepare_frame(FramePacket& frame) {
     plan.draws = gxDraws + clearDraws;
     if (hasGxDraw && !pass.directResourcesOnly) {
       streamsNeeded = true;
+      stream_usage().dawnGxPasses.fetch_add(1, std::memory_order_relaxed);
+      if (pass.msaaSamples != 1 || pass.colorAttachmentCount != 1) {
+        count_reason(StreamUsage::Multisample);
+      }
+      if (otherDraws != 0) {
+        count_reason(StreamUsage::OtherDraw);
+      }
+      if (noConfig) {
+        count_reason(StreamUsage::NoConfig);
+      }
+      if (vertexPath) {
+        count_reason(StreamUsage::VertexPath);
+      }
+      if (fogRange) {
+        count_reason(StreamUsage::FogRange);
+      }
+      if (offsetClamp) {
+        count_reason(StreamUsage::OffsetClamp);
+      }
     }
     if (customDraws != 0) {
       streamsNeeded = true;
+      stream_usage().dawnCustomPasses.fetch_add(1, std::memory_order_relaxed);
     }
     // sortOpaqueDraws: runs of consecutive opaque, depth-ordered draws are grouped by program, textures and
     // uniform window so the driver sees fewer state changes. Not exact when opaque surfaces share depth values.
@@ -1812,9 +1864,12 @@ void prepare_frame(FramePacket& frame) {
   // Frames recorded into mapped GL storage reach Dawn's buffers only when something reads them through Dawn.
   if (sMapped != nullptr && streamsNeeded) {
     const auto& res = resources();
-    const auto upload = [](const wgpu::Buffer& dst, const ByteBuffer& src) {
+    auto& usage = stream_usage();
+    usage.dawnStreamFrames.fetch_add(1, std::memory_order_relaxed);
+    const auto upload = [&](const wgpu::Buffer& dst, const ByteBuffer& src) {
       if (src.size() != 0) {
         webgpu::g_queue.WriteBuffer(dst, 0, src.data(), AURORA_ALIGN(src.size(), 4));
+        usage.dawnStreamBytes.fetch_add(src.size(), std::memory_order_relaxed);
       }
     };
     upload(res.vertexBuffer, frame.verts);
@@ -1837,6 +1892,12 @@ void uninstall_frame() {
 }
 
 void shutdown_mapped_slots(); // gles_mapped_streams.cpp
+
+void forget_pipeline(PipelineRef ref) {
+  if (sPrepared.erase(ref) != 0 && sLastPipeline == ref) {
+    sLastPipeline = UINTPTR_MAX;
+  }
+}
 
 void shutdown() {
   uninstall_frame();
@@ -1887,6 +1948,7 @@ bool encode_pass_resources(const wgpu::RenderPassEncoder&, detail::RenderPass& p
 void prepare_frame(detail::FramePacket&) {}
 void install_frame() {}
 void uninstall_frame() {}
+void forget_pipeline(PipelineRef) {}
 void shutdown() {}
 #endif
 } // namespace aurora::gfx::gles_direct

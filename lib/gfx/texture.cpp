@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -124,6 +126,8 @@ struct TextureSlab {
   uint32_t layers = 0;
   std::vector<uint32_t> freeLayers;
   std::vector<texture_pool::ShelfPacker> atlasLayers;
+  uint32_t live = 0;      // layers or atlas cells handed out
+  uint64_t idleSince = 0; // g_slabFrame when the last one came back
 };
 
 struct TextureSlabKey {
@@ -145,6 +149,48 @@ struct TextureSlabKey {
 
 std::mutex g_slabMutex;
 absl::flat_hash_map<TextureSlabKey, std::vector<std::shared_ptr<TextureSlab>>> g_slabs;
+uint64_t g_slabFrame = 0;
+
+// AURORA_SLAB_LIMITS=<array layers>,<array KiB>,<atlas layers> (any separator) sets how far slabs grow; unset, a
+// device with up to 1.3 GB of RAM gets the small limits (see texture_pool::SlabLimits).
+texture_pool::SlabLimits read_slab_limits() noexcept {
+  texture_pool::SlabLimits limits = texture_pool::DefaultSlabLimits;
+  unsigned long long memTotalKb = 0;
+  if (FILE* f = std::fopen("/proc/meminfo", "re")) {
+    char line[256];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+      if (std::sscanf(line, "MemTotal: %llu kB", &memTotalKb) == 1) {
+        break;
+      }
+    }
+    std::fclose(f);
+  }
+  if (memTotalKb != 0 && memTotalKb <= 1300000) {
+    limits = texture_pool::SmallSlabLimits;
+  }
+  if (const char* value = std::getenv("AURORA_SLAB_LIMITS")) {
+    unsigned layers = 0;
+    unsigned kib = 0;
+    unsigned atlasLayers = 0;
+    if (std::sscanf(value, "%u%*[^0-9]%u%*[^0-9]%u", &layers, &kib, &atlasLayers) == 3 && layers != 0 && kib != 0 &&
+        atlasLayers != 0) {
+      limits = {.maxLayers = layers, .maxBytes = static_cast<uint64_t>(kib) << 10, .maxAtlasLayers = atlasLayers};
+    }
+  }
+  return limits;
+}
+
+const texture_pool::SlabLimits& slab_limits() noexcept {
+  static const texture_pool::SlabLimits limits = read_slab_limits();
+  return limits;
+}
+
+// With g_slabMutex held: one layer or cell of `slab` came back.
+void release_slab_use(TextureSlab& slab) noexcept {
+  if (slab.live > 0 && --slab.live == 0) {
+    slab.idleSince = g_slabFrame;
+  }
+}
 
 std::shared_ptr<TextureSlab> create_slab(const TextureSlabKey& key, uint32_t layers, const char* label) {
   auto slab = std::make_shared<TextureSlab>();
@@ -199,11 +245,13 @@ TextureHandle allocate_slab_layer(const TextureSlabKey& key, const char* label) 
     if (!slab) {
       const uint64_t layerBytes = calc_texture_size(key.format, key.width, key.height, key.mips);
       const uint32_t layers =
-          texture_pool::next_slab_layers(key.width, key.height, slabs.empty() ? 0 : slabs.back()->layers, layerBytes);
+          texture_pool::next_slab_layers(key.width, key.height, slabs.empty() ? 0 : slabs.back()->layers, layerBytes,
+                                         slab_limits());
       slab = slabs.emplace_back(create_slab(key, layers, label));
     }
     layer = slab->freeLayers.back();
     slab->freeLayers.pop_back();
+    ++slab->live;
   }
   const wgpu::Extent3D size{
       .width = key.width,
@@ -216,6 +264,7 @@ TextureHandle allocate_slab_layer(const TextureSlabKey& key, const char* label) 
     delete ptr;
     std::lock_guard lock{g_slabMutex};
     slab->freeLayers.push_back(layer);
+    release_slab_use(*slab);
   });
 }
 
@@ -250,10 +299,12 @@ TextureHandle allocate_atlas_cell(const TextureSlabKey& key, uint32_t width, uin
       }
     }
     if (!slab) {
-      const uint32_t layers = texture_pool::next_atlas_slab_layers(slabs.empty() ? 0 : slabs.back()->layers);
+      const uint32_t layers =
+          texture_pool::next_atlas_slab_layers(slabs.empty() ? 0 : slabs.back()->layers, slab_limits());
       const bool placed = place(slabs.emplace_back(create_slab(key, layers, label)));
       CHECK(placed, "{}: {}x{} does not fit an empty atlas layer", label, width, height);
     }
+    ++slab->live;
   }
   const wgpu::Extent3D size{
       .width = width,
@@ -263,10 +314,11 @@ TextureHandle allocate_atlas_cell(const TextureSlabKey& key, uint32_t width, uin
   auto* ref = new TextureRef(slab->texture, slab->view, wgpu::TextureView{}, size, key.format, 1, key.gxFormat);
   ref->layer = layer;
   ref->atlasCell = Vec2<uint32_t>{x, y};
-  return TextureHandle(ref, [slab, layer](TextureRef* ptr) {
+  return TextureHandle(ref, [slab, layer, x, y](TextureRef* ptr) {
     delete ptr;
     std::lock_guard lock{g_slabMutex};
-    slab->atlasLayers[layer].release();
+    slab->atlasLayers[layer].release(x, y);
+    release_slab_use(*slab);
   });
 }
 
@@ -473,9 +525,55 @@ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, co
                                wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment, label);
 }
 
+void trim_texture_pool() noexcept {
+  std::lock_guard lock{g_slabMutex};
+  if (++g_slabFrame % texture_pool::SlabTrimPeriod != 0) {
+    return;
+  }
+  for (auto it = g_slabs.begin(); it != g_slabs.end();) {
+    std::erase_if(it->second, [](const std::shared_ptr<TextureSlab>& slab) {
+      return slab->live == 0 && g_slabFrame - slab->idleSince > texture_pool::SlabIdleFrames;
+    });
+    if (it->second.empty()) {
+      g_slabs.erase(it++);
+    } else {
+      ++it;
+    }
+  }
+}
+
 void shutdown_texture_pool() noexcept {
   std::lock_guard lock{g_slabMutex};
   g_slabs.clear();
+}
+
+TexturePoolStats texture_pool_stats() noexcept {
+  TexturePoolStats stats;
+  std::lock_guard lock{g_slabMutex};
+  for (const auto& [key, slabs] : g_slabs) {
+    const uint64_t layerBytes = calc_texture_size(key.format, key.width, key.height, key.mips);
+    if (key.atlas && !slabs.empty()) {
+      ++stats.atlasClasses;
+    }
+    for (const auto& slab : slabs) {
+      if (key.atlas) {
+        ++stats.atlasSlabs;
+        stats.atlasLayers += slab->layers;
+        stats.atlasBytes += layerBytes * slab->layers;
+        stats.atlasCells += slab->live;
+        for (const auto& layer : slab->atlasLayers) {
+          stats.atlasLayersInUse += layer.live() != 0 ? 1 : 0;
+          stats.atlasShelfRows += layer.used_rows();
+        }
+      } else {
+        ++stats.arraySlabs;
+        stats.arrayLayers += slab->layers;
+        stats.arrayBytes += layerBytes * slab->layers;
+        stats.arrayLayersInUse += slab->live;
+      }
+    }
+  }
+  return stats;
 }
 
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {

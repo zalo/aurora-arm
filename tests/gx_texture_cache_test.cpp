@@ -347,7 +347,7 @@ TEST_F(GxTextureCacheTest, IdentityIsStableAcrossRecreatedObjects) {
 
 TEST_F(GxTextureCacheTest, IdentityCoversImageDescriptionAndSamplerState) {
   std::array<uint8_t, 16> pixels{};
-  std::array<uint8_t, 16> other{};
+  std::array<uint8_t, 16> other{1}; // identity is derived from content, so the other image has to differ
   const auto base = make_texture(pixels.data(), 0);
   const u32 id = texture::texture_object_identity(base);
 

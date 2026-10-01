@@ -96,12 +96,14 @@ bool find_pipeline_config(PipelineRef ref, PipelineConfig& config) {
   return true;
 }
 
+void remember_pipeline_config(PipelineRef ref, const PipelineConfig& config) {
+  std::lock_guard lock{sPipelineConfigMutex};
+  sPipelineConfigs.try_emplace(ref, config);
+}
+
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
-  {
-    std::lock_guard lock{sPipelineConfigMutex};
-    sPipelineConfigs[xxh3_hash(config, static_cast<HashType>(ShaderType::Clear))] = config;
-  }
+  remember_pipeline_config(xxh3_hash(config, static_cast<HashType>(ShaderType::Clear)), config);
   const bool writesSceneColor = config.clearColor || config.clearAlpha;
   const auto source = shader_source(writesSceneColor);
   wgpu::ShaderSourceWGSL sourceDescriptor{};

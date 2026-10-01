@@ -62,11 +62,12 @@ void create_slots_gl(void* data) {
     std::memset(mapped, 0, bytes);
     return true;
   };
+  const auto& sizes = stream_sizes();
   std::vector<MappedSlot> slots(request.count);
   for (auto& slot : slots) {
     // A whole extra window lets a draw in the last window bind a full 64 KiB range.
-    if (!make(slot.uniforms, slot.uniformData, UniformBufferSize + gx::UniformWindowSize) ||
-        !make(slot.indices, slot.indexData, IndexBufferSize) || !make(slot.vertices, slot.vertexData, VertexBufferSize)) {
+    if (!make(slot.uniforms, slot.uniformData, sizes.uniform + gx::UniformWindowSize) ||
+        !make(slot.indices, slot.indexData, sizes.index) || !make(slot.vertices, slot.vertexData, sizes.vertex)) {
       Log.warn("persistent mapping failed; frame streams stay staged");
       while (glGetError() != GL_NO_ERROR) {
       }

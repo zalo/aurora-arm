@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "clear.hpp"
+#include "gles_direct.hpp"
 #include "resources.hpp"
 #include "hash.hpp"
 #include "../gx/pipeline.hpp"
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -25,6 +27,8 @@
 #include <optional>
 #include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <SDL3/SDL_iostream.h>
 #include <absl/container/flat_hash_map.h>
@@ -42,11 +46,14 @@ constexpr const char* SdlVfsName = "aurora_pipeline_cache_sdl_vfs";
 struct CachedPipeline {
   wgpu::RenderPipeline pipeline;
   uint32_t firstFrameUsed = UINT32_MAX;
+  // g_pipelineTick of the last request or bind; 0 for one preloaded from the cache database and not used yet.
+  uint32_t lastUsedTick = 0;
 };
 
 struct PendingPipeline {
   PipelineRef hash;
   uint32_t firstFrameUsed = UINT32_MAX;
+  uint32_t lastUsedTick = 0;
   NewPipelineCallback create;
 };
 
@@ -81,6 +88,23 @@ static absl::flat_hash_map<PipelineRef, CachedPipeline> g_pipelines;
 static std::deque<PendingPipeline> g_pipelineQueue;
 static std::deque<PendingPipeline> g_backgroundPipelineQueue;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
+
+// Bounded cache. Every pipeline is a GL program the driver keeps resident: measured on ~1 GB Mali handhelds
+// (RG35XX SP, Miyoo Flip) at ~0.44 MB each, a Melee Classic run grows from ~270 to ~1200 pipelines and is
+// OOM-killed around its 18th match. Past g_pipelineCacheMax the least recently used pipelines that have been
+// idle for PipelineIdleFrames are retired; a retired pipeline stays alive and comes back on any request or
+// bind until the next sweep, which covers frames already recorded and the recording-side memos that hand out
+// references without asking this cache (they reset on pipeline_cache_generation()). After that it is released
+// on the render worker, and a later request compiles it again like a new pipeline.
+constexpr uint32_t PipelineSweepPeriod = 64;
+constexpr uint32_t PipelineIdleFrames = 600;
+static size_t g_pipelineCacheMax = 0; // 0 = unbounded
+static std::atomic<uint32_t> g_pipelineTick{0};
+static std::atomic<uint64_t> g_pipelineCacheGeneration{0};
+static std::atomic<uint64_t> g_evictedPipelines{0};
+static absl::flat_hash_map<PipelineRef, CachedPipeline> g_retiredPipelines;
+static std::vector<std::pair<PipelineRef, wgpu::RenderPipeline>> g_releasedPipelines;
+static size_t g_preloadedPipelines = 0;
 static std::atomic_bool g_gpuCachePrunePending = false;
 
 static sqlite3* g_pipelineCacheDb = nullptr;
@@ -434,6 +458,18 @@ static void notify_pipeline_ready(bool queued) {
 }
 
 static PipelineRef g_lastPipelineRef = std::numeric_limits<PipelineRef>::max();
+static uint32_t g_lastPipelineTick = 0;
+
+// g_pipelineMutex held. Brings a retired pipeline back into the cache.
+static bool resurrect_pipeline(PipelineRef hash) {
+  const auto it = g_retiredPipelines.find(hash);
+  if (it == g_retiredPipelines.end()) {
+    return false;
+  }
+  g_pipelines.try_emplace(hash, std::move(it->second));
+  g_retiredPipelines.erase(it);
+  return true;
+}
 
 static std::atomic<uint64_t> g_pipelineWaitNs{0};
 static std::atomic<uint64_t> g_pipelineWaitCount{0};
@@ -448,22 +484,38 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
 
   const PipelineRef hash = xxh3_hash(config, static_cast<HashType>(type));
   const bool blocking = priority == PipelinePriority::Blocking;
-  if (!blocking && hash == g_lastPipelineRef) {
+  // The repeat shortcut holds within one frame only, so a pipeline in use is stamped at least once per frame.
+  const uint32_t tick = g_pipelineTick.load(std::memory_order_relaxed);
+  if (!blocking && hash == g_lastPipelineRef && tick == g_lastPipelineTick) {
     return g_lastPipelineRef;
   }
   g_lastPipelineRef = hash;
+  g_lastPipelineTick = tick;
   const uint32_t firstFrameUsed = firstFrameUsedOverride.value_or(current_frame());
   bool notifyWorker = false;
   bool persist = priority != PipelinePriority::Background;
+  const uint32_t lastUsedTick = persist ? tick : 0;
   bool pipelineReady = false;
   bool createdPipeline = false;
   bool queued = false;
   std::optional<PipelineCacheWrite> cacheWrite;
+  // A pipeline built on this thread (no pipeline thread). The build runs after g_pipelineMutex is dropped: it
+  // needs the backend's context, which the render worker holds for a whole submit while its direct GLES passes
+  // call get_pipeline(), so building under the mutex deadlocked the two threads. The hash stays in
+  // g_pendingPipelines meanwhile.
+  NewPipelineCallback createNow;
+  uint32_t createFirstFrameUsed = firstFrameUsed;
   {
     std::scoped_lock guard{g_pipelineMutex};
     auto pipelineIt = g_pipelines.find(hash);
+    if (pipelineIt == g_pipelines.end() && resurrect_pipeline(hash)) {
+      pipelineIt = g_pipelines.find(hash);
+    }
     if (pipelineIt != g_pipelines.end()) {
       pipelineReady = true;
+      if (persist) {
+        pipelineIt->second.lastUsedTick = lastUsedTick;
+      }
       if (persist && firstFrameUsed < pipelineIt->second.firstFrameUsed) {
         pipelineIt->second.firstFrameUsed = firstFrameUsed;
         cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
@@ -478,17 +530,16 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
               cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
             }
           }
-          g_pipelines.try_emplace(hash, CachedPipeline{
-                                            .pipeline = pending->create(),
-                                            .firstFrameUsed = pending->firstFrameUsed,
-                                        });
-          pipelineReady = true;
-          ++g_pipelinesPerFrame;
-          createdPipeline = true;
+          createNow = std::move(pending->create);
+          createFirstFrameUsed = pending->firstFrameUsed;
+          g_pendingPipelines.insert(hash);
           queued = true;
         }
       } else {
         auto* pending = touch_pending_pipeline(hash, priority);
+        if (pending != nullptr && persist) {
+          pending->lastUsedTick = lastUsedTick;
+        }
         if (pending != nullptr && firstFrameUsed < pending->firstFrameUsed) {
           pending->firstFrameUsed = firstFrameUsed;
           if (persist) {
@@ -501,20 +552,16 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
       }
     } else if (!g_hasPipelineThread && !g_suppressPipelineCreation &&
                (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
-      g_pipelines.try_emplace(hash, CachedPipeline{
-                                        .pipeline = cb(),
-                                        .firstFrameUsed = firstFrameUsed,
-                                    });
-      pipelineReady = true;
+      createNow = std::move(cb);
+      g_pendingPipelines.insert(hash);
       if (persist) {
         cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
       }
-      ++g_pipelinesPerFrame;
-      createdPipeline = true;
     } else {
       PendingPipeline pending{
           .hash = hash,
           .firstFrameUsed = firstFrameUsed,
+          .lastUsedTick = lastUsedTick,
           .create = std::move(cb),
       };
       switch (priority) {
@@ -540,6 +587,22 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
   if (cacheWrite) {
     enqueue_pipeline_cache_write(std::move(*cacheWrite));
     cacheWrite.reset();
+  }
+
+  if (createNow) {
+    auto pipeline = createNow();
+    {
+      std::scoped_lock guard{g_pipelineMutex};
+      g_pipelines.try_emplace(hash, CachedPipeline{
+                                        .pipeline = std::move(pipeline),
+                                        .firstFrameUsed = createFirstFrameUsed,
+                                        .lastUsedTick = lastUsedTick,
+                                    });
+      g_pendingPipelines.erase(hash);
+      ++g_pipelinesPerFrame;
+    }
+    pipelineReady = true;
+    createdPipeline = true;
   }
 
   if (createdPipeline) {
@@ -1016,6 +1079,7 @@ static void pipeline_worker() {
       g_pipelines.try_emplace(pending.hash, CachedPipeline{
                                                 .pipeline = std::move(result),
                                                 .firstFrameUsed = pending.firstFrameUsed,
+                                                .lastUsedTick = pending.lastUsedTick,
                                             });
       g_pendingPipelines.erase(pending.hash);
       hasMore = !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty();
@@ -1047,7 +1111,11 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
   }
 
   size_t acceptedRows = 0;
-  while ((ret = sqlite3_step(g_pipelineCacheLoadStmt)) == SQLITE_ROW) {
+  // Rows come oldest first use first (boot, menus, then whatever later sessions reached); with a bounded cache
+  // only that head is built ahead of time and the rest compiles when a scene asks for it.
+  const size_t preloadMax = g_pipelineCacheMax - g_pipelineCacheMax / 8;
+  while ((g_pipelineCacheMax == 0 || g_preloadedPipelines < preloadMax) &&
+         (ret = sqlite3_step(g_pipelineCacheLoadStmt)) == SQLITE_ROW) {
     const auto* configBlob = static_cast<const uint8_t*>(sqlite3_column_blob(g_pipelineCacheLoadStmt, 0));
     const auto configSize = sqlite3_column_bytes(g_pipelineCacheLoadStmt, 0);
     const auto firstFrameUsed = static_cast<uint32_t>(sqlite3_column_int64(g_pipelineCacheLoadStmt, 1));
@@ -1063,9 +1131,10 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
 
     find_pipeline_impl(type, config, [=] { return create(config); }, PipelinePriority::Background, firstFrameUsed);
     ++acceptedRows;
+    ++g_preloadedPipelines;
   }
 
-  if (ret != SQLITE_DONE) {
+  if (ret != SQLITE_DONE && ret != SQLITE_ROW && ret != SQLITE_OK) {
     Log.error("Failed to read pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
     pipeline_cache_abort();
   }
@@ -1171,7 +1240,39 @@ static bool synchronous_pipeline_compilation() {
          string_view_contains(webgpu::g_adapterInfo.description, "V3D");
 }
 
+// AURORA_PIPELINE_CACHE_MAX=<count> (0 = unbounded); unset, the bound follows the device's RAM like the texture
+// budget does. 448 pipelines are ~200 MB on Mali, which with the 64 MB texture budget leaves a ~1 GB handheld
+// a few hundred MB free; a Melee match uses 100-200.
+static size_t pipeline_cache_max() {
+  if (const char* value = std::getenv("AURORA_PIPELINE_CACHE_MAX")) {
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end != value) {
+      return static_cast<size_t>(parsed);
+    }
+  }
+  unsigned long long memTotalKb = 0;
+  if (FILE* f = std::fopen("/proc/meminfo", "re")) {
+    char line[256];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+      if (std::sscanf(line, "MemTotal: %llu kB", &memTotalKb) == 1) {
+        break;
+      }
+    }
+    std::fclose(f);
+  }
+  if (memTotalKb == 0) {
+    return 0;
+  }
+  return memTotalKb <= 1300000 ? 448 : memTotalKb <= 3000000 ? 1024 : 0;
+}
+
 void initialize_pipeline_cache() {
+  g_pipelineCacheMax = pipeline_cache_max();
+  g_preloadedPipelines = 0;
+  if (g_pipelineCacheMax != 0) {
+    Log.info("Pipeline cache bounded to {} pipelines", g_pipelineCacheMax);
+  }
   g_pipelineCacheBroken = false;
   g_pipelineCacheWriterStop = false;
   g_pipelineThreadEnd = false;
@@ -1187,7 +1288,10 @@ void initialize_pipeline_cache() {
   }
 
   const size_t loadedCount = load_pipeline_cache();
-  if (!g_pipelineCacheBroken && loadedCount > 0) {
+  // The prune drops every Dawn cache blob the preload did not touch. A truncated preload leaves the blobs of
+  // the pipelines that compile on demand later untouched, and those must stay warm.
+  const bool preloadTruncated = g_pipelineCacheMax != 0 && g_preloadedPipelines >= g_pipelineCacheMax - g_pipelineCacheMax / 8;
+  if (!g_pipelineCacheBroken && loadedCount > 0 && !preloadTruncated) {
     g_gpuCachePrunePending = true;
   }
 
@@ -1211,17 +1315,55 @@ void shutdown_pipeline_cache() {
   g_pipelinesPerFrame = 0;
   g_gpuCachePrunePending = false;
   g_pipelines.clear();
+  g_retiredPipelines.clear();
+  g_releasedPipelines.clear();
   g_pipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
   g_pendingPipelines.clear();
 
   queuedPipelines = 0;
   createdPipelines = 0;
+  g_evictedPipelines = 0;
+}
+
+static void sweep_pipelines(uint32_t tick) {
+  std::lock_guard lock{g_pipelineMutex};
+  // Retired by the previous sweep and not asked for since: nothing recorded still refers to them.
+  g_evictedPipelines.fetch_add(g_retiredPipelines.size(), std::memory_order_relaxed);
+  for (auto& [ref, cached] : g_retiredPipelines) {
+    g_releasedPipelines.emplace_back(ref, std::move(cached.pipeline));
+  }
+  g_retiredPipelines.clear();
+  if (g_pipelines.size() <= g_pipelineCacheMax) {
+    return;
+  }
+  std::vector<std::pair<uint32_t, PipelineRef>> idle;
+  for (const auto& [ref, cached] : g_pipelines) {
+    if (tick - cached.lastUsedTick > PipelineIdleFrames) {
+      idle.emplace_back(cached.lastUsedTick, ref);
+    }
+  }
+  if (idle.empty()) {
+    return;
+  }
+  const size_t target = g_pipelineCacheMax - g_pipelineCacheMax / 8;
+  const size_t count = std::min(idle.size(), g_pipelines.size() - target);
+  std::partial_sort(idle.begin(), idle.begin() + count, idle.end());
+  for (size_t i = 0; i < count; ++i) {
+    const auto it = g_pipelines.find(idle[i].second);
+    g_retiredPipelines.try_emplace(it->first, std::move(it->second));
+    g_pipelines.erase(it);
+  }
+  g_pipelineCacheGeneration.fetch_add(1, std::memory_order_release);
 }
 
 void begin_pipeline_frame() {
   if (!g_hasPipelineThread) {
     g_pipelinesPerFrame = 0;
+  }
+  const uint32_t tick = g_pipelineTick.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (g_pipelineCacheMax != 0 && tick % PipelineSweepPeriod == 0) {
+    sweep_pipelines(tick);
   }
 }
 
@@ -1233,12 +1375,40 @@ void end_pipeline_frame() {
 
 bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
-  const auto it = g_pipelines.find(ref);
+  auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {
-    return false;
+    if (!resurrect_pipeline(ref)) {
+      return false;
+    }
+    it = g_pipelines.find(ref);
   }
+  it->second.lastUsedTick = g_pipelineTick.load(std::memory_order_relaxed);
   pipeline = it->second.pipeline;
   return true;
 }
+
+uint64_t pipeline_cache_generation() noexcept { return g_pipelineCacheGeneration.load(std::memory_order_acquire); }
+
+void release_retired_pipelines() {
+  std::vector<std::pair<PipelineRef, wgpu::RenderPipeline>> released;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    if (g_releasedPipelines.empty()) {
+      return;
+    }
+    released.swap(g_releasedPipelines);
+  }
+  for (const auto& [ref, pipeline] : released) {
+    gles_direct::forget_pipeline(ref);
+  }
+  // The last references drop here, outside the lock: Dawn deletes the GL programs.
+}
+
+size_t live_pipeline_count() noexcept {
+  std::lock_guard lock{g_pipelineMutex};
+  return g_pipelines.size() + g_retiredPipelines.size();
+}
+
+uint64_t evicted_pipeline_count() noexcept { return g_evictedPipelines.load(std::memory_order_relaxed); }
 
 } // namespace aurora::gfx

@@ -2,6 +2,7 @@
 
 #include "../gfx/depth_peek.hpp"
 #include "../gfx/hash.hpp"
+#include "../gfx/pipeline_cache.hpp"
 #include "../gfx/frame.hpp"
 #include "../gfx/profile.hpp"
 #include "../gfx/recording.hpp"
@@ -666,8 +667,9 @@ static uint64_t variance_zeroed_hash(PipelineConfig c, int group) noexcept {
 
 // Pipeline variant for point draws recorded into the half-resolution sprite pass: same shader, premultiplied
 // accumulation blend (ShaderConfig::spriteAccumulate).
+static absl::flat_hash_map<gfx::PipelineRef, gfx::PipelineRef> sSpriteVariantMemo;
 static gfx::PipelineRef sprite_pipeline_variant(const DrawCache& cache) {
-  static absl::flat_hash_map<gfx::PipelineRef, gfx::PipelineRef> memo;
+  auto& memo = sSpriteVariantMemo;
   if (const auto it = memo.find(cache.pipelineRef); it != memo.end()) {
     return it->second;
   }
@@ -679,8 +681,9 @@ static gfx::PipelineRef sprite_pipeline_variant(const DrawCache& cache) {
 }
 
 // Resident variant (AuroraConfig::residentRecords): same shader with a per-vertex record input (binding 1).
+static absl::flat_hash_map<gfx::PipelineRef, gfx::PipelineRef> sResidentVariantMemo;
 static gfx::PipelineRef resident_records_variant(const DrawCache& cache) {
-  static absl::flat_hash_map<gfx::PipelineRef, gfx::PipelineRef> memo;
+  auto& memo = sResidentVariantMemo;
   if (const auto it = memo.find(cache.pipelineRef); it != memo.end()) {
     return it->second;
   }
@@ -1347,6 +1350,7 @@ void handle_aurora(ByteReader& reader) noexcept {
     // Asynchronous frames: the producer does not join the processor, so the per-frame work
     // aurora::end_frame() performs after drain() runs here, on the thread that owns the state.
     clear_draw_cache();
+    resident::end_frame();
     texture::end_frame();
     gfx::finish();
     gfx::end_deferred_frame();
@@ -1414,6 +1418,12 @@ void clear_draw_cache() noexcept {
   sFrameResidentRecords.clear();
   sFrameResidentWindows.clear();
   sResidentDrawnEntries.clear();
+  // The pipeline cache retired pipelines: the memoized references must go through find_pipeline again.
+  static uint64_t pipelineGeneration = 0;
+  if (const uint64_t generation = gfx::pipeline_cache_generation(); generation != pipelineGeneration) {
+    pipelineGeneration = generation;
+    reset_pipeline_memo();
+  }
   sDrawCache.bindGeneration = 0;
   sDrawCache.uniformRange = {};
   sDrawCache.fogRange = {};
@@ -1422,6 +1432,8 @@ void clear_draw_cache() noexcept {
 
 void reset_pipeline_memo() noexcept {
   sPipelineMemo.clear();
+  sSpriteVariantMemo.clear();
+  sResidentVariantMemo.clear();
   sDrawCache.hasPipeline = false;
 }
 

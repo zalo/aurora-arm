@@ -81,6 +81,7 @@ bool decode_display_list(const u8* list, u32 size, GXVtxFmt fmt, const VertexLoa
 
 u32 arena_stride(u32 arena) noexcept;
 size_t used_bytes() noexcept;
+size_t live_bytes() noexcept; // used_bytes() less the holes erased lists left
 size_t entry_count() noexcept;
 Stats& stats() noexcept;
 
@@ -107,5 +108,7 @@ const wgpu::Buffer& arena_buffer(u32 arena, uint64_t& size) noexcept;
 void encode_record_uploads(wgpu::CommandEncoder& encoder, const std::vector<gfx::ArenaUpload>& uploads);
 const wgpu::Buffer& record_buffer(u32 arena, uint64_t& size) noexcept;
 void release_buffers() noexcept;
+// GPU bytes of the arena and record buffers; they grow by doubling and never shrink. Any thread.
+void buffer_bytes(uint64_t& arenas, uint64_t& records) noexcept;
 
 } // namespace aurora::gx::resident

@@ -52,6 +52,7 @@ set(AURORA_NOD_PROVIDER "${_default_provider}" CACHE STRING
   "How to provide nod: auto, vendor (build from source), system (find_package/imported), package (download prebuilt)")
 set_property(CACHE AURORA_NOD_PROVIDER PROPERTY STRINGS auto vendor system package)
 set(AURORA_NOD_LINKAGE "${_default_linkage}" CACHE STRING "nod linkage type preference")
+set(AURORA_NOD_GROUP_CACHE "" CACHE STRING "Decoded 2 MiB sector groups nod keeps cached (vendor provider only; empty keeps nod's default of 64)")
 set_property(CACHE AURORA_NOD_LINKAGE PROPERTY STRINGS shared static)
 
 add_subdirectory(extern)

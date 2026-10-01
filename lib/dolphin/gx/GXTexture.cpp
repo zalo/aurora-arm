@@ -6,6 +6,10 @@
 #include "dolphin/gx/GXAurora.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+
+#include <xxhash.h>
 
 #include "tracy/Tracy.hpp"
 
@@ -127,6 +131,18 @@ void GXInitTexObjData(GXTexObj* obj_, const void* data) {
   auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
   obj->data = data;
   ++obj->texDataVersion;
+  // Replacing the image of an existing object makes it a stream (movie planes). A content identity would turn every
+  // frame into a new object, and the texture cache would keep one texture per frame instead of rewriting the
+  // object's own few; two planes that happen to hold the same image must not share an identity either. So a stream
+  // gets an identity of its own, kept until the object is initialized again.
+  if (!obj->stream()) {
+    static std::atomic<u32> nextStream{0};
+    const std::array<u32, 2> key{0x5354524Du, nextStream.fetch_add(1, std::memory_order_relaxed)}; // 'STRM'
+    const uint64_t hash = XXH3_64bits(key.data(), sizeof(key));
+    const u32 id = static_cast<u32>(hash ^ (hash >> 32));
+    obj->texObjId = id != 0 ? id : 1;
+    obj->set_stream();
+  }
 }
 
 void GXInitTexObjWrapMode(GXTexObj* obj_, GXTexWrapMode wrapS, GXTexWrapMode wrapT) {
@@ -224,7 +240,10 @@ void GXLoadTexObj(GXTexObj* obj_, GXTexMapID id) {
   // Libraries such as HSD build a temporary GXTexObj per material every frame, so a counter identity never repeats
   // and every load would hash the whole image again. Derive the identity from the description instead; the texture
   // cache verifies the source contents on reuse, so a stale or colliding identity only costs a cache miss.
-  obj->texObjId = aurora::gx::texture::texture_object_identity(*obj);
+  // A stream keeps the identity GXInitTexObjData gave it.
+  if (!obj->stream()) {
+    obj->texObjId = aurora::gx::texture::texture_object_identity(*obj);
+  }
   emit_loaded_texobj_metadata(*obj, id);
 }
 

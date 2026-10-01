@@ -39,6 +39,8 @@ u32 texture_object_identity(const GXTexObj_& obj) noexcept;
 u32 tlut_object_identity(const GXTlutObj_& tlut) noexcept;
 
 void invalidate_bindings() noexcept;
+// An EFB copy target was written: keeps it out of the idle sweep of copy textures.
+void touch_copy_texture(const gfx::TextureHandle& handle) noexcept;
 uint64_t current_bind_generation() noexcept;
 void invalidate_replacement(uint64_t replacementId) noexcept;
 void end_frame() noexcept;

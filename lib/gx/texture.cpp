@@ -1,9 +1,12 @@
 #include "texture.hpp"
 
 #include "../gfx/recording.hpp"
+#include "../gfx/resources.hpp"
 #include "../gfx/tex_palette_conv.hpp"
 #include "../gfx/texture_convert.hpp"
+#include "../gfx/texture_pool.hpp"
 #include "../gfx/texture_replacement.hpp"
+#include "resident_geometry.hpp"
 #include "shader_info.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -114,6 +117,7 @@ struct ContentCacheEntry {
   gfx::TextureHandle handle;
   uint64_t bytes = 0;
   std::list<TextureContentKey>::iterator lruIt;
+  uint64_t lastUsedFrame = 0; // the frame it was cached or last looked up
 };
 
 constexpr size_t SourceKeyCacheMaxEntries = 16384;
@@ -210,6 +214,17 @@ uint64_t initial_content_cache_budget() noexcept {
 uint64_t s_contentCacheBudgetBytes = initial_content_cache_budget();
 uint64_t s_objectCacheIdleFrames = env_u64_or("MELEE_TEXOBJ_IDLE_FRAMES", default_object_idle_frames());
 uint64_t s_frameCount = 0;
+// A cached texture nothing used for this many frames is released (sweep_content_cache); 0 keeps textures until
+// the budget evicts them. The budget alone lets the cache fill with the textures of scenes long gone: after a
+// dozen Melee matches on a 1 GiB handheld 64 MiB of content held 125 MiB of atlas and array slabs, most of it
+// for stages and fighters that were no longer loaded.
+uint64_t default_content_idle_frames() noexcept {
+  const uint64_t memKb = device_mem_total_kb();
+  return memKb != 0 && memKb <= 1300000ull ? 3600 : 0;
+}
+uint64_t s_contentIdleFrames = env_u64_or("AURORA_CONTENT_IDLE_FRAMES", default_content_idle_frames());
+// An EFB copy target nothing copied into or sampled for this many frames is released (sweep_copy_textures).
+uint64_t s_copyIdleFrames = env_u64_or("AURORA_COPY_IDLE_FRAMES", 1800);
 uint64_t s_bindGeneration = 1;
 std::atomic<uint64_t> s_pendingInvalidations = 0;
 std::atomic<uint64_t> s_pendingCacheClears = 0;
@@ -395,6 +410,7 @@ void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, const
 void touch_content_cache(ContentCacheEntry& entry) {
   s_contentLru.splice(s_contentLru.begin(), s_contentLru, entry.lruIt);
   entry.lruIt = s_contentLru.begin();
+  entry.lastUsedFrame = s_frameCount;
 }
 
 gfx::TextureHandle find_content_texture(const TextureContentKey& key) {
@@ -422,7 +438,10 @@ void cache_content_texture(TextureContentKey key, const gfx::TextureHandle& hand
 
   s_contentLru.push_front(key);
   const auto [it, inserted] = s_contentCache.emplace(
-      std::move(key), ContentCacheEntry{.handle = handle, .bytes = bytes, .lruIt = s_contentLru.begin()});
+      std::move(key), ContentCacheEntry{.handle = handle,
+                                        .bytes = bytes,
+                                        .lruIt = s_contentLru.begin(),
+                                        .lastUsedFrame = s_frameCount});
   if (!inserted) {
     s_contentLru.pop_front();
     touch_content_cache(it->second);
@@ -632,6 +651,7 @@ void touch_bound_texture(const GXTexObj_& obj) {
   if (copyIt == g_gxState.copyTextures.end()) {
     return;
   }
+  copyIt->second.handle->lastUsedFrame = s_frameCount;
   const auto& tlut = g_gxState.loadedTluts[obj.tlut];
   if (auto tlutIt = s_tlutObjectCaches.find(tlut.tlutObjId); tlutIt != s_tlutObjectCaches.end()) {
     tlutIt->second.lastUsedFrame = s_frameCount;
@@ -673,6 +693,70 @@ void sweep_object_caches() {
       ++cacheIt;
     }
   }
+}
+
+// Releases cached textures that sat unused for s_contentIdleFrames, least recently looked up first. A texture
+// object draws its texture without another lookup, so an entry something else still holds counts as used.
+void sweep_content_cache() {
+  if (s_contentIdleFrames == 0 || s_frameCount % 64 != 0) {
+    return;
+  }
+  while (!s_contentLru.empty()) {
+    const auto it = s_contentCache.find(s_contentLru.back());
+    if (it == s_contentCache.end()) {
+      s_contentLru.pop_back();
+      continue;
+    }
+    auto& entry = it->second;
+    if (s_frameCount - std::min(entry.lastUsedFrame, s_frameCount) <= s_contentIdleFrames) {
+      break;
+    }
+    if (entry.handle.use_count() > 1) {
+      touch_content_cache(entry);
+      continue;
+    }
+    s_contentCacheBytes -= entry.bytes;
+    s_contentCache.erase(it);
+    s_contentLru.pop_back();
+    ++s_stats.evictions;
+  }
+}
+
+// EFB copy targets are found by the game's destination pointer and were only released when the game destroyed
+// the copy (GXDestroyCopyTex), which a title need not do: Melee never does, so each scene left its screen-sized
+// targets behind, five or so per match. Releasing the idle ones bounds that; a copy sampled again after sitting
+// unused for the whole window would read as an ordinary texture at that address.
+void sweep_copy_textures() {
+  if (s_frameCount % 64 != 0) {
+    return;
+  }
+  absl::flat_hash_set<const void*> released;
+  for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
+    const auto& handle = it->second.handle;
+    if (handle && s_frameCount - std::min(handle->lastUsedFrame, s_frameCount) <= s_copyIdleFrames) {
+      ++it;
+      continue;
+    }
+    if (const auto current = g_gxState.copyTextures.find(it->first.dest);
+        current != g_gxState.copyTextures.end() && current->second.handle == handle) {
+      g_gxState.copyTextures.erase(current);
+    }
+    released.insert(handle.get());
+    g_gxState.copyTextureCache.erase(it++);
+  }
+  if (released.empty()) {
+    return;
+  }
+  for (auto& [_, cache] : s_tlutObjectCaches) {
+    for (auto it = cache.dynamicPaletteTextures.begin(); it != cache.dynamicPaletteTextures.end();) {
+      if (released.contains(it->first.sourceIdentity)) {
+        cache.dynamicPaletteTextures.erase(it++);
+      } else {
+        ++it;
+      }
+    }
+  }
+  texture::invalidate_bindings();
 }
 
 bool use_replacement(std::optional<gfx::texture_replacement::ReplacementResult> replacement, gfx::TextureHandle& handle,
@@ -811,6 +895,12 @@ u32 tlut_object_identity(const GXTlutObj_& tlut) noexcept {
 }
 
 void invalidate_bindings() noexcept { s_pendingInvalidations.fetch_add(1, std::memory_order_release); }
+
+void touch_copy_texture(const gfx::TextureHandle& handle) noexcept {
+  if (handle) {
+    handle->lastUsedFrame = s_frameCount;
+  }
+}
 
 uint64_t current_bind_generation() noexcept {
   apply_pending_invalidations();
@@ -972,6 +1062,72 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
   return handle;
 }
 
+// AURORA_MEM_LOG=<frames> (1 = every 600 frames): what the texture layer holds, cached content next to the GPU
+// bytes of the pool that backs it. The two differ because a slab is only released as a whole.
+void log_memory() noexcept {
+  static const uint64_t interval = [] {
+    const uint64_t frames = env_u64_or("AURORA_MEM_LOG", 0);
+    return frames == 1 ? 600 : frames;
+  }();
+  if (interval == 0 || s_frameCount % interval != 0) {
+    return;
+  }
+  constexpr auto mib = [](uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); };
+  const auto pool = gfx::texture_pool_stats();
+  uint64_t copyBytes = 0;
+  for (const auto& [_, copy] : g_gxState.copyTextureCache) {
+    copyBytes += texture_handle_size(copy.handle);
+  }
+  uint64_t arenaBytes = 0;
+  uint64_t recordBytes = 0;
+  resident::buffer_bytes(arenaBytes, recordBytes);
+  const uint64_t atlasRows = static_cast<uint64_t>(pool.atlasLayers) * gfx::texture_pool::AtlasSize;
+  Log.info("mem: content {:.1f}/{:.0f} MiB in {} entries, {} texobj, {} tlut | atlas {:.1f} MiB: {} classes {} slabs "
+           "{} layers ({} in use) {} cells, {}% of rows shelved | arrays {:.1f} MiB: {} slabs {} layers ({} in use) | "
+           "{} copy textures, {} cached copies {:.1f} MiB | resident {:.1f} MiB ({:.1f} live) in {} lists, buffers {:.1f} + {:.1f} "
+           "MiB",
+           mib(s_contentCacheBytes), mib(s_contentCacheBudgetBytes), s_contentCache.size(),
+           s_textureObjectCaches.size(), s_tlutObjectCaches.size(), mib(pool.atlasBytes), pool.atlasClasses,
+           pool.atlasSlabs, pool.atlasLayers, pool.atlasLayersInUse, pool.atlasCells,
+           atlasRows != 0 ? pool.atlasShelfRows * 100 / atlasRows : 0, mib(pool.arrayBytes), pool.arraySlabs,
+           pool.arrayLayers, pool.arrayLayersInUse, g_gxState.copyTextures.size(), g_gxState.copyTextureCache.size(),
+           mib(copyBytes), mib(resident::used_bytes()), mib(resident::live_bytes()), resident::entry_count(), mib(arenaBytes),
+           mib(recordBytes));
+
+  // Largest frame so far per stream against its size, and how many frames since the last line also wrote their
+  // streams into Dawn's buffers.
+  constexpr auto kib = [](uint64_t bytes) { return bytes >> 10; };
+  constexpr auto get = [](const std::atomic<uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+  const auto& usage = gfx::stream_usage();
+  const auto& sizes = gfx::stream_sizes();
+  static uint64_t lastFrames = 0;
+  static uint64_t lastDawnFrames = 0;
+  static uint64_t lastDawnBytes = 0;
+  const uint64_t frames = get(usage.frames);
+  const uint64_t dawnFrames = get(usage.dawnStreamFrames);
+  const uint64_t dawnBytes = get(usage.dawnStreamBytes);
+  Log.info("mem: stream max/size KiB: uniform {}/{} vertex {}/{} index {}/{} storage {}/{} texture upload {}/{} | "
+           "{} overflow uploads {:.1f} MiB, {} dropped pushes | {} of {} frames wrote {:.1f} MiB to the Dawn streams "
+           "({} GX passes: {} multisample, {} other draw, {} no config, {} vertex path, {} fog range, {} offset "
+           "clamp; {} tasks; {} custom passes so far), {} draws skipped for a pipeline",
+           kib(get(usage.maxUniform)), kib(sizes.uniform), kib(get(usage.maxVertex)), kib(sizes.vertex),
+           kib(get(usage.maxIndex)), kib(sizes.index), kib(get(usage.maxStorage)), kib(sizes.storage),
+           kib(get(usage.maxTextureUpload)), kib(sizes.textureUpload), get(usage.overflowUploads),
+           mib(get(usage.overflowUploadBytes)), get(usage.droppedPushes), dawnFrames - lastDawnFrames,
+           frames - lastFrames, mib(dawnBytes - lastDawnBytes), get(usage.dawnGxPasses),
+           get(usage.dawnPassReasons[gfx::StreamUsage::Multisample]),
+           get(usage.dawnPassReasons[gfx::StreamUsage::OtherDraw]),
+           get(usage.dawnPassReasons[gfx::StreamUsage::NoConfig]),
+           get(usage.dawnPassReasons[gfx::StreamUsage::VertexPath]),
+           get(usage.dawnPassReasons[gfx::StreamUsage::FogRange]),
+           get(usage.dawnPassReasons[gfx::StreamUsage::OffsetClamp]),
+           get(usage.dawnPassReasons[gfx::StreamUsage::EncoderTask]), get(usage.dawnCustomPasses),
+           get(usage.pendingPipelineDraws));
+  lastFrames = frames;
+  lastDawnFrames = dawnFrames;
+  lastDawnBytes = dawnBytes;
+}
+
 void end_frame() noexcept {
   const auto streamingStats = gfx::texture_replacement::process_streaming();
   s_stats.pendingLoads = streamingStats.pendingLoads;
@@ -996,6 +1152,10 @@ void end_frame() noexcept {
   ++s_frameCount;
   apply_pending_invalidations();
   sweep_object_caches();
+  sweep_copy_textures();
+  sweep_content_cache();
+  gfx::trim_texture_pool();
+  log_memory();
 }
 
 void shutdown() noexcept {
@@ -1124,6 +1284,9 @@ bool resolve_sampled_textures(const ShaderInfo& info) noexcept {
         obj.texObjId == textureBind.texObj.texObjId && obj.texDataVersion == textureBind.texObj.texDataVersion &&
         same_texture_description(obj, textureBind.texObj)) {
       touch_bound_texture(obj);
+      if (textureBind.ref) {
+        textureBind.ref->lastUsedFrame = s_frameCount;
+      }
       continue;
     }
 
@@ -1132,6 +1295,7 @@ bool resolve_sampled_textures(const ShaderInfo& info) noexcept {
     const GXState::CopyTextureRef* copyRef = copyIt != g_gxState.copyTextures.end() ? &copyIt->second : nullptr;
     if (copyRef != nullptr) {
       gfx::on_copy_texture_sampled(copyRef->handle);
+      copyRef->handle->lastUsedFrame = s_frameCount;
     }
     if (is_palette_format(obj.format())) {
       const auto tlutIdx = static_cast<size_t>(obj.tlut);

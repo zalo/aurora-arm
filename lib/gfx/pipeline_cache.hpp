@@ -35,6 +35,14 @@ template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
 bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
+// Bounded cache (AURORA_PIPELINE_CACHE_MAX, RAM-scaled by default). Changes whenever pipelines are retired:
+// whoever memoizes PipelineRefs outside this cache drops them then and asks find_pipeline again, which is what
+// keeps a pipeline in use alive (or recompiles one that was released).
+uint64_t pipeline_cache_generation() noexcept;
+// Render worker, once per frame: drops the pipelines that stayed retired for a whole sweep period.
+void release_retired_pipelines();
+size_t live_pipeline_count() noexcept;
+uint64_t evicted_pipeline_count() noexcept;
 // Renderer time accounting (AuroraConfig::renderStats): time and count of blocking pipeline waits.
 uint64_t pipeline_wait_ns() noexcept;
 uint64_t pipeline_wait_count() noexcept;

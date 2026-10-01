@@ -14,8 +14,6 @@ inline constexpr size_t StagingBufferCount = FrameSlotCount + 1; // 1 GiB device
 #else
 inline constexpr size_t StagingBufferCount = FrameSlotCount + 3;
 #endif
-inline constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + IndexBufferSize +
-                                              StorageBufferSize + (UseTextureBuffer ? TextureUploadSize : 0);
 
 // Where each stream lives in a staging buffer. When the frame streams are recorded into persistently
 // mapped GL storage (gles_direct mapped streams, decided in initialize()) the vertex, uniform and index

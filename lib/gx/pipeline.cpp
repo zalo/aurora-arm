@@ -16,6 +16,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -36,15 +37,17 @@ bool find_pipeline_config(gfx::PipelineRef ref, PipelineConfig& config) {
   return true;
 }
 
+void remember_pipeline_config(gfx::PipelineRef ref, const PipelineConfig& config) {
+  std::lock_guard lock{sPipelineConfigMutex};
+  sPipelineConfigs.try_emplace(ref, config);
+}
+
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
   const auto shader = build_shader(config.shaderConfig);
   const auto hash = xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX));
   const auto label = fmt::format("GX Pipeline {:x} shader {:x}", hash, xxh3_hash(config.shaderConfig));
-  {
-    std::lock_guard lock{sPipelineConfigMutex};
-    sPipelineConfigs[hash] = config;
-  }
+  remember_pipeline_config(hash, config); // pipelines preloaded from the cache are never requested
   if (config.shaderConfig.cpuVertexDecode) {
     const auto layout = decoded_vertex_layout(config.shaderConfig);
     // Points keep one record per point and draw it as one instance of a shared quad
@@ -151,6 +154,9 @@ std::vector<ArenaBuffer> sArenaBuffers;
 // vertex index like the arena itself. Fully rewritten each frame, so growth need not preserve old contents.
 std::vector<ArenaBuffer> sRecordBuffers;
 constexpr uint64_t MinArenaBufferSize = 1024 * 1024;
+// GPU bytes of the two buffer sets, for buffer_bytes() on other threads.
+std::atomic<uint64_t> sArenaBufferBytes{0};
+std::atomic<uint64_t> sRecordBufferBytes{0};
 } // namespace
 
 void encode_uploads(wgpu::CommandEncoder& encoder, const std::vector<gfx::ArenaUpload>& uploads) {
@@ -182,6 +188,7 @@ void encode_uploads(wgpu::CommandEncoder& encoder, const std::vector<gfx::ArenaU
         encoder.CopyBufferToBuffer(arena.buffer, 0, grown, 0, arena.size);
       }
       arena.buffer = std::move(grown);
+      sArenaBufferBytes.fetch_add(size - arena.size, std::memory_order_relaxed);
       arena.size = size;
     }
     // Staged copy, ordered in the command stream after every earlier pass that reads the arena. A
@@ -236,6 +243,7 @@ void encode_record_uploads(wgpu::CommandEncoder& encoder, const std::vector<gfx:
           .size = size,
       };
       record.buffer = webgpu::g_device.CreateBuffer(&descriptor);
+      sRecordBufferBytes.fetch_add(size - record.size, std::memory_order_relaxed);
       record.size = size;
     }
     // Staged copy, like the arena upload: a queue WriteBuffer into a buffer the GPU may still read stalls
@@ -266,6 +274,13 @@ const wgpu::Buffer& record_buffer(u32 arena, uint64_t& size) noexcept {
 void release_buffers() noexcept {
   sArenaBuffers.clear();
   sRecordBuffers.clear();
+  sArenaBufferBytes.store(0, std::memory_order_relaxed);
+  sRecordBufferBytes.store(0, std::memory_order_relaxed);
+}
+
+void buffer_bytes(uint64_t& arenas, uint64_t& records) noexcept {
+  arenas = sArenaBufferBytes.load(std::memory_order_relaxed);
+  records = sRecordBufferBytes.load(std::memory_order_relaxed);
 }
 } // namespace resident
 

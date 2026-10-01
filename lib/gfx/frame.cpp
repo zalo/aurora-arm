@@ -19,10 +19,13 @@
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -55,7 +58,64 @@ std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
 std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
 StagingLayout g_stagingLayout;
 
+StreamSizes read_stream_sizes() noexcept {
+  StreamSizes sizes;
+  unsigned long long memTotalKb = 0;
+  if (FILE* f = std::fopen("/proc/meminfo", "re")) {
+    char line[256];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+      if (std::sscanf(line, "MemTotal: %llu kB", &memTotalKb) == 1) {
+        break;
+      }
+    }
+    std::fclose(f);
+  }
+  // Resident display lists keep geometry in their own arenas and CPU decode leaves the storage stream to lookup
+  // tables: Melee's busiest frames (the credits) put 0.9 MiB into the vertex stream and nothing into storage, while
+  // the uniform stream peaked at 6 MiB and a stage load at 9 MiB of texture uploads. On a 1 GiB device the unused
+  // 12.5 MiB cost 55 MiB of GPU memory across the staging slots and Dawn's buffers.
+  if (memTotalKb != 0 && memTotalKb <= 1300000 && g_config.cpuVertexDecode && g_config.residentDisplayLists) {
+    sizes.vertex = std::min<uint64_t>(sizes.vertex, 3u << 20);
+    sizes.storage = std::min<uint64_t>(sizes.storage, 512u << 10);
+  }
+  if (const char* value = std::getenv("AURORA_STREAM_KB")) {
+    unsigned long long kib[5] = {};
+    // Any separator: launch scripts that split their settings on commas pass "8192/12288/...".
+    if (std::sscanf(value, "%llu%*[^0-9]%llu%*[^0-9]%llu%*[^0-9]%llu%*[^0-9]%llu", &kib[0], &kib[1], &kib[2], &kib[3],
+                    &kib[4]) == 5) {
+      // Whole 64 KiB units: the uniform stream is bound in windows of gx::UniformWindowSize.
+      const auto apply = [](uint64_t& size, unsigned long long requestKib) {
+        if (requestKib != 0) {
+          size = AURORA_ALIGN(std::max<uint64_t>(requestKib << 10, 256 << 10), uint64_t{gx::UniformWindowSize});
+        }
+      };
+      apply(sizes.uniform, kib[0]);
+      apply(sizes.vertex, kib[1]);
+      apply(sizes.index, kib[2]);
+      apply(sizes.storage, kib[3]);
+      apply(sizes.textureUpload, kib[4]);
+    } else {
+      Log.warn("AURORA_STREAM_KB={} ignored: expected <uniform>,<vertex>,<index>,<storage>,<texture upload>", value);
+    }
+  }
+  return sizes;
+}
+
+} // namespace
+
+const StreamSizes& stream_sizes() noexcept {
+  static const StreamSizes sizes = read_stream_sizes();
+  return sizes;
+}
+
+StreamUsage& stream_usage() noexcept {
+  static StreamUsage usage;
+  return usage;
+}
+
+namespace {
 StagingLayout make_staging_layout(bool streams) {
+  const auto& sizes = stream_sizes();
   StagingLayout layout{.streams = streams};
   uint64_t offset = 0;
   const auto place = [&](uint64_t& region, uint64_t size) {
@@ -63,13 +123,13 @@ StagingLayout make_staging_layout(bool streams) {
     offset += size;
   };
   if (streams) {
-    place(layout.vertex, VertexBufferSize);
-    place(layout.uniform, UniformBufferSize);
-    place(layout.index, IndexBufferSize);
+    place(layout.vertex, sizes.vertex);
+    place(layout.uniform, sizes.uniform);
+    place(layout.index, sizes.index);
   }
-  place(layout.storage, StorageBufferSize);
+  place(layout.storage, sizes.storage);
   if constexpr (UseTextureBuffer) {
-    place(layout.textureUpload, TextureUploadSize);
+    place(layout.textureUpload, sizes.textureUpload);
   }
   layout.size = offset;
   return layout;
@@ -470,14 +530,21 @@ void initialize() {
     };
     out = g_device.CreateBuffer(&descriptor);
   };
-  createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
+  const auto& sizes = stream_sizes();
+  if (sizes.uniform != UniformBufferSize || sizes.vertex != VertexBufferSize || sizes.index != IndexBufferSize ||
+      sizes.storage != StorageBufferSize || sizes.textureUpload != TextureUploadSize) {
+    Log.info("frame streams: uniform {} vertex {} index {} storage {} texture upload {} KiB",
+             sizes.uniform >> 10, sizes.vertex >> 10, sizes.index >> 10, sizes.storage >> 10,
+             sizes.textureUpload >> 10);
+  }
+  createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, sizes.uniform,
                "Shared Uniform Buffer");
   createBuffer(g_resources.vertexBuffer,
-               wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, VertexBufferSize,
+               wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, sizes.vertex,
                "Shared Vertex Buffer");
-  createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, IndexBufferSize,
+  createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, sizes.index,
                "Shared Index Buffer");
-  createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
+  createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, sizes.storage,
                "Shared Storage Buffer");
   // The persistently mapped GL streams are created now, before the staging buffers, so those can leave out
   // the stream regions they would never receive (StagingLayout). Dawn's GL interop makes the context current
@@ -489,7 +556,8 @@ void initialize() {
   if (!g_stagingLayout.streams) {
     Log.info("frame streams live in mapped GL storage; {} staging buffers of {} MiB hold storage and texture uploads only "
              "(instead of {} MiB each)",
-             StagingBufferCount, g_stagingLayout.size / (1024 * 1024), StagingBufferSize / (1024 * 1024));
+             StagingBufferCount, g_stagingLayout.size / (1024 * 1024),
+             make_staging_layout(true).size / (1024 * 1024));
   }
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     const auto label = fmt::format("Staging Buffer {}", i);
@@ -725,6 +793,7 @@ bool reserve_frame(uint32_t& frameSlot) {
   frame.stagingBuffer = *stagingSlot;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
   const auto& layout = g_stagingLayout;
+  const auto& sizes = stream_sizes();
   const auto mapBuffer = [&](ByteBuffer& buf, uint64_t offset, uint64_t size) {
     if (size <= 0) {
       return;
@@ -734,21 +803,21 @@ bool reserve_frame(uint32_t& frameSlot) {
   if (const auto* mapped = gles_direct::mapped_slot(*stagingSlot); mapped != nullptr) {
     // Persistently mapped GL streams: the slot is free, its fence having signalled. The staging buffers were
     // created without the stream regions (or, when the slots came late, those regions stay unused).
-    frame.verts = ByteBuffer{mapped->vertexData, static_cast<size_t>(VertexBufferSize)};
-    frame.uniforms = ByteBuffer{mapped->uniformData, static_cast<size_t>(UniformBufferSize)};
-    frame.indices = ByteBuffer{mapped->indexData, static_cast<size_t>(IndexBufferSize)};
+    frame.verts = ByteBuffer{mapped->vertexData, static_cast<size_t>(sizes.vertex)};
+    frame.uniforms = ByteBuffer{mapped->uniformData, static_cast<size_t>(sizes.uniform)};
+    frame.indices = ByteBuffer{mapped->indexData, static_cast<size_t>(sizes.index)};
     frame.mappedStreams = true;
   } else {
     AURORA_ASSERT(layout.streams, "staging buffers were sized without stream regions, but mapped GL stream slot {} is "
                                   "unavailable",
                   *stagingSlot);
-    mapBuffer(frame.verts, layout.vertex, VertexBufferSize);
-    mapBuffer(frame.uniforms, layout.uniform, UniformBufferSize);
-    mapBuffer(frame.indices, layout.index, IndexBufferSize);
+    mapBuffer(frame.verts, layout.vertex, sizes.vertex);
+    mapBuffer(frame.uniforms, layout.uniform, sizes.uniform);
+    mapBuffer(frame.indices, layout.index, sizes.index);
   }
-  mapBuffer(frame.storage, layout.storage, StorageBufferSize);
+  mapBuffer(frame.storage, layout.storage, sizes.storage);
   if constexpr (UseTextureBuffer) {
-    mapBuffer(frame.textureUpload, layout.textureUpload, TextureUploadSize);
+    mapBuffer(frame.textureUpload, layout.textureUpload, sizes.textureUpload);
   }
   g_cpuFrameStartNs.store(timestamp_ns(PresentClock::now()), std::memory_order_release);
   return true;
@@ -842,6 +911,7 @@ void end_frame(EndFrameCallback callback) {
     }
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
+    release_retired_pipelines();
     aurora_render_phase = "release-slot";
     release_staging_slot(stagingSlot, mappedStreams);
     aurora_render_phase = "process-events";

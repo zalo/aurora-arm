@@ -68,6 +68,8 @@ void register_stream_independent_task(EncoderTaskId type);
 // command buffer executes.
 void install_frame();
 void uninstall_frame();
+// The pipeline cache released this pipeline: drop the GL state prepared for it.
+void forget_pipeline(PipelineRef ref);
 void shutdown();
 
 // Persistently mapped GL streams (glesMappedStreams). One slot per staging buffer; a slot is written

@@ -321,8 +321,9 @@ void seal_pass(FramePacket& frame, uint32_t passIndex) {
   pass.sealed = true;
 }
 
-Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment) {
-  if (!stream_has_room(target, length, alignment, "frame")) {
+// `tail` is room that has to stay free behind the pushed data.
+Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment, size_t tail = 0) {
+  if (!stream_has_room(target, length + tail, alignment, "frame")) {
     return {static_cast<uint32_t>(target.size()), 0};
   }
   if (alignment != 0) {
@@ -351,6 +352,7 @@ static bool stream_has_room(const ByteBuffer& target, size_t length, size_t alig
   if (begin + length <= target.capacity()) {
     return true;
   }
+  stream_usage().droppedPushes.fetch_add(1, std::memory_order_relaxed);
   static uint32_t reports = 0;
   if (reports++ % 300 == 0) {
     Log.report(LOG_ERROR, "{} stream full ({} + {} > {} bytes); dropping draw data", name, begin, length,
@@ -740,6 +742,20 @@ RecordedFrame end_recording() {
   frame.stats.lastIndexSize = frame.indices.size();
   frame.stats.lastStorageSize = frame.storage.size();
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
+  {
+    auto& usage = stream_usage();
+    const auto raise = [](std::atomic<uint64_t>& max, uint64_t value) {
+      if (value > max.load(std::memory_order_relaxed)) {
+        max.store(value, std::memory_order_relaxed);
+      }
+    };
+    usage.frames.fetch_add(1, std::memory_order_relaxed);
+    raise(usage.maxUniform, frame.uniforms.size());
+    raise(usage.maxVertex, frame.verts.size());
+    raise(usage.maxIndex, frame.indices.size());
+    raise(usage.maxStorage, frame.storage.size());
+    raise(usage.maxTextureUpload, frame.textureUpload.size());
+  }
 
   for (auto& array : gx::g_gxState.arrays) {
     array.cachedRange = {};
@@ -828,7 +844,7 @@ void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32
                                wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {
   const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
   auto& frame = current_frame_packet();
-  if (frame.textureUpload.size() + copyBytesPerRow * rowsPerImage <= TextureUploadSize) {
+  if (frame.textureUpload.size() + copyBytesPerRow * rowsPerImage <= stream_sizes().textureUpload) {
     const auto range = push_texture_data(data, bytesPerRow, rowsPerImage);
     const wgpu::TexelCopyBufferLayout layout{
         .offset = range.offset,
@@ -840,6 +856,8 @@ void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32
   }
 
   const uint64_t uploadSize = copyBytesPerRow * rowsPerImage;
+  stream_usage().overflowUploads.fetch_add(1, std::memory_order_relaxed);
+  stream_usage().overflowUploadBytes.fetch_add(uploadSize, std::memory_order_relaxed);
   const wgpu::BufferDescriptor descriptor{
       .label = "Overflow Texture Upload Buffer",
       .usage = wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc,
@@ -986,7 +1004,9 @@ void push_draw_command(clear::DrawData data) {
 
 template <>
 PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
-  return find_pipeline(ShaderType::Clear, config, [=] { return create_pipeline(config); });
+  const PipelineRef ref = find_pipeline(ShaderType::Clear, config, [=] { return create_pipeline(config); });
+  clear::remember_pipeline_config(ref, config); // the direct path clears from the configuration alone
+  return ref;
 }
 
 namespace {
@@ -1691,7 +1711,11 @@ void push_draw_command(rmlui::DrawData data) {
 
 template <>
 PipelineRef pipeline_ref(const gx::PipelineConfig& config) {
-  return find_pipeline(ShaderType::GX, config, [=] { return create_pipeline(config); });
+  const PipelineRef ref = find_pipeline(ShaderType::GX, config, [=] { return create_pipeline(config); });
+  // Known from the request on, not from when the pipeline thread gets to it: the OpenGL ES direct path plans a
+  // pass from its draws' configurations and sent every pass with a queued pipeline through Dawn instead.
+  gx::remember_pipeline_config(ref, config);
+  return ref;
 }
 
 #ifdef AURORA_ENABLE_RMLUI
@@ -1718,7 +1742,11 @@ void finish() {
       g_smallCopies.skipped = g_smallCopies.renderedCount = 0;
     }
     auto& frame = current_frame_packet();
-    frame.uniforms.append_zeroes(gx::MaxUniformSize);
+    // Keeps the window bound for the last record inside the stream. The stream is a fixed view that aborts when
+    // grown, and push_uniform leaves this much room behind every record.
+    if (frame.uniforms.owned() || frame.uniforms.size() + gx::MaxUniformSize <= frame.uniforms.capacity()) {
+      frame.uniforms.append_zeroes(gx::MaxUniformSize);
+    }
     auto& pass = frame.renderPasses[g_recorder.currentRenderPass];
     pass.captureDepthSnapshot = true;
     enqueue_pass(frame, g_recorder.currentRenderPass);
@@ -1759,7 +1787,8 @@ Range push_uniform(const uint8_t* data, size_t length) {
   if (!check_recording("push_uniform")) {
     return {};
   }
-  return push(current_frame_packet().uniforms, data, length, resources().limits.minUniformBufferOffsetAlignment);
+  return push(current_frame_packet().uniforms, data, length, resources().limits.minUniformBufferOffsetAlignment,
+              gx::MaxUniformSize);
 }
 
 Range push_table_uniform(const uint8_t* data, size_t length) {
@@ -1768,7 +1797,7 @@ Range push_table_uniform(const uint8_t* data, size_t length) {
     return {};
   }
   // A 4 KiB-aligned record never straddles a 64 KiB window.
-  return push(current_frame_packet().uniforms, data, length, gx::UniformRecordStride);
+  return push(current_frame_packet().uniforms, data, length, gx::UniformRecordStride, gx::MaxUniformSize);
 }
 
 bool vertices_follow(Range previous) {

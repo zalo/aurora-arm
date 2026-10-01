@@ -122,6 +122,18 @@ TEST(TexturePoolTest, AtlasSlabsDoubleToTheirCap) {
   EXPECT_EQ(texture_pool::next_atlas_slab_layers(8), texture_pool::MaxAtlasSlabLayers);
 }
 
+TEST(TexturePoolTest, SmallLimitsKeepSlabsSmall) {
+  const auto& limits = texture_pool::SmallSlabLimits;
+  EXPECT_EQ(texture_pool::next_atlas_slab_layers(0, limits), 1u);
+  EXPECT_EQ(texture_pool::next_atlas_slab_layers(1, limits), limits.maxAtlasLayers);
+  EXPECT_EQ(texture_pool::next_atlas_slab_layers(limits.maxAtlasLayers, limits), limits.maxAtlasLayers);
+  // 16x16 RGBA8 layers never go past the layer cap, 128x128 ones (64 KiB) fill the byte budget at 8.
+  EXPECT_EQ(texture_pool::next_slab_layers(16, 16, 8, layer_bytes(16, 16), limits), limits.maxLayers);
+  EXPECT_EQ(texture_pool::next_slab_layers(128, 128, 4, layer_bytes(128, 128), limits), 8u);
+  EXPECT_EQ(texture_pool::next_slab_layers(256, 256, 0, layer_bytes(256, 256), limits), 2u);
+  EXPECT_EQ(texture_pool::next_slab_layers(256, 256, 2, layer_bytes(256, 256), limits), 2u);
+}
+
 TEST(TexturePoolTest, ShelfPackerPlacesCellsWithGutters) {
   using texture_pool::AtlasGutter;
   using texture_pool::AtlasSize;
@@ -151,25 +163,68 @@ TEST(TexturePoolTest, ShelfPackerPlacesCellsWithGutters) {
   EXPECT_FALSE(full.place(1, 1, x, y));
 }
 
-TEST(TexturePoolTest, ShelfPackerReusesAnEmptiedLayer) {
+TEST(TexturePoolTest, ShelfPackerReusesReleasedCells) {
+  using texture_pool::AtlasGutter;
   texture_pool::ShelfPacker packer;
   uint32_t x = 0;
   uint32_t y = 0;
-  ASSERT_TRUE(packer.place(500, 500, x, y));
-  ASSERT_TRUE(packer.place(500, 500, x, y));
-  ASSERT_TRUE(packer.place(500, 500, x, y));
-  ASSERT_TRUE(packer.place(500, 500, x, y));
+  std::array<std::array<uint32_t, 2>, 4> cells{};
+  for (auto& cell : cells) {
+    ASSERT_TRUE(packer.place(500, 500, cell[0], cell[1]));
+  }
   EXPECT_FALSE(packer.place(500, 500, x, y));
-  packer.release();
-  // Cells never move, so a partially used layer is still full for this size.
-  EXPECT_FALSE(packer.place(500, 500, x, y));
-  packer.release();
-  packer.release();
-  packer.release();
+  // A released cell takes the next texture that fits it, in place.
+  packer.release(cells[1][0], cells[1][1]);
+  EXPECT_EQ(packer.live(), 3u);
+  ASSERT_TRUE(packer.place(500, 500, x, y));
+  EXPECT_EQ(x, cells[1][0]);
+  EXPECT_EQ(y, cells[1][1]);
+  // A narrower texture leaves the rest of the cell free for another one.
+  packer.release(cells[2][0], cells[2][1]);
+  ASSERT_TRUE(packer.place(200, 480, x, y));
+  EXPECT_EQ(x, cells[2][0]);
+  EXPECT_EQ(y, cells[2][1]);
+  ASSERT_TRUE(packer.place(200, 480, x, y));
+  EXPECT_EQ(x, cells[2][0] + 200 + 2 * AtlasGutter);
+  EXPECT_EQ(y, cells[2][1]);
+  EXPECT_EQ(packer.live(), 5u);
+}
+
+TEST(TexturePoolTest, ShelfPackerGivesBackEmptiedShelves) {
+  using texture_pool::AtlasGutter;
+  texture_pool::ShelfPacker packer;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  std::array<std::array<uint32_t, 2>, 3> shelves{};
+  for (auto& shelf : shelves) {
+    ASSERT_TRUE(packer.place(100, 298, shelf[0], shelf[1]));
+    ASSERT_TRUE(packer.place(900, 298, x, y));
+  }
+  const auto release_shelf = [&](size_t i) {
+    packer.release(shelves[i][0], shelves[i][1]);
+    packer.release(shelves[i][0] + 100 + 2 * AtlasGutter, shelves[i][1]);
+  };
+  EXPECT_EQ(packer.used_rows(), 900u);
+  // An emptied shelf in the middle is cut to the height of the next texture; the rest stays free.
+  release_shelf(1);
+  EXPECT_EQ(packer.used_rows(), 900u);
+  ASSERT_TRUE(packer.place(100, 98, x, y));
+  EXPECT_EQ(y, shelves[1][1]);
+  ASSERT_TRUE(packer.place(100, 198, x, y));
+  EXPECT_EQ(y, shelves[1][1] + 100);
+  // Emptied shelves at the bottom are unshelved, together with emptied rows above them.
+  packer.release(x, y);
+  release_shelf(2);
+  EXPECT_EQ(packer.used_rows(), 400u);
+  ASSERT_TRUE(packer.place(1000, 600, x, y));
+  EXPECT_EQ(y, 400 + AtlasGutter);
+  // The whole layer comes back once nothing is placed.
+  packer.release(x, y);
+  packer.release(AtlasGutter, shelves[1][1]);
+  release_shelf(0);
   EXPECT_EQ(packer.live(), 0u);
-  ASSERT_TRUE(packer.place(500, 500, x, y));
-  EXPECT_EQ(x, texture_pool::AtlasGutter);
-  EXPECT_EQ(y, texture_pool::AtlasGutter);
+  EXPECT_EQ(packer.used_rows(), 0u);
+  ASSERT_TRUE(packer.place(1022, 1022, x, y));
 }
 
 TEST(TexturePoolTest, GutterReplicatesEdgeTexels) {

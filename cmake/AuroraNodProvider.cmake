@@ -70,6 +70,24 @@ if (_aurora_nod_provider STREQUAL "vendor")
     )
 
     FetchContent_MakeAvailable(aurora_nod)
+    # nod keeps its last 64 decoded sector groups (2 MiB each, 128 MiB once a session has read
+    # that much of the disc). AURORA_NOD_GROUP_CACHE shrinks that for low-memory targets; cargo
+    # builds at build time, so rewriting the constant here is picked up.
+    if (AURORA_NOD_GROUP_CACHE)
+      set(_aurora_nod_preloader "${aurora_nod_SOURCE_DIR}/nod/src/disc/preloader.rs")
+      file(READ "${_aurora_nod_preloader}" _aurora_nod_src)
+      string(REGEX REPLACE "LruCache::new\\(NonZeroUsize::new\\([0-9]+\\)"
+        "LruCache::new(NonZeroUsize::new(${AURORA_NOD_GROUP_CACHE})" _aurora_nod_patched "${_aurora_nod_src}")
+      if (NOT _aurora_nod_patched MATCHES "LruCache::new\\(NonZeroUsize::new\\(${AURORA_NOD_GROUP_CACHE}\\)")
+        message(FATAL_ERROR "aurora: nod's sector group cache size was not found in ${_aurora_nod_preloader}")
+      endif ()
+      if (NOT _aurora_nod_patched STREQUAL _aurora_nod_src)
+        file(WRITE "${_aurora_nod_preloader}" "${_aurora_nod_patched}")
+      endif ()
+      message(STATUS "aurora: nod sector group cache: ${AURORA_NOD_GROUP_CACHE} groups")
+      unset(_aurora_nod_src)
+      unset(_aurora_nod_patched)
+    endif ()
     set(BUILD_SHARED_LIBS "${_aurora_nod_saved_bsl}")
     unset(_aurora_nod_saved_bsl)
     if (NOT TARGET nod::nod)

@@ -30,6 +30,7 @@ struct Cache {
   // is a range query here; scanning all entries x 26 array pointers per release was 43% of the FIFO
   // worker in a scene whose effect archives churn constantly.
   std::multimap<uintptr_t, u64> pointerIndex;
+  size_t liveBytes = 0; // arena bytes of the entries; the rest of Arena::used belongs to erased ones
   bool resetRequested = false;
   Stats stats;
 };
@@ -38,6 +39,9 @@ Cache& cache() noexcept {
   static Cache instance;
   return instance;
 }
+
+// end_frame() leaves a cache smaller than this alone.
+constexpr size_t CompactBytes = 4 * 1024 * 1024;
 
 size_t budget() noexcept {
   return g_config.residentGeometryBudget != 0 ? g_config.residentGeometryBudget : DefaultBudget;
@@ -72,10 +76,16 @@ u32 arena_for_stride(u32 stride) {
   return static_cast<u32>(arenas.size() - 1);
 }
 
+size_t entry_bytes(const Entry& entry) noexcept {
+  const auto& arenas = cache().arenas;
+  return entry.arena < arenas.size() ? static_cast<size_t>(entry.vertexCount) * arenas[entry.arena].stride : 0;
+}
+
 void reset() noexcept {
   auto& c = cache();
   c.entries.clear();
   c.pointerIndex.clear();
+  c.liveBytes = 0;
   for (auto& arena : c.arenas) {
     arena.used = 0; // pending uploads keep their own offsets and still reach their frame ops
   }
@@ -124,6 +134,7 @@ Entry& insert(u64 key, Entry entry) {
   auto& c = cache();
   erase(key);
   auto& stored = c.entries.emplace(key, std::move(entry)).first->second;
+  c.liveBytes += entry_bytes(stored);
   for_each_dependency(stored, [&](uintptr_t p) { c.pointerIndex.emplace(p, key); });
   return stored;
 }
@@ -143,6 +154,7 @@ void erase(u64 key) noexcept {
       }
     }
   });
+  c.liveBytes -= entry_bytes(it->second);
   c.entries.erase(it);
 }
 
@@ -278,6 +290,8 @@ size_t used_bytes() noexcept {
   return total;
 }
 
+size_t live_bytes() noexcept { return cache().liveBytes; }
+
 size_t entry_count() noexcept { return cache().entries.size(); }
 
 Stats& stats() noexcept { return cache().stats; }
@@ -329,7 +343,12 @@ std::vector<gfx::ArenaUpload> take_record_uploads() {
 }
 
 void end_frame() noexcept {
-  if (cache().resetRequested) {
+  auto& c = cache();
+  // Arenas only append, so an erased list leaves a hole. A scene change erases most lists at once: when holes are
+  // more than half of a sizeable cache, start over and let the lists still drawn decode again. Otherwise every
+  // scene adds its lists to the arenas until the budget, 31 MiB (41 MiB of buffers) after 27 Melee matches that
+  // each drew 5 MiB.
+  if (c.resetRequested || (c.liveBytes * 2 < used_bytes() && used_bytes() >= CompactBytes)) {
     reset();
   }
 }
@@ -352,6 +371,7 @@ void shutdown() noexcept {
   auto& c = cache();
   c.entries.clear();
   c.pointerIndex.clear();
+  c.liveBytes = 0;
   c.arenas.clear();
   c.resetRequested = false;
   c.stats = {};

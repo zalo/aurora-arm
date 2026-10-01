@@ -52,6 +52,8 @@ struct TextureRef {
   // texture_pool::AtlasSize); the shader then samples clamp(uv) * scale +
   // offset, both passed through the uniform record.
   std::optional<Vec2<uint32_t>> atlasCell;
+  // For an EFB copy target: the frame it was last copied into or sampled (gx::texture).
+  uint64_t lastUsedFrame = 0;
 
   TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
              wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
@@ -84,8 +86,26 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
+// Once per frame: releases the shared array textures that have had no layer in use for a while.
+void trim_texture_pool() noexcept;
 // Drops the pool of shared array textures; layers still referenced stay alive.
 void shutdown_texture_pool() noexcept;
+// GPU bytes the pool holds, which is what the device pays for: a slab stays allocated as a whole while any
+// layer or atlas cell of it is in use.
+struct TexturePoolStats {
+  uint64_t atlasBytes = 0;
+  uint32_t atlasSlabs = 0;
+  uint32_t atlasLayers = 0;
+  uint32_t atlasLayersInUse = 0;
+  uint32_t atlasCells = 0;
+  uint32_t atlasClasses = 0;
+  uint64_t atlasShelfRows = 0; // rows handed to shelves over all layers (AtlasSize per layer at most)
+  uint64_t arrayBytes = 0;
+  uint32_t arraySlabs = 0;
+  uint32_t arrayLayers = 0;
+  uint32_t arrayLayersInUse = 0;
+};
+TexturePoolStats texture_pool_stats() noexcept;
 }; // namespace aurora::gfx
 
 struct GXTexObj_ {
@@ -132,6 +152,9 @@ struct GXTexObj_ {
   // Custom flag for texture caching
   bool no_cache() const noexcept { return (flags & 0x80) != 0; }
   void set_no_cache(bool value) noexcept { flags = value ? flags | 0x80 : flags & ~0x80; }
+  // Set by GXInitTexObjData: the object's image is replaced over time and texObjId is no longer derived from it.
+  bool stream() const noexcept { return (flags & 0x04) != 0; }
+  void set_stream() noexcept { flags |= 0x04; }
 
   // Hacky workaround for an instances where incremental IDs are used for GXCopyTex, but the copy tex was invalidated
   // and the texture reference is still present.

@@ -10,6 +10,12 @@
 
 #include <SDL3/SDL_filesystem.h>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <unistd.h>
+#define AURORA_IO_SYNC_DIRECTORY 1
+#endif
+
 namespace aurora::io {
 namespace {
 
@@ -19,6 +25,24 @@ void restore_error(const std::string& error) noexcept {
   if (!error.empty()) {
     SDL_SetError("%s", error.c_str());
   }
+}
+
+// Makes a rename durable. The file's data is synced before the rename, but the rename itself only changes the
+// directory (and, on FAT, the allocation table) in the page cache: a handheld switched off within the next
+// seconds came back with the save's directory entry pointing at freed clusters, which fsck then truncates to an
+// empty file. Best effort: a filesystem that cannot sync a directory keeps its old behaviour.
+void sync_parent_directory(const std::string& path) noexcept {
+#ifdef AURORA_IO_SYNC_DIRECTORY
+  const size_t slash = path.find_last_of('/');
+  const std::string directory = slash == std::string::npos ? "." : slash == 0 ? "/" : path.substr(0, slash);
+  const int fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd >= 0) {
+    fsync(fd);
+    close(fd);
+  }
+#else
+  (void)path;
+#endif
 }
 
 bool copy_stream(SDL_IOStream* src, SDL_IOStream* dst) noexcept {
@@ -230,6 +254,7 @@ bool AtomicFileWriter::commit() noexcept {
     return false;
   }
 
+  sync_parent_directory(m_targetPath);
   m_temporaryPath.clear();
   m_targetPath.clear();
   return true;
