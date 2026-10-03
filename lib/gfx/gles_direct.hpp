@@ -83,6 +83,7 @@ struct MappedSlot {
   uint8_t* indexData = nullptr;
   uint8_t* vertexData = nullptr;
   void* fence = nullptr; // GLsync of the last frame that used the slot
+  uint32_t indexFrames = 0; // frames drawn from the index stream since its storage was created
 };
 // Creates and maps the slots (through the interop, from the render worker). Leaves the streams staged
 // when GL_EXT_buffer_storage is unavailable.

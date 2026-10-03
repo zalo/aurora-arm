@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -29,6 +30,65 @@ std::atomic<bool> sReady{false};
 namespace {
 using BufferStorageProc = void(GL_APIENTRY*)(GLenum, GLsizeiptr, const void*, GLbitfield);
 constexpr GLbitfield MapPersistentBit = 0x0040; // GL_MAP_PERSISTENT_BIT_EXT
+BufferStorageProc sBufferStorage = nullptr;
+
+// Persistent, explicitly flushed mapping: the FIFO processor writes from another core and the
+// written ranges are flushed on the render thread before submit, rather than relying on coherent
+// mapping semantics for cross-thread writes.
+bool make_stream(GLuint& name, uint8_t*& mapped, size_t bytes) {
+  constexpr GLbitfield storageFlags = GL_MAP_WRITE_BIT | MapPersistentBit;
+  constexpr GLbitfield mapFlags = GL_MAP_WRITE_BIT | MapPersistentBit | GL_MAP_FLUSH_EXPLICIT_BIT;
+  glGenBuffers(1, &name);
+  glBindBuffer(GL_COPY_WRITE_BUFFER, name);
+  sBufferStorage(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, storageFlags);
+  mapped = static_cast<uint8_t*>(glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, static_cast<GLsizeiptr>(bytes), mapFlags));
+  if (glGetError() != GL_NO_ERROR || mapped == nullptr) {
+    mapped = nullptr;
+    return false;
+  }
+  std::memset(mapped, 0, bytes);
+  return true;
+}
+
+// The Mali blob on Allwinner H700 handhelds (libmali.so.0.20, fbdev) grows a table per index buffer inside
+// glDrawRangeElements (20-byte entries, doubling) and only lets go of it with the buffer. Fed by a stream whose
+// draws land at new offsets every frame, the three slots' tables reached 20 MiB each after 22 minutes of play and
+// kept doubling: an hour cost 200 MB of process memory. So a slot's index stream is replaced with fresh storage
+// after this many frames, which keeps each table under 3 MiB. AURORA_GLES_INDEX_STREAM_FRAMES overrides; 0 keeps
+// the storage.
+uint32_t index_stream_frames() {
+  static const uint32_t frames = [] {
+    const char* value = std::getenv("AURORA_GLES_INDEX_STREAM_FRAMES");
+    return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 256u;
+  }();
+  return frames;
+}
+
+// The slot is idle here: its fence has signalled and it has not been handed back to the recorder.
+void renew_index_stream(MappedSlot& slot) {
+  const uint32_t frames = index_stream_frames();
+  if (frames == 0 || ++slot.indexFrames < frames) {
+    return;
+  }
+  slot.indexFrames = 0;
+  GLuint fresh = 0;
+  uint8_t* data = nullptr;
+  if (make_stream(fresh, data, stream_sizes().index)) {
+    glBindBuffer(GL_COPY_WRITE_BUFFER, slot.indices);
+    glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+    glDeleteBuffers(1, &slot.indices);
+    slot.indices = fresh;
+    slot.indexData = data;
+  } else {
+    // Out of memory or a driver refusal: keep the storage in use.
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    if (fresh != 0) {
+      glDeleteBuffers(1, &fresh);
+    }
+  }
+  glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+}
 
 struct CreateRequest {
   size_t count;
@@ -45,29 +105,14 @@ void create_slots_gl(void* data) {
     Log.info("GL_EXT_buffer_storage unavailable; frame streams stay staged");
     return;
   }
-  // Persistent, explicitly flushed mapping: the FIFO processor writes from another core and the
-  // written ranges are flushed on the render thread before submit, rather than relying on coherent
-  // mapping semantics for cross-thread writes.
-  constexpr GLbitfield storageFlags = GL_MAP_WRITE_BIT | MapPersistentBit;
-  constexpr GLbitfield mapFlags = GL_MAP_WRITE_BIT | MapPersistentBit | GL_MAP_FLUSH_EXPLICIT_BIT;
-  const auto make = [&](GLuint& name, uint8_t*& mapped, size_t bytes) {
-    glGenBuffers(1, &name);
-    glBindBuffer(GL_COPY_WRITE_BUFFER, name);
-    bufferStorage(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, storageFlags);
-    mapped = static_cast<uint8_t*>(glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, static_cast<GLsizeiptr>(bytes), mapFlags));
-    if (glGetError() != GL_NO_ERROR || mapped == nullptr) {
-      mapped = nullptr;
-      return false;
-    }
-    std::memset(mapped, 0, bytes);
-    return true;
-  };
+  sBufferStorage = bufferStorage;
   const auto& sizes = stream_sizes();
   std::vector<MappedSlot> slots(request.count);
   for (auto& slot : slots) {
     // A whole extra window lets a draw in the last window bind a full 64 KiB range.
-    if (!make(slot.uniforms, slot.uniformData, sizes.uniform + gx::UniformWindowSize) ||
-        !make(slot.indices, slot.indexData, sizes.index) || !make(slot.vertices, slot.vertexData, sizes.vertex)) {
+    if (!make_stream(slot.uniforms, slot.uniformData, sizes.uniform + gx::UniformWindowSize) ||
+        !make_stream(slot.indices, slot.indexData, sizes.index) ||
+        !make_stream(slot.vertices, slot.vertexData, sizes.vertex)) {
       Log.warn("persistent mapping failed; frame streams stay staged");
       while (glGetError() != GL_NO_ERROR) {
       }
@@ -142,6 +187,7 @@ void check_fence_gl(void* data) {
   if (query.done) {
     glDeleteSync(static_cast<GLsync>(query.slot->fence));
     query.slot->fence = nullptr;
+    renew_index_stream(*query.slot);
   }
 }
 
