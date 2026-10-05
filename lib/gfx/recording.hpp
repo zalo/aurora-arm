@@ -59,8 +59,11 @@ void end_color_pass();
 void queue_texture_copy(wgpu::TexelCopyTextureInfo src, wgpu::TexelCopyTextureInfo dst, wgpu::Extent3D size);
 void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();
-uint32_t get_sample_count() noexcept;
+bool has_normal_attachment() noexcept;
 RenderTargetLayout get_render_target_layout() noexcept;
+// The layout GX draw pipelines are resolved against: the pass being recorded, or the EFB pass that a
+// half-resolution sprite segment interrupts.
+RenderTargetLayout gx_render_target_layout() noexcept;
 void clear_caches() noexcept;
 
 namespace tex_palette_conv {
@@ -118,7 +121,8 @@ template <typename PipelineConfig>
 PipelineRef pipeline_ref(const PipelineConfig& config);
 
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
-                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8);
+                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
+                       GXPixelFmt sourceFormat);
 uint32_t align_uniform(uint32_t value);
 Vec2<uint32_t> get_render_target_size() noexcept;
 void set_viewport(const Viewport& viewport) noexcept;

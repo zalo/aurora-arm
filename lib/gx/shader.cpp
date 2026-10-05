@@ -929,6 +929,16 @@ void apply_uniform_table(std::string& source, const ShaderConfig& config) {
       pos += to.size();
     }
   };
+  // The fragment entry point's return type varies (plain colour, normal attachment, dual-source blending), so
+  // the record index is set right after its opening brace instead of by matching the whole signature.
+  const auto fragment_prologue = [&](std::string_view text) {
+    constexpr std::string_view Head = "fn fs_main(in: VertexOutput) -> ";
+    const size_t head = source.find(Head);
+    const size_t brace = head == std::string::npos ? head : source.find('{', head + Head.size());
+    if (brace != std::string::npos) {
+      source.insert(brace + 1, text);
+    }
+  };
   replace("@group(1) @binding(0)\nvar<uniform> ubuf: Uniform;",
           fmt::format("struct UniformRecord {{ @size({}) value: Uniform }};\n@group(1) @binding(0)\nvar<uniform> "
                       "uniform_table: array<UniformRecord, {}>;",
@@ -940,24 +950,22 @@ void apply_uniform_table(std::string& source, const ShaderConfig& config) {
     replace("var out: VertexOutput;",
             fmt::format("var out: VertexOutput;\n    record_index = (v_record & {0}u) + (imm._pad & {0}u);\n    "
                         "out.record = record_index;", UniformRecordsPerWindow - 1));
-    replace("fn fs_main(in: VertexOutput) -> @location(0) vec4f {",
-            "fn fs_main(in: VertexOutput) -> @location(0) vec4f {\n    record_index = in.record;");
+    fragment_prologue("\n    record_index = in.record;");
   } else if (config.batchDraws) {
     replace("var out: VertexOutput;",
             fmt::format("var out: VertexOutput;\n    record_index = ((v_matrices.z >> 8u) & {0}u) + (imm._pad & {0}u);\n    "
                         "out.record = record_index;", UniformRecordsPerWindow - 1));
-    replace("fn fs_main(in: VertexOutput) -> @location(0) vec4f {",
-            "fn fs_main(in: VertexOutput) -> @location(0) vec4f {\n    record_index = in.record;");
+    fragment_prologue("\n    record_index = in.record;");
   } else {
     replace("var out: VertexOutput;", fmt::format("var out: VertexOutput;\n    record_index = imm._pad & {}u;", UniformRecordsPerWindow - 1));
-    replace("fn fs_main(in: VertexOutput) -> @location(0) vec4f {",
-            fmt::format("fn fs_main(in: VertexOutput) -> @location(0) vec4f {{\n    record_index = imm._pad & {}u;", UniformRecordsPerWindow - 1));
+    fragment_prologue(fmt::format("\n    record_index = imm._pad & {}u;", UniformRecordsPerWindow - 1));
   }
 }
 
-std::string build_shader_source(const ShaderConfig& config) noexcept {
+std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
+                                uint32_t normalAttachment) noexcept {
   ZoneScoped;
-  const auto hash = xxh3_hash(config);
+  const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
   const auto info = build_shader_info(config);
   if (EnableDebugPrints && !s_seenShaders.contains(hash)) {
     s_seenShaders.insert(hash);
@@ -1199,6 +1207,11 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
   if constexpr (EnableNormalVisualization) {
     vtxOutAttrs += fmt::format("\n    @location({}) nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.nrm = mv_nrm;";
+  }
+  const bool useNormalTarget = normalAttachment != UINT32_MAX && config.attrs[GX_VA_NRM].attrType != GX_NONE;
+  if (useNormalTarget && !(UsePerPixelLighting && info.lightingEnabled)) {
+    vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
+    vtxXfrAttrsPre += "\n    out.mv_nrm = mv_nrm;";
   }
 
   uniBufAttrs += "\n    proj: mat4x4f,";
@@ -1781,7 +1794,46 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
 
-  auto shaderSource = fmt::format(R"""(
+  if (dstAlphaMode == DstAlphaMode::Replace) {
+    // GX destination alpha is set via the blend constant
+    fragmentFn += "\n    prev.a = 1.0;";
+  }
+
+  std::string fragmentOutput;
+  std::string_view fragmentOutputType = "@location(0) vec4f"sv;
+  std::string fragmentReturn = "\n    return prev;"s;
+  if (normalAttachment != UINT32_MAX) {
+    fragmentOutput = fmt::format(
+        "\nstruct FragmentOutput {{\n"
+        "    @location(0) color: vec4f,\n"
+        "    @location({}) normal: vec4f,\n"
+        "}};\n",
+        normalAttachment);
+    fragmentOutputType = "FragmentOutput"sv;
+    fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = prev;";
+    if (useNormalTarget) {
+      fragmentReturn +=
+          "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
+          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
+          "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));";
+    } else {
+      fragmentReturn += "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);";
+    }
+    fragmentReturn += "\n    return out;";
+  }
+
+  if (dstAlphaMode == DstAlphaMode::DualSource) {
+    fragmentOutput =
+        "\nstruct FragmentOutput {\n"
+        "    @location(0) @blend_src(0) color: vec4f,\n"
+        "    @location(0) @blend_src(1) blend: vec4f,\n"
+        "};\n";
+    fragmentOutputType = "FragmentOutput"sv;
+    fragmentReturn = "\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev);";
+  }
+
+  auto shaderSource =
+      fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -2143,15 +2195,18 @@ fn vs_main({3}
     return out;
 }}
 
+{9}
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
-    return prev;
+fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
 }}
 )""",
-                                        uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
-                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre);
+                  uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn, fragmentFnPre,
+                  vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType, fragmentReturn);
   if (config.uniformTable) {
     apply_uniform_table(shaderSource, config);
+  }
+  if (dstAlphaMode == DstAlphaMode::DualSource) {
+    shaderSource.insert(0, "enable dual_source_blending;\n");
   }
   if (EnableDebugPrints) {
     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
@@ -2160,10 +2215,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
   return shaderSource;
 }
 
-wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
+wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
+                                DstAlphaMode dstAlphaMode) noexcept {
   ZoneScoped;
-  const auto shaderSource = build_shader_source(config);
-  const auto hash = xxh3_hash(config);
+  uint32_t normalAttachment = UINT32_MAX;
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    if (layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal) {
+      normalAttachment = i;
+    }
+  }
+  const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
+  const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
   wgpu::ShaderSourceWGSL wgslDescriptor{};
   wgslDescriptor.code = shaderSource.c_str();
   const auto label = fmt::format("GX Shader {:x}", hash);

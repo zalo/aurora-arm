@@ -5,7 +5,6 @@
 #include "../../gfx/texture.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../window.hpp"
-#include "../../gfx/clear.hpp"
 #include "../../webgpu/gpu.hpp"
 #include "../../gx/texture.hpp"
 #include "../vi/vi_internal.hpp"
@@ -51,34 +50,17 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
     if (gfx::tex_copy_conv::needs_conversion(texCopyFmt)) {
       handle = gfx::new_conv_texture(dstWidth, dstHeight, texCopyFmt, "Copy Conv Texture");
     } else {
-      // Configure the texture swizzle to use alpha 1.0 if targeting RGB565 or EFB doesn't have alpha
-      const auto fmt =
-          texCopyFmt == GX_TF_RGB565 || g_gxState.pixelFmt == GX_PF_RGB8_Z24 || g_gxState.pixelFmt == GX_PF_RGB565_Z16
-              ? GX_TF_RGB565
-              : GX_TF_RGBA8;
-      handle = gfx::new_render_texture(dstWidth, dstHeight, fmt, "Resolved Texture");
+      handle = gfx::new_render_texture(dstWidth, dstHeight, GX_TF_RGBA8, "Resolved Texture");
     }
     it = g_gxState.copyTextureCache.emplace(key, GXState::CopyTextureRef{.handle = handle, .revision = 0}).first;
   }
   auto& handle = it->second;
 
-  if (g_gxState.alphaUpdate && g_gxState.dstAlpha != UINT32_MAX) {
-    if (!clear) {
-      // TODO: figure out the right behavior here.
-      // should the copy have a specific alpha value but the EFB remains untouched?
-    }
-    // Overwrite alpha before resolving
-    gfx::push_draw_command(gfx::clear::DrawData{
-        .pipeline =
-            gfx::pipeline_ref(gfx::clear::make_pipeline_config(gfx::get_render_target_layout(), false, true, false)),
-        .color = wgpu::Color{0.f, 0.f, 0.f, g_gxState.dstAlpha / 255.f},
-    });
-  }
   const auto clearColor = clear && g_gxState.colorUpdate;
-  const auto clearAlpha = clear && g_gxState.alphaUpdate;
+  const auto clearAlpha = clear && g_gxState.alphaUpdate && efb_has_alpha(g_gxState.pixelFmt);
   const auto clearDepth = clear && g_gxState.depthUpdate;
   gfx::resolve_pass_into(handle.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
-                         clear_depth_value(), texCopyFmt);
+                         clear_depth_value(), texCopyFmt, g_gxState.pixelFmt);
   ++handle.revision;
   texture::touch_copy_texture(handle.handle);
   g_gxState.copyTextures[dest] = handle;

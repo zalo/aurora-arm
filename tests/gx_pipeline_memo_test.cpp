@@ -87,6 +87,8 @@ void apply(const Material& m) {
   GXSetBlendMode(m.blendMode, m.blendSrc, m.blendDst, m.logicOp);
   GXSetZMode(m.depthCompare, m.depthFunc, m.depthUpdate);
   GXSetCullMode(m.cullMode);
+  // Destination alpha and the alpha update mask only reach the pipeline on a framebuffer that stores alpha.
+  GXSetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
   GXSetDstAlpha(m.dstAlpha, m.dstAlphaValue);
   GXSetColorUpdate(m.colorUpdate);
   GXSetAlphaUpdate(m.alphaUpdate);

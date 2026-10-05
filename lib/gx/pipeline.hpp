@@ -1,11 +1,12 @@
 #pragma once
 
-#include "../gfx/types.hpp"
+#include "../gfx/pipeline_cache.hpp"
 #include "gx.hpp"
 
 namespace aurora::gx {
 struct DrawData {
   gfx::PipelineRef pipeline;
+  GXBindGroups bindGroups;
   gfx::Range vertRange;
   gfx::Range idxRange;
   gfx::Range uniformRange;
@@ -13,7 +14,6 @@ struct DrawData {
   uint32_t vtxCount;
   uint32_t indexCount;
   uint32_t instanceCount;
-  GXBindGroups bindGroups;
   uint32_t dstAlpha;
   // 0: vertices in the frame vertex stream with 16-bit indices. Otherwise resident arena index + 1
   // (resident_geometry.hpp): the whole arena is bound and the indices are absolute 32-bit.
@@ -23,7 +23,7 @@ struct DrawData {
 constexpr uint32_t GXPipelineConfigVersion = 13;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
-  uint32_t msaaSamples = 1;
+  uint32_t msaaSamples = 1; // deprecated
   ShaderConfig shaderConfig;
   GXCompare depthFunc;
   GXCullMode cullMode;
@@ -38,7 +38,18 @@ struct PipelineConfig {
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
-wgpu::RenderPipeline create_pipeline([[maybe_unused]] const PipelineConfig& config);
+struct PipelineOptions {
+  DstAlphaMode dstAlphaMode = DstAlphaMode::None;
+  bool colorUpdate = false;
+  bool alphaUpdate = false;
+  bool depthUpdate = false;
+};
+
+gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
+// GXSetDstAlpha with alpha writes on: the draw stores the constant instead of its own alpha...
+bool dst_alpha_replaces(const PipelineConfig& config) noexcept;
+// ...and when its color blend reads source alpha, that takes dual-source blending or an alpha prepass.
+bool dst_alpha_needs_source_alpha(const PipelineConfig& config) noexcept;
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 // Configuration a pipeline reference was created from (registered when it is requested or created; any thread).
 bool find_pipeline_config(gfx::PipelineRef ref, PipelineConfig& config);

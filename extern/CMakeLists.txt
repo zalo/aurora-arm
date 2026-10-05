@@ -330,12 +330,9 @@ if (AURORA_ENABLE_GX)
   if (AURORA_ENABLE_RMLUI AND NOT TARGET RmlUi)
     message(STATUS "aurora: Fetching RmlUi")
     FetchContent_Declare(rmlui
-      URL https://github.com/mikke89/RmlUi/archive/0ae381e00d7426762bb5ed897973366358b16642.tar.gz
-      URL_HASH SHA256=fa4b84db1bae7b929996beb51d79b7037cd7aec438737a0df4d3c816d9b13bd8
+      URL https://github.com/encounter/RmlUi/archive/f00a0fee38391b2f927114e11bea18dc0a7dba1e.tar.gz
+      URL_HASH SHA256=6d9fd1164b7873c9dfba72d724753bda9e3db8280c9af802eed8e2a12035f152
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      PATCH_COMMAND ${CMAKE_COMMAND}
-        -DRMLUI_SOURCE_DIR=<SOURCE_DIR>
-        -P "${CMAKE_CURRENT_LIST_DIR}/../cmake/patches/apply-rmlui-keyboard-showed-state.cmake"
       EXCLUDE_FROM_ALL
     )
     block(SCOPE_FOR VARIABLES PROPAGATE rmlui_SOURCE_DIR rmlui_BINARY_DIR rmlui_POPULATED)
@@ -344,7 +341,6 @@ if (AURORA_ENABLE_GX)
     endblock()
 
     add_library(rmlui_backends STATIC ${rmlui_SOURCE_DIR}/Backends/RmlUi_Platform_SDL.cpp)
-    # TODO: maybe dont hardcode this to SDL3?
     target_compile_definitions(rmlui_backends PUBLIC RMLUI_SDL_VERSION_MAJOR=3)
     target_include_directories(rmlui_backends PUBLIC ${rmlui_SOURCE_DIR}/Backends)
     target_link_libraries(rmlui_backends PRIVATE rmlui ${AURORA_SDL3_TARGET})

@@ -149,6 +149,7 @@ constexpr size_t MaxFogRangeLuts = 32;
 std::vector<FogRangeLutEntry> sFogRangeLuts;
 
 struct DrawCache {
+  uint64_t targetLayoutKey = 0;
   PipelineConfig config{};
   ShaderInfo shaderInfo{};
   gfx::PipelineRef pipelineRef{};
@@ -185,15 +186,18 @@ uint32_t sPipelineMemoMisses = 0;
 // reference: primitive, vertex descriptor/format and indexed array layout, fog
 // type and range flag, TEV swap table and stages, indirect stages, color
 // channels, texgens, alpha compare, cull/depth/blend state, destination alpha,
-// polygon offsets, write masks and the render pass sample count. Anything not
+// polygon offsets, write masks, the EFB pixel format, the render target layout
+// and the render pass sample count. Anything not
 // listed here (matrices, colors, textures, lights, viewport) only feeds
 // uniforms or bind groups, which are resolved separately per draw.
-uint64_t pipeline_state_hash(GXPrimitive prim, GXVtxFmt fmt) noexcept {
+uint64_t pipeline_state_hash(GXPrimitive prim, GXVtxFmt fmt, uint64_t targetLayoutKey) noexcept {
   const auto& state = g_gxState;
   Hasher hasher;
   const auto put = [&](const auto& value) { hasher.update(&value, sizeof(value)); };
   put(prim);
   put(fmt);
+  put(targetLayoutKey);
+  put(state.pixelFmt);
   const auto& vtxFmt = state.vtxFmts[fmt];
   for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
     const auto type = state.vtxDesc[i];
@@ -234,17 +238,15 @@ uint64_t pipeline_state_hash(GXPrimitive prim, GXVtxFmt fmt) noexcept {
   put(state.depthUpdate);
   put(state.alphaUpdate);
   put(state.colorUpdate);
-  const uint32_t sampleCount = gfx::get_sample_count();
-  put(sampleCount);
   return hasher.digest();
 }
 
 // Resolves the draw cache's pipeline config, shader info and pipeline reference
 // for the current GX state, reusing the memoized result when this state was
 // resolved before.
-void resolve_pipeline(GXPrimitive prim, GXVtxFmt fmt) noexcept {
+void resolve_pipeline(GXPrimitive prim, GXVtxFmt fmt, uint64_t targetLayoutKey) noexcept {
   auto& cache = sDrawCache;
-  const uint64_t key = pipeline_state_hash(prim, fmt);
+  const uint64_t key = pipeline_state_hash(prim, fmt, targetLayoutKey);
   if (const auto it = sPipelineMemo.find(key); it != sPipelineMemo.end()) {
     cache.config = it->second.config;
     cache.shaderInfo = it->second.shaderInfo;
@@ -503,14 +505,16 @@ static void prepare_pipeline(GXPrimitive prim, GXVtxFmt fmt) noexcept {
   auto& state = g_gxState;
   auto& cache = sDrawCache;
   const u8 lineMode = line_mode_for_prim(prim);
+  const auto targetLayoutKey = gfx::gx_render_target_layout().key;
   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
-                             cache.lineMode == lineMode && cache.config.msaaSamples == gfx::get_sample_count();
+                             cache.lineMode == lineMode && cache.targetLayoutKey == targetLayoutKey;
   if (!pipelineValid) {
     gfx::profile::Scope profile("pipeline_build");
     const bool hadPipeline = cache.hasPipeline;
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
-    resolve_pipeline(prim, fmt);
+    resolve_pipeline(prim, fmt, targetLayoutKey);
+    cache.targetLayoutKey = targetLayoutKey;
     cache.fmt = fmt;
     cache.lineMode = lineMode;
     cache.hasPipeline = true;
@@ -853,6 +857,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u32 vtxCount, gfx::Rang
   cache.lastDrawFmt = fmt;
   gfx::push_draw_command(DrawData{
       .pipeline = cache.pipelineRef,
+      .bindGroups = cache.bindGroups,
       .vertRange = vertRange,
       .idxRange = idxRange,
       .uniformRange = cache.uniformRange,
@@ -860,7 +865,6 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u32 vtxCount, gfx::Rang
       .vtxCount = vtxCount,
       .indexCount = numIndices,
       .instanceCount = instanceCount,
-      .bindGroups = cache.bindGroups,
       .dstAlpha = state.dstAlpha,
       .residentArena = residentArena,
   });

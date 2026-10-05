@@ -725,8 +725,13 @@ const ResolvedTextures& resolve_textures(BindGroupRef group, PipelineRef pipelin
 // through the storage buffer immediates) and no depth bias clamp (Dawn's GL backend emulates it through an
 // internal immediate whose layout the direct path does not mirror).
 bool pipeline_eligible(const gx::PipelineConfig& c) {
+  // A destination alpha that replaces the output while the color blend reads source alpha is drawn by Dawn
+  // (dual-source blending or an alpha prepass, see gx::create_pipeline); the state mirrored here covers only
+  // the single-pipeline constant-alpha form.
+  const bool dstAlphaTwoStage =
+      !c.shaderConfig.spriteAccumulate && gx::dst_alpha_replaces(c) && gx::dst_alpha_needs_source_alpha(c);
   return c.shaderConfig.cpuVertexDecode && c.shaderConfig.batchDraws && !c.shaderConfig.fogRangeEnabled &&
-         std::bit_cast<float>(c.polygonOffsetClampBits) == 0.f;
+         std::bit_cast<float>(c.polygonOffsetClampBits) == 0.f && !dstAlphaTwoStage;
 }
 
 PreparedPipeline* prepare_pipeline(PipelineRef ref) {
@@ -735,9 +740,11 @@ PreparedPipeline* prepare_pipeline(PipelineRef ref) {
     return &it->second;
   }
   PreparedPipeline p;
-  if (!gx::find_pipeline_config(ref, p.config) || !get_pipeline(ref, p.owner)) {
+  CompiledPipeline compiled;
+  if (!gx::find_pipeline_config(ref, p.config) || !get_pipeline(ref, compiled)) {
     return nullptr;
   }
+  p.owner = std::move(compiled.main);
   p.gl = GetGLInteropRenderPipeline(p.owner.Get());
   p.uniformBinding = GetGLInteropBufferBinding(p.owner.Get(), 1, 0);
   p.storageBindings = {GetGLInteropBufferBinding(p.owner.Get(), 0, 0), GetGLInteropBufferBinding(p.owner.Get(), 0, 1)};
@@ -1282,7 +1289,12 @@ bool render_clear(const clear::DrawData& d, uint32_t width, uint32_t height, uin
   glDepthMask(config.clearDepth ? GL_TRUE : GL_FALSE);
   glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
   glDepthRangef(d.depth, d.depth);
-  glScissor(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+  // The clear covers d.rect; the scissor command that follows every clear draw restores the pass's own.
+  const auto x = std::min(static_cast<uint32_t>(std::max(d.rect.x, 0)), width);
+  const auto y = std::min(static_cast<uint32_t>(std::max(d.rect.y, 0)), height);
+  glScissor(static_cast<GLint>(x), static_cast<GLint>(y),
+            static_cast<GLsizei>(std::min(static_cast<uint32_t>(std::max(d.rect.width, 0)), width - x)),
+            static_cast<GLsizei>(std::min(static_cast<uint32_t>(std::max(d.rect.height, 0)), height - y)));
   if (clear_with_gl_clear()) {
     glClearColor(static_cast<float>(d.color.r), static_cast<float>(d.color.g), static_cast<float>(d.color.b),
                  static_cast<float>(d.color.a));
@@ -1639,9 +1651,9 @@ bool encode_pass_resources(const wgpu::RenderPassEncoder& encoder, RenderPass& p
       // recording it anyway cost the whole pass's encoding plus a copy of the frame's streams into Dawn's
       // buffers (each write to a buffer the previous frames still use makes Mali reallocate all of it), every
       // frame for as long as shaders compiled, for commands the direct path then intercepted.
-      wgpu::RenderPipeline p;
+      CompiledPipeline p;
       if (get_pipeline(d.pipeline, p)) {
-        pipelines.push_back(std::move(p));
+        pipelines.push_back(std::move(p.main));
       }
     }
     if (d.residentArena != 0) {

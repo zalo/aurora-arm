@@ -109,7 +109,7 @@ wgpu::CompareFunction to_compare_function(GXCompare func) {
 }
 
 wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendFactor dstFac, GXLogicOp op,
-                                u32 dstAlpha) {
+                                u32 dstAlpha, bool dualSource) {
   wgpu::BlendComponent colorBlendComponent;
   switch (mode) {
     DEFAULT_FATAL("unsupported blend mode {}", underlying(mode));
@@ -160,6 +160,19 @@ wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendF
       break;
     }
     break;
+  }
+  if (dualSource) {
+    const auto remap = [](wgpu::BlendFactor factor) {
+      if (factor == wgpu::BlendFactor::SrcAlpha) {
+        return wgpu::BlendFactor::Src1Alpha;
+      }
+      if (factor == wgpu::BlendFactor::OneMinusSrcAlpha) {
+        return wgpu::BlendFactor::OneMinusSrc1Alpha;
+      }
+      return factor;
+    };
+    colorBlendComponent.srcFactor = remap(colorBlendComponent.srcFactor);
+    colorBlendComponent.dstFactor = remap(colorBlendComponent.dstFactor);
   }
   wgpu::BlendComponent alphaBlendComponent;
   if (dstAlpha != UINT32_MAX) {
@@ -313,22 +326,24 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
 
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
 
-wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
+wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                                    const PipelineOptions& options, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept {
   ZoneScoped;
   const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
   const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
   const float depthBiasClamp = webgpu::g_hasCoreFeatures ? std::bit_cast<float>(config.polygonOffsetClampBits) : 0.0f;
+  const bool writesDepth = config.depthCompare && options.depthUpdate;
   const wgpu::DepthStencilState depthStencil{
-      .format = g_graphicsConfig.depthFormat,
-      .depthWriteEnabled = config.depthCompare && config.depthUpdate,
+      .format = layout.depthStencilFormat,
+      .depthWriteEnabled = writesDepth,
       .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
       .depthBias = round_away_from_zero<int32_t>(depthBias),
       .depthBiasSlopeScale = depthBiasSlopeScale,
       .depthBiasClamp = depthBiasClamp,
   };
-  auto blendState =
-      to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha);
+  auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
+                                   config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
   // Half-resolution sprite accumulation (gfx/sprite_pass.hpp): rgb blends as the game asked (src * a + dst * f),
   // alpha accumulates coverage (1 - product of (1 - a)) for a destination factor of INVSRCALPHA and stays
   // untouched for ONE; alpha-tested opaque sprites store premultiplied color and full coverage.
@@ -350,15 +365,22 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
       };
     }
   }
-  const std::array colorTargets{wgpu::ColorTargetState{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
-      .blend = &blendState,
-      .writeMask = spriteAccumulate ? wgpu::ColorWriteMask::All : to_write_mask(config.colorUpdate, config.alphaUpdate),
-  }};
+  std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    colorTargets[i] = {
+        .format = layout.colorAttachments[i].format,
+        .writeMask = layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth
+                         ? wgpu::ColorWriteMask::All
+                         : wgpu::ColorWriteMask::None,
+    };
+  }
+  colorTargets[gfx::SceneColorAttachmentIndex].blend = &blendState;
+  colorTargets[gfx::SceneColorAttachmentIndex].writeMask =
+      spriteAccumulate ? wgpu::ColorWriteMask::All : to_write_mask(options.colorUpdate, options.alphaUpdate);
   const wgpu::FragmentState fragmentState{
       .module = shader,
       .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
+      .targetCount = layout.colorAttachmentCount,
       .targets = colorTargets.data(),
   };
   const wgpu::RenderPipelineDescriptor descriptor{
@@ -372,11 +394,8 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
               .buffers = vtxBuffers.data(),
           },
       .primitive = to_primitive_state(config.cullMode),
-      .depthStencil = &depthStencil,
-      .multisample =
-          wgpu::MultisampleState{
-              .count = config.msaaSamples,
-          },
+      .depthStencil = layout.depthStencilFormat != wgpu::TextureFormat::Undefined ? &depthStencil : nullptr,
+      .multisample = wgpu::MultisampleState{.count = layout.sampleCount},
       .fragment = &fragmentState,
   };
   return g_device.CreateRenderPipeline(&descriptor);
@@ -471,22 +490,34 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   }
   const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
   const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);
+  const bool hasAlpha = efb_has_alpha(g_gxState.pixelFmt);
+  const bool alphaUpdate = hasAlpha && g_gxState.alphaUpdate;
+  const auto blendFactor = [hasAlpha](GXBlendFactor factor) {
+    if (!hasAlpha) {
+      if (factor == GX_BL_DSTALPHA) {
+        return GX_BL_ONE;
+      }
+      if (factor == GX_BL_INVDSTALPHA) {
+        return GX_BL_ZERO;
+      }
+    }
+    return factor;
+  };
   config = {
-      .msaaSamples = gfx::get_sample_count(),
       .shaderConfig = config.shaderConfig,
       .depthFunc = g_gxState.depthFunc,
       .cullMode = cullMode,
       .blendMode = g_gxState.blendMode,
-      .blendFacSrc = g_gxState.blendFacSrc,
-      .blendFacDst = g_gxState.blendFacDst,
+      .blendFacSrc = blendFactor(g_gxState.blendFacSrc),
+      .blendFacDst = blendFactor(g_gxState.blendFacDst),
       .blendOp = g_gxState.blendOp,
-      .dstAlpha = g_gxState.dstAlpha,
+      .dstAlpha = alphaUpdate ? g_gxState.dstAlpha : UINT32_MAX,
       .polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset),
       .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
       .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
       .depthCompare = g_gxState.depthCompare,
       .depthUpdate = g_gxState.depthUpdate,
-      .alphaUpdate = g_gxState.alphaUpdate,
+      .alphaUpdate = alphaUpdate,
       .colorUpdate = g_gxState.colorUpdate,
   };
 }

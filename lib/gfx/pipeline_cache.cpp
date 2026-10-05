@@ -4,6 +4,7 @@
 
 #include "clear.hpp"
 #include "gles_direct.hpp"
+#include "frame_packet.hpp"
 #include "resources.hpp"
 #include "hash.hpp"
 #include "../gx/pipeline.hpp"
@@ -22,10 +23,13 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <ranges>
+#include <variant>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -43,16 +47,17 @@ constexpr int PipelineCacheSchema = 1;
 constexpr const char* InitialPipelineCacheName = "initial_pipeline_cache.db";
 constexpr const char* SdlVfsName = "aurora_pipeline_cache_sdl_vfs";
 
+using NewPipelineCallback = std::function<CompiledPipeline()>;
+
 struct CachedPipeline {
-  wgpu::RenderPipeline pipeline;
-  uint32_t firstFrameUsed = UINT32_MAX;
-  // g_pipelineTick of the last request or bind; 0 for one preloaded from the cache database and not used yet.
+  CompiledPipeline pipeline;
+  // g_pipelineTick of the last request or bind; 0 for one built ahead of time from the known configurations and
+  // not used yet.
   uint32_t lastUsedTick = 0;
 };
 
 struct PendingPipeline {
   PipelineRef hash;
-  uint32_t firstFrameUsed = UINT32_MAX;
   uint32_t lastUsedTick = 0;
   NewPipelineCallback create;
 };
@@ -63,6 +68,19 @@ struct PipelineCacheWrite {
   uint32_t configVersion;
   ByteBuffer config;
   uint32_t firstFrameUsed = UINT32_MAX;
+};
+
+using SavedPipelineConfig = std::variant<gx::PipelineConfig, clear::PipelineConfig
+#ifdef AURORA_ENABLE_RMLUI
+                                         ,
+                                         rmlui::PipelineConfig
+#endif
+                                         >;
+
+struct KnownPipeline {
+  ShaderType type;
+  SavedPipelineConfig config;
+  uint32_t firstFrameUsed;
 };
 
 struct SdlVfsSqliteFile {
@@ -85,6 +103,8 @@ static std::atomic_bool g_pipelineThreadEnd = false;
 static std::condition_variable g_pipelineQueueCv;
 static std::condition_variable g_pipelineReadyCv;
 static absl::flat_hash_map<PipelineRef, CachedPipeline> g_pipelines;
+static absl::flat_hash_map<HashType, KnownPipeline> g_knownPipelines;
+static std::optional<uint64_t> g_pipelineLayoutKey;
 static std::deque<PendingPipeline> g_pipelineQueue;
 static std::deque<PendingPipeline> g_backgroundPipelineQueue;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
@@ -103,7 +123,7 @@ static std::atomic<uint32_t> g_pipelineTick{0};
 static std::atomic<uint64_t> g_pipelineCacheGeneration{0};
 static std::atomic<uint64_t> g_evictedPipelines{0};
 static absl::flat_hash_map<PipelineRef, CachedPipeline> g_retiredPipelines;
-static std::vector<std::pair<PipelineRef, wgpu::RenderPipeline>> g_releasedPipelines;
+static std::vector<std::pair<PipelineRef, CompiledPipeline>> g_releasedPipelines;
 static size_t g_preloadedPipelines = 0;
 static std::atomic_bool g_gpuCachePrunePending = false;
 
@@ -355,6 +375,7 @@ struct AtomicStatRef {
   uint32_t operator--() { return __atomic_sub_fetch(&ref, 1, __ATOMIC_RELAXED); }
   uint32_t operator++(int) { return __atomic_fetch_add(&ref, 1, __ATOMIC_RELAXED); }
   uint32_t operator--(int) { return __atomic_fetch_sub(&ref, 1, __ATOMIC_RELAXED); }
+  uint32_t operator+=(uint32_t val) { return __atomic_add_fetch(&ref, val, __ATOMIC_RELAXED); }
   uint32_t operator=(uint32_t val) {
     __atomic_store_n(&ref, val, __ATOMIC_RELAXED);
     return val;
@@ -398,34 +419,26 @@ static auto find_pending_pipeline(Queue& queue, PipelineRef hash) {
 }
 
 enum class PipelinePriority {
-  Background, // loaded from cache
+  Background, // cache warmup
   Normal,     // async skip draw
   Blocking,   // block until compiled
 };
 
-static PendingPipeline* touch_pending_pipeline(PipelineRef hash, PipelinePriority priority) {
-  auto priorityIt = find_pending_pipeline(g_pipelineQueue, hash);
-  if (priorityIt != g_pipelineQueue.end()) {
-    return &*priorityIt;
+static void promote_pending_pipeline(PipelineRef hash, PipelinePriority priority) {
+  if (priority == PipelinePriority::Background) {
+    return;
   }
 
   auto backgroundIt = find_pending_pipeline(g_backgroundPipelineQueue, hash);
   if (backgroundIt == g_backgroundPipelineQueue.end()) {
-    return nullptr;
+    return;
   }
-  switch (priority) {
-  case PipelinePriority::Background:
-    return &*backgroundIt;
-  case PipelinePriority::Normal:
-    g_pipelineQueue.emplace_back(std::move(*backgroundIt));
-    g_backgroundPipelineQueue.erase(backgroundIt);
-    return &g_pipelineQueue.back();
-  case PipelinePriority::Blocking:
+  if (priority == PipelinePriority::Blocking) {
     g_pipelineQueue.emplace_front(std::move(*backgroundIt));
-    g_backgroundPipelineQueue.erase(backgroundIt);
-    return &g_pipelineQueue.front();
+  } else {
+    g_pipelineQueue.emplace_back(std::move(*backgroundIt));
   }
-  return nullptr;
+  g_backgroundPipelineQueue.erase(backgroundIt);
 }
 
 static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
@@ -448,8 +461,8 @@ static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
   return std::nullopt;
 }
 
-static void notify_pipeline_ready(bool queued) {
-  ++createdPipelines;
+static void notify_pipeline_ready(bool queued, uint32_t pipelineCount) {
+  createdPipelines += pipelineCount;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
     // Prune GPU cache entries after fully loading the pipeline cache.
     webgpu::cache_prune();
@@ -471,96 +484,94 @@ static bool resurrect_pipeline(PipelineRef hash) {
   return true;
 }
 
+// g_pipelineMutex held. A foreground request for a queued pipeline moves it ahead of the warm-up queue and
+// stamps its use.
+static void touch_pending_pipeline(PipelineRef hash, PipelinePriority priority, uint32_t lastUsedTick) {
+  promote_pending_pipeline(hash, priority);
+  if (priority == PipelinePriority::Background) {
+    return;
+  }
+  const auto it = find_pending_pipeline(g_pipelineQueue, hash);
+  if (it != g_pipelineQueue.end()) {
+    it->lastUsedTick = lastUsedTick;
+  }
+}
+
 static std::atomic<uint64_t> g_pipelineWaitNs{0};
 static std::atomic<uint64_t> g_pipelineWaitCount{0};
 uint64_t pipeline_wait_ns() noexcept { return g_pipelineWaitNs.load(std::memory_order_relaxed); }
 uint64_t pipeline_wait_count() noexcept { return g_pipelineWaitCount.load(std::memory_order_relaxed); }
 
-template <typename PipelineConfig>
-static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& config, NewPipelineCallback&& cb,
-                                      PipelinePriority priority = PipelinePriority::Normal,
-                                      std::optional<uint32_t> firstFrameUsedOverride = std::nullopt) {
+template <typename Config>
+static void remember_pipeline_config(ShaderType type, const Config& config, uint32_t firstFrameUsed, bool persist) {
+  const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
+  bool changed = false;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    auto [it, inserted] = g_knownPipelines.try_emplace(cacheKey, KnownPipeline{type, config, firstFrameUsed});
+    changed = inserted || firstFrameUsed < it->second.firstFrameUsed;
+    it->second.firstFrameUsed = std::min(it->second.firstFrameUsed, firstFrameUsed);
+  }
+  if (persist && changed) {
+    enqueue_pipeline_cache_write(make_pipeline_cache_write(type, cacheKey, config, firstFrameUsed));
+  }
+}
+
+static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallback&& cb,
+                                      PipelinePriority priority = PipelinePriority::Normal) {
   ZoneScoped;
 
-  const PipelineRef hash = xxh3_hash(config, static_cast<HashType>(type));
   const bool blocking = priority == PipelinePriority::Blocking;
   // The repeat shortcut holds within one frame only, so a pipeline in use is stamped at least once per frame.
   const uint32_t tick = g_pipelineTick.load(std::memory_order_relaxed);
-  if (!blocking && hash == g_lastPipelineRef && tick == g_lastPipelineTick) {
+  if (!blocking && runtimeKey == g_lastPipelineRef && tick == g_lastPipelineTick) {
     return g_lastPipelineRef;
   }
-  g_lastPipelineRef = hash;
+  g_lastPipelineRef = runtimeKey;
   g_lastPipelineTick = tick;
-  const uint32_t firstFrameUsed = firstFrameUsedOverride.value_or(current_frame());
+  // Building a known configuration ahead of time is not a use: such a pipeline stays first in line for retirement.
+  const bool foreground = priority != PipelinePriority::Background;
+  const uint32_t lastUsedTick = foreground ? tick : 0;
   bool notifyWorker = false;
-  bool persist = priority != PipelinePriority::Background;
-  const uint32_t lastUsedTick = persist ? tick : 0;
   bool pipelineReady = false;
   bool createdPipeline = false;
+  uint32_t pipelineCount = 0;
   bool queued = false;
-  std::optional<PipelineCacheWrite> cacheWrite;
   // A pipeline built on this thread (no pipeline thread). The build runs after g_pipelineMutex is dropped: it
   // needs the backend's context, which the render worker holds for a whole submit while its direct GLES passes
   // call get_pipeline(), so building under the mutex deadlocked the two threads. The hash stays in
   // g_pendingPipelines meanwhile.
   NewPipelineCallback createNow;
-  uint32_t createFirstFrameUsed = firstFrameUsed;
   {
     std::scoped_lock guard{g_pipelineMutex};
-    auto pipelineIt = g_pipelines.find(hash);
-    if (pipelineIt == g_pipelines.end() && resurrect_pipeline(hash)) {
-      pipelineIt = g_pipelines.find(hash);
+    auto pipelineIt = g_pipelines.find(runtimeKey);
+    if (pipelineIt == g_pipelines.end() && resurrect_pipeline(runtimeKey)) {
+      pipelineIt = g_pipelines.find(runtimeKey);
     }
     if (pipelineIt != g_pipelines.end()) {
       pipelineReady = true;
-      if (persist) {
+      if (foreground) {
         pipelineIt->second.lastUsedTick = lastUsedTick;
       }
-      if (persist && firstFrameUsed < pipelineIt->second.firstFrameUsed) {
-        pipelineIt->second.firstFrameUsed = firstFrameUsed;
-        cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
-      }
-    } else if (g_pendingPipelines.contains(hash)) {
+    } else if (g_pendingPipelines.contains(runtimeKey)) {
       if (blocking && !g_hasPipelineThread) {
-        auto pending = take_pending_pipeline(hash);
+        auto pending = take_pending_pipeline(runtimeKey);
         if (pending) {
-          if (firstFrameUsed < pending->firstFrameUsed) {
-            pending->firstFrameUsed = firstFrameUsed;
-            if (persist) {
-              cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
-            }
-          }
           createNow = std::move(pending->create);
-          createFirstFrameUsed = pending->firstFrameUsed;
-          g_pendingPipelines.insert(hash);
+          g_pendingPipelines.insert(runtimeKey);
           queued = true;
         }
       } else {
-        auto* pending = touch_pending_pipeline(hash, priority);
-        if (pending != nullptr && persist) {
-          pending->lastUsedTick = lastUsedTick;
-        }
-        if (pending != nullptr && firstFrameUsed < pending->firstFrameUsed) {
-          pending->firstFrameUsed = firstFrameUsed;
-          if (persist) {
-            cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
-          }
-        } else if (pending == nullptr && persist) {
-          cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
-        }
-        notifyWorker = priority != PipelinePriority::Background;
+        touch_pending_pipeline(runtimeKey, priority, lastUsedTick);
+        notifyWorker = foreground;
       }
     } else if (!g_hasPipelineThread && !g_suppressPipelineCreation &&
                (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
       createNow = std::move(cb);
-      g_pendingPipelines.insert(hash);
-      if (persist) {
-        cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
-      }
+      g_pendingPipelines.insert(runtimeKey);
     } else {
       PendingPipeline pending{
-          .hash = hash,
-          .firstFrameUsed = firstFrameUsed,
+          .hash = runtimeKey,
           .lastUsedTick = lastUsedTick,
           .create = std::move(cb),
       };
@@ -575,38 +586,30 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
         g_pipelineQueue.emplace_front(std::move(pending));
         break;
       }
-      g_pendingPipelines.insert(hash);
-      if (persist) {
-        cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
-      }
+      g_pendingPipelines.insert(runtimeKey);
       ++queuedPipelines;
       notifyWorker = true;
     }
   }
 
-  if (cacheWrite) {
-    enqueue_pipeline_cache_write(std::move(*cacheWrite));
-    cacheWrite.reset();
-  }
-
   if (createNow) {
-    auto pipeline = createNow();
+    auto result = createNow();
+    pipelineCount = result.pipeline_count();
     {
       std::scoped_lock guard{g_pipelineMutex};
-      g_pipelines.try_emplace(hash, CachedPipeline{
-                                        .pipeline = std::move(pipeline),
-                                        .firstFrameUsed = createFirstFrameUsed,
-                                        .lastUsedTick = lastUsedTick,
-                                    });
-      g_pendingPipelines.erase(hash);
-      ++g_pipelinesPerFrame;
+      g_pipelines.try_emplace(runtimeKey, CachedPipeline{
+                                              .pipeline = std::move(result),
+                                              .lastUsedTick = lastUsedTick,
+                                          });
+      g_pendingPipelines.erase(runtimeKey);
+      g_pipelinesPerFrame += std::max(1u, pipelineCount);
     }
     pipelineReady = true;
     createdPipeline = true;
   }
 
   if (createdPipeline) {
-    notify_pipeline_ready(queued);
+    notify_pipeline_ready(queued, pipelineCount);
   }
 
   if (notifyWorker) {
@@ -617,27 +620,39 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
     std::unique_lock lock{g_pipelineMutex};
     if (g_config.renderStats) {
       const auto waitStart = std::chrono::steady_clock::now();
-      g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; });
+      g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(runtimeKey) || g_pipelineThreadEnd; });
       g_pipelineWaitNs.fetch_add(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count(),
           std::memory_order_relaxed);
       g_pipelineWaitCount.fetch_add(1, std::memory_order_relaxed);
     } else {
-      g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; });
-    }
-    auto pipelineIt = g_pipelines.find(hash);
-    if (pipelineIt != g_pipelines.end() && persist && firstFrameUsed < pipelineIt->second.firstFrameUsed) {
-      pipelineIt->second.firstFrameUsed = firstFrameUsed;
-      cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
+      g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(runtimeKey) || g_pipelineThreadEnd; });
     }
   }
-
-  if (cacheWrite) {
-    enqueue_pipeline_cache_write(std::move(*cacheWrite));
-  }
-
-  return hash;
+  return runtimeKey;
 }
+
+static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& config, const RenderTargetLayout& layout,
+                                    PipelinePriority priority) {
+  const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(type)));
+  return find_pipeline_impl(runtimeKey, [config, layout] { return create_pipeline(config, layout); }, priority);
+}
+
+static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig& config,
+                                    const RenderTargetLayout& layout, PipelinePriority priority) {
+  const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(type)));
+  return find_pipeline_impl(
+      runtimeKey, [config, layout] { return CompiledPipeline{.main = create_pipeline(config, layout)}; }, priority);
+}
+
+#ifdef AURORA_ENABLE_RMLUI
+static PipelineRef resolve_pipeline(ShaderType type, const rmlui::PipelineConfig& config, const RenderTargetLayout&,
+                                    PipelinePriority priority) {
+  return find_pipeline_impl(
+      xxh3_hash(config, static_cast<HashType>(type)),
+      [config] { return CompiledPipeline{.main = rmlui::create_pipeline(config)}; }, priority);
+}
+#endif
 
 static void pipeline_cache_abort() {
   g_pipelineCacheBroken = true;
@@ -1094,25 +1109,25 @@ static void pipeline_worker() {
       source.pop_front();
     }
     auto result = pending.create();
+    const auto pipelineCount = result.pipeline_count();
     {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, CachedPipeline{
                                                 .pipeline = std::move(result),
-                                                .firstFrameUsed = pending.firstFrameUsed,
                                                 .lastUsedTick = pending.lastUsedTick,
                                             });
       g_pendingPipelines.erase(pending.hash);
       hasMore = !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty();
     }
     if (!g_hasPipelineThread) {
-      ++g_pipelinesPerFrame;
+      g_pipelinesPerFrame += std::max(1u, pipelineCount);
     }
-    notify_pipeline_ready(true);
+    notify_pipeline_ready(true, pipelineCount);
   }
 }
 
-template <typename PipelineConfig, typename CreateFn>
-static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersion, CreateFn&& create) {
+template <typename PipelineConfig>
+static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersion) {
   if (!prepare_pipeline_cache_db()) {
     return 0;
   }
@@ -1149,7 +1164,7 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
       continue;
     }
 
-    find_pipeline_impl(type, config, [=] { return create(config); }, PipelinePriority::Background, firstFrameUsed);
+    remember_pipeline_config(type, config, firstFrameUsed, false);
     ++acceptedRows;
     ++g_preloadedPipelines;
   }
@@ -1177,13 +1192,11 @@ static size_t load_pipeline_cache() {
 
   size_t acceptedRows = 0;
 #ifdef AURORA_ENABLE_RMLUI
-  acceptedRows += load_pipeline_cache_entries<rmlui::PipelineConfig>(ShaderType::Rml, rmlui::RmlPipelineConfigVersion,
-                                                                     rmlui::create_pipeline);
+  acceptedRows += load_pipeline_cache_entries<rmlui::PipelineConfig>(ShaderType::Rml, rmlui::RmlPipelineConfigVersion);
 #endif
-  acceptedRows += load_pipeline_cache_entries<clear::PipelineConfig>(
-      ShaderType::Clear, clear::ClearPipelineConfigVersion, clear::create_pipeline);
   acceptedRows +=
-      load_pipeline_cache_entries<gx::PipelineConfig>(ShaderType::GX, gx::GXPipelineConfigVersion, gx::create_pipeline);
+      load_pipeline_cache_entries<clear::PipelineConfig>(ShaderType::Clear, clear::ClearPipelineConfigVersion);
+  acceptedRows += load_pipeline_cache_entries<gx::PipelineConfig>(ShaderType::GX, gx::GXPipelineConfigVersion);
   return acceptedRows;
 }
 
@@ -1211,20 +1224,20 @@ static void stop_pipeline_cache_writer() {
   g_pipelineCacheWriteQueue.clear();
 }
 
-template <>
-PipelineRef find_pipeline(ShaderType type, const clear::PipelineConfig& config, NewPipelineCallback&& cb) {
-  return find_pipeline_impl(type, config, std::move(cb));
+PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout) {
+  remember_pipeline_config(ShaderType::Clear, config, current_frame(), true);
+  return resolve_pipeline(ShaderType::Clear, config, layout, PipelinePriority::Normal);
 }
 
-template <>
-PipelineRef find_pipeline(ShaderType type, const gx::PipelineConfig& config, NewPipelineCallback&& cb) {
-  return find_pipeline_impl(type, config, std::move(cb));
+PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
+  remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
+  return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal);
 }
 
 #ifdef AURORA_ENABLE_RMLUI
-template <>
-PipelineRef find_pipeline(ShaderType type, const rmlui::PipelineConfig& config, NewPipelineCallback&& cb) {
-  return find_pipeline_impl(type, config, std::move(cb), PipelinePriority::Blocking, 0);
+PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
+  remember_pipeline_config(ShaderType::Rml, config, 0, true);
+  return resolve_pipeline(ShaderType::Rml, config, {}, PipelinePriority::Blocking);
 }
 #endif
 
@@ -1289,6 +1302,51 @@ static size_t pipeline_cache_max() {
   return memTotalKb <= 1300000 ? 448 : memTotalKb <= 3000000 ? 1024 : 0;
 }
 
+void rebuild_pipeline_cache() {
+  ZoneScoped;
+  const auto scene = scene_render_target_layout();
+  auto offscreen = scene;
+  offscreen.colorAttachmentCount = 1;
+  offscreen.sampleCount = 1;
+  detail::finalize_render_target_layout(offscreen);
+  g_pipelineLayoutKey = scene.key;
+
+  std::vector<KnownPipeline> known;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    known.reserve(g_knownPipelines.size());
+    for (const auto& pipeline : g_knownPipelines | std::views::values) {
+      known.push_back(pipeline);
+    }
+  }
+  std::ranges::sort(known, {}, &KnownPipeline::firstFrameUsed);
+  // A bounded cache builds only the head ahead of time, like the database preload: every configuration this
+  // session has seen would otherwise be compiled at once when the layout changes.
+  if (g_pipelineCacheMax != 0) {
+    const size_t preloadMax = g_pipelineCacheMax - g_pipelineCacheMax / 8;
+    if (known.size() > preloadMax) {
+      known.resize(preloadMax);
+    }
+  }
+  for (const auto& pipeline : known) {
+    std::visit(
+        [&](const auto& config) {
+          // Sprite accumulation variants draw into the sprite pass, whose layout is not known here; they are
+          // built when a segment first asks for them.
+          if constexpr (requires { config.shaderConfig.spriteAccumulate; }) {
+            if (config.shaderConfig.spriteAccumulate) {
+              return;
+            }
+          }
+          resolve_pipeline(pipeline.type, config, scene, PipelinePriority::Background);
+          if (offscreen.key != scene.key) {
+            resolve_pipeline(pipeline.type, config, offscreen, PipelinePriority::Background);
+          }
+        },
+        pipeline.config);
+  }
+}
+
 void initialize_pipeline_cache() {
   g_pipelineCacheMax = pipeline_cache_max();
   g_preloadedPipelines = 0;
@@ -1310,9 +1368,11 @@ void initialize_pipeline_cache() {
   }
 
   const size_t loadedCount = load_pipeline_cache();
+  rebuild_pipeline_cache();
   // The prune drops every Dawn cache blob the preload did not touch. A truncated preload leaves the blobs of
   // the pipelines that compile on demand later untouched, and those must stay warm.
-  const bool preloadTruncated = g_pipelineCacheMax != 0 && g_preloadedPipelines >= g_pipelineCacheMax - g_pipelineCacheMax / 8;
+  const bool preloadTruncated =
+      g_pipelineCacheMax != 0 && g_preloadedPipelines >= g_pipelineCacheMax - g_pipelineCacheMax / 8;
   if (!g_pipelineCacheBroken && loadedCount > 0 && !preloadTruncated) {
     g_gpuCachePrunePending = true;
   }
@@ -1339,6 +1399,8 @@ void shutdown_pipeline_cache() {
   g_pipelines.clear();
   g_retiredPipelines.clear();
   g_releasedPipelines.clear();
+  g_knownPipelines.clear();
+  g_pipelineLayoutKey.reset();
   g_pipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
   g_pendingPipelines.clear();
@@ -1387,6 +1449,9 @@ void begin_pipeline_frame() {
   if (g_pipelineCacheMax != 0 && tick % PipelineSweepPeriod == 0) {
     sweep_pipelines(tick);
   }
+  if (g_pipelineLayoutKey != scene_render_target_layout().key) {
+    rebuild_pipeline_cache();
+  }
 }
 
 void end_pipeline_frame() {
@@ -1395,7 +1460,7 @@ void end_pipeline_frame() {
   }
 }
 
-bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
+bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
   auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {
@@ -1403,6 +1468,9 @@ bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
       return false;
     }
     it = g_pipelines.find(ref);
+  }
+  if (!it->second.pipeline.main) {
+    return false;
   }
   it->second.lastUsedTick = g_pipelineTick.load(std::memory_order_relaxed);
   pipeline = it->second.pipeline;
@@ -1412,7 +1480,7 @@ bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
 uint64_t pipeline_cache_generation() noexcept { return g_pipelineCacheGeneration.load(std::memory_order_acquire); }
 
 void release_retired_pipelines() {
-  std::vector<std::pair<PipelineRef, wgpu::RenderPipeline>> released;
+  std::vector<std::pair<PipelineRef, CompiledPipeline>> released;
   {
     std::lock_guard lock{g_pipelineMutex};
     if (g_releasedPipelines.empty()) {

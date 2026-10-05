@@ -4,6 +4,10 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/AuroraCopyRuntimeDLLs.cmake)
 
 set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
 
+if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  add_compile_options(/Zc:__cplusplus)
+endif ()
+
 if (NOT TARGET gtest)
   FetchContent_Declare(googletest
     URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
@@ -23,6 +27,43 @@ target_include_directories(io_tests PRIVATE ../lib)
 target_link_libraries(io_tests PRIVATE gtest gtest_main ${AURORA_SDL3_TARGET})
 aurora_copy_runtime_dlls(io_tests)
 gtest_discover_tests(io_tests)
+
+add_executable(input_tests
+  input_binding_test.cpp
+  input_router_test.cpp
+  ../lib/input/binding.cpp
+  ../lib/input/capture.cpp
+  ../lib/input/router.cpp
+  ../lib/input/source_state.cpp
+)
+target_include_directories(input_tests PRIVATE
+  ../include
+  ../lib
+)
+target_compile_definitions(input_tests PRIVATE AURORA TARGET_PC)
+target_link_libraries(input_tests PRIVATE gtest gtest_main ${AURORA_SDL3_TARGET})
+aurora_copy_runtime_dlls(input_tests)
+gtest_discover_tests(input_tests)
+
+add_executable(pad_adapter_tests
+  pad_adapter_test.cpp
+)
+target_include_directories(pad_adapter_tests PRIVATE
+  ../include
+  ../lib
+)
+target_link_libraries(pad_adapter_tests PRIVATE aurora::pad gtest gtest_main)
+if (AURORA_ENABLE_GX)
+  target_link_libraries(pad_adapter_tests PRIVATE aurora::gx aurora::vi)
+  if (NOT MSVC AND NOT APPLE)
+    # aurora::core calls into aurora::gx and aurora::vi here (render worker, FIFO, direct submission), so the
+    # static archives have to be searched as one group.
+    target_link_libraries(pad_adapter_tests PRIVATE
+      "$<LINK_GROUP:RESCAN,aurora_core,aurora_gx,aurora_vi>")
+  endif ()
+endif ()
+aurora_copy_runtime_dlls(pad_adapter_tests)
+gtest_discover_tests(pad_adapter_tests)
 
 add_executable(time_tests
   time_test.cpp

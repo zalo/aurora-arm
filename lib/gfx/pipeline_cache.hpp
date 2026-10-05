@@ -2,8 +2,6 @@
 
 #include "types.hpp"
 
-#include <functional>
-
 namespace aurora::gfx::clear {
 struct PipelineConfig;
 } // namespace aurora::gfx::clear
@@ -24,17 +22,26 @@ enum class ShaderType : uint8_t {
   Rml = 2,
 };
 
-using NewPipelineCallback = std::function<wgpu::RenderPipeline()>;
+struct CompiledPipeline {
+  wgpu::RenderPipeline main;
+  wgpu::RenderPipeline prepass;
+
+  [[nodiscard]] uint32_t pipeline_count() const {
+    return static_cast<uint32_t>(static_cast<bool>(main)) + static_cast<uint32_t>(static_cast<bool>(prepass));
+  }
+};
 
 void initialize_pipeline_cache();
 void shutdown_pipeline_cache();
 void begin_pipeline_frame();
 void end_pipeline_frame();
+void rebuild_pipeline_cache();
 
-template <typename Config>
-PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
+PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout);
+PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);
+PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
 
-bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
+bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
 // Bounded cache (AURORA_PIPELINE_CACHE_MAX, RAM-scaled by default). Changes whenever pipelines are retired:
 // whoever memoizes PipelineRefs outside this cache drops them then and asks find_pipeline again, which is what
 // keeps a pipeline in use alive (or recompiles one that was released).

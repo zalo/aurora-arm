@@ -89,10 +89,12 @@ struct RenderPass {
   wgpu::Texture copySourceTexture;
   wgpu::TextureView copySourceView;
   wgpu::TextureView copySourceDepthView;
+  wgpu::Texture copySourceNormalTexture;
   uint32_t msaaSamples = 1;
 
   TextureHandle resolveTarget;
   GXTexFmt resolveFormat = GX_TF_RGBA8;
+  GXPixelFmt resolveSourceFormat = GX_PF_RGBA6_Z24;
   ClipRect resolveRect;
   Range resolveUniformRange;
   // Additional EFB copies resolved from this pass. Pass fusion (recording.cpp) records the EFB pass that follows a
@@ -108,6 +110,7 @@ struct RenderPass {
   Range dualResolveUniformRange;
   wgpu::Texture snapshotColorDst;
   wgpu::TextureView snapshotDepthDst;
+  wgpu::Texture snapshotNormalDst;
   float clearDepthValue = 1.f;
   wgpu::LoadOp depthLoadOp = wgpu::LoadOp::Undefined;
   wgpu::StoreOp depthStoreOp = wgpu::StoreOp::Store;
@@ -134,7 +137,7 @@ struct RenderPass {
   bool directResourcesOnly = false;
 
   RenderTargetLayout target_layout() const noexcept;
-  bool has_consumer() const { return resolveTarget || snapshotColorDst || snapshotDepthDst; }
+  bool has_consumer() const { return resolveTarget || snapshotColorDst || snapshotDepthDst || snapshotNormalDst; }
   bool has_content() const {
     if (hasDraws || clearDepth) {
       return true;

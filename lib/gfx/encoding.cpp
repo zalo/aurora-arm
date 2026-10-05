@@ -36,7 +36,7 @@ using webgpu::g_queue;
 
 namespace {
 constexpr Module Log{"aurora::gfx"};
-PipelineRef g_currentPipeline;
+WGPURenderPipeline g_currentPipeline = nullptr;
 
 void apply_viewport(const wgpu::RenderPassEncoder& pass, const Viewport& vp) {
   const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
@@ -111,7 +111,7 @@ void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const E
 
 void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, RenderPass& passInfo) {
   ZoneScoped;
-  g_currentPipeline = UINTPTR_MAX;
+  g_currentPipeline = nullptr;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> lastDebugGroupStack;
 #endif
@@ -164,7 +164,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
     } break;
     case CommandType::CustomDraw: {
       render_custom_draw(cmd.data.customDraw, pass, passInfo);
-      g_currentPipeline = UINTPTR_MAX;
+      g_currentPipeline = nullptr;
       pass.SetBindGroup(0, resources().staticBindGroup);
       pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
       if (hasViewport) {
@@ -209,14 +209,18 @@ void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const S
   }
   const tex_copy_conv::ConvRequest convReq{
       .fmt = format,
+      .srcFmt = passInfo.resolveSourceFormat,
       .srcView = isDepth ? passInfo.copySourceDepthView : scene.view,
       .uniformRange = uniformRange,
       .dst = target,
       .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
   };
+  // An EFB without alpha needs no opaque-alpha blit here: it holds alpha 1 (see resolve_pass_into in
+  // recording.cpp), so the plain copy below already yields an opaque texture.
+  const bool sameFormat = target->format == passInfo.colorAttachments[SceneColorAttachmentIndex].format;
   if (needsConversion) {
     tex_copy_conv::run(cmd, convReq);
-  } else if (needsScaling) {
+  } else if (needsScaling || !sameFormat) {
     tex_copy_conv::blit(cmd, convReq);
   } else {
     const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
@@ -243,7 +247,7 @@ void resolve_copy(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const S
 // A fused pass whose two copies share a conversion format and need no scaling converts both in one render pass
 // with two color targets instead of one pass per copy.
 bool resolve_dual(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const SceneSource& scene) {
-  if (passInfo.extraResolves.size() != 1 || passInfo.dualResolveUniformRange.size != 32) {
+  if (passInfo.extraResolves.size() != 1 || passInfo.dualResolveUniformRange.size != sizeof(tex_copy_conv::DualUniforms)) {
     return false;
   }
   const auto& extra = passInfo.extraResolves[0];
@@ -260,6 +264,7 @@ bool resolve_dual(wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const S
   }
   const tex_copy_conv::ConvRequest convReq{
       .fmt = passInfo.resolveFormat,
+      .srcFmt = passInfo.resolveSourceFormat,
       .srcView = scene.view,
       .dst = passInfo.resolveTarget,
       .sampleFilter = tex_copy_conv::SampleFilter::Nearest,
@@ -395,6 +400,21 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   if (passInfo.snapshotDepthDst) {
     tex_copy_conv::snapshot_depth(cmd, passInfo.copySourceDepthView, passInfo.msaaSamples, passInfo.snapshotDepthDst);
   }
+  if (passInfo.snapshotNormalDst) {
+    const webgpu::gpu_prof::Zone zone{cmd, "Normal snapshot"};
+    const wgpu::TexelCopyTextureInfo src{
+        .texture = passInfo.copySourceNormalTexture,
+    };
+    const wgpu::TexelCopyTextureInfo dst{
+        .texture = passInfo.snapshotNormalDst,
+    };
+    const wgpu::Extent3D size{
+        .width = passInfo.colorAttachments[SceneColorAttachmentIndex].size.width,
+        .height = passInfo.colorAttachments[SceneColorAttachmentIndex].size.height,
+        .depthOrArrayLayers = 1,
+    };
+    cmd.CopyTextureToTexture(&src, &dst, &size);
+  }
 }
 
 constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
@@ -493,16 +513,21 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
 }
 } // namespace detail
 
-bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
-  if (ref == g_currentPipeline) {
-    return true;
+void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassEncoder& pass) {
+  if (pipeline.Get() == g_currentPipeline) {
+    return;
   }
-  wgpu::RenderPipeline pipeline;
+  pass.SetPipeline(pipeline);
+  g_currentPipeline = pipeline.Get();
+}
+
+bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
+  CompiledPipeline pipeline;
   if (!get_pipeline(ref, pipeline)) {
     return false;
   }
-  pass.SetPipeline(pipeline);
-  g_currentPipeline = ref;
+  AURORA_ASSERT(!pipeline.prepass, "Prepass pipelines require individual binding");
+  bind_pipeline(pipeline.main, pass);
   return true;
 }
 } // namespace aurora::gfx

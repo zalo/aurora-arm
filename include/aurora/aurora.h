@@ -152,6 +152,15 @@ typedef struct {
   bool disableRenderPassFusion;
 
   /*
+   * GXCopyTex(..., GX_TRUE) clears the whole EFB instead of only the copied rectangle. The two are the same
+   * when nothing outside the rectangle is used afterwards (render-to-texture passes at the start of a frame),
+   * and the whole-target clear is a render pass load op where the rectangle is a clear draw over loaded
+   * contents, which costs a full-target readback per copy on tile-based GPUs. Render pass fusion and the small
+   * copy pass interval apply only to whole-target clears.
+   */
+  bool wholeTargetCopyClear;
+
+  /*
    * Decode GX vertex attributes on the CPU into conventional vertex buffers instead of fetching
    * them from storage buffers in the vertex shader. Produces the same vertex values; intended for
    * GLES-class GPUs where vertex-shader storage buffer reads are slow or unavailable.
@@ -321,6 +330,9 @@ void aurora_set_background_input(bool value);
 void aurora_set_resampler(AuroraSampler sampler);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
+
+SDL_Window* aurora_get_window();
+AuroraWindowSize aurora_get_window_size();
 
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);

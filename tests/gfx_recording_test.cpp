@@ -5,6 +5,7 @@
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/resources.hpp"
+#include "gfx/tex_copy_conv.hpp"
 #include "gfx/texture.hpp"
 #include "gx/gx.hpp"
 #include "gx/pipeline.hpp"
@@ -35,6 +36,8 @@ protected:
     // Without a device the limits hold the "undefined" sentinel; uniform pushes need a real alignment.
     detail::resources().limits.minUniformBufferOffsetAlignment = 256;
     g_config.disableRenderPassFusion = false;
+    // The fusion and small-copy tests are about copies that clear the whole target, as the port configures it.
+    g_config.wholeTargetCopyClear = true;
     gx::g_gxState.clearColor = clear_value();
     gx::g_gxState.colorUpdate = true;
     gx::g_gxState.alphaUpdate = true;
@@ -66,7 +69,7 @@ protected:
     auto target = std::make_shared<TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{}, size,
                                                ColorFormat, 1, GX_TF_RGBA8);
     resolve_pass_into(std::move(target), {0, 0, static_cast<int32_t>(size.width), static_cast<int32_t>(size.height)},
-                      false, false, false, {}, 1.f);
+                      false, false, false, {}, 1.f, GX_TF_RGBA8, GX_PF_RGBA6_Z24);
   }
 
   size_t count_efb_passes() const {
@@ -109,7 +112,7 @@ protected:
   static void copy(TextureHandle target, const ClipRect& rect = SmallRect, bool clearColor = true,
                    bool clearAlpha = false, bool clearDepth = false, Vec4<float> clearValue = clear_value()) {
     resolve_pass_into(std::move(target), rect, clearColor, clearAlpha, clearDepth, clearValue, gx::clear_depth_value(),
-                      GX_TF_I8);
+                      GX_TF_I8, GX_PF_RGBA6_Z24);
   }
 
   // Records a small segment and its copy. With fusion the pass stays open for the segment that follows.
@@ -271,7 +274,7 @@ TEST_F(GfxRecordingTest, AdjacentSmallCopiesFuseIntoOnePass) {
   EXPECT_EQ(fused.extraResolves[0].target, second);
   EXPECT_EQ(fused.extraResolves[0].rect, (ClipRect{256, 0, 256, 256}));
   EXPECT_EQ(fused.extraResolves[0].format, GX_TF_I8);
-  EXPECT_EQ(fused.extraResolves[0].uniformRange.size, 16u);
+  EXPECT_EQ(fused.extraResolves[0].uniformRange.size, sizeof(tex_copy_conv::Uniforms));
   EXPECT_EQ(fused.writeMask, WriteColor);
   // The second segment was recorded right of the first copy rectangle.
   EXPECT_EQ(count_commands(fused, detail::CommandType::Draw), 2u);
@@ -300,7 +303,7 @@ TEST_F(GfxRecordingTest, FusedPassCarriesBothConversionTransforms) {
 
   ASSERT_EQ(frame.renderPasses.size(), 2u);
   const auto& fused = frame.renderPasses[0];
-  ASSERT_EQ(fused.dualResolveUniformRange.size, 32u);
+  ASSERT_EQ(fused.dualResolveUniformRange.size, sizeof(tex_copy_conv::DualUniforms));
   std::array<float, 8> transforms{};
   std::memcpy(transforms.data(), frame.uniforms.data() + fused.dualResolveUniformRange.offset, sizeof(transforms));
   const float w = 256.f / 640.f;

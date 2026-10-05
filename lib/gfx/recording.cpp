@@ -61,6 +61,7 @@ struct FrameRecorder {
   Viewport cachedViewport;
   ClipRect cachedScissor;
   bool suppressRenderWorker = false;
+  bool normalRequested = false;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> debugGroupStack;
 #endif
@@ -168,7 +169,12 @@ void set_efb_targets(RenderPass& pass) {
     auto& color = pass.colorAttachments[i];
     color.semantic = layout.colorAttachments[i].semantic;
     color.format = layout.colorAttachments[i].format;
-    AURORA_ASSERT(false, "Scene render-target attachment {} has no backing texture", i);
+    if (color.semantic == ColorAttachmentSemantic::Normal) {
+      color.size = webgpu::g_normalBuffer.size;
+      color.view = webgpu::g_normalBuffer.view;
+    } else {
+      AURORA_ASSERT(false, "Scene render-target attachment {} has no backing texture", i);
+    }
   }
   pass.depthStencilView = webgpu::g_depthBuffer.view;
   pass.depthStencilFormat = layout.depthStencilFormat;
@@ -177,6 +183,9 @@ void set_efb_targets(RenderPass& pass) {
   pass.copySourceView =
       webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : webgpu::g_frameBuffer.view;
   pass.copySourceDepthView = webgpu::g_depthBuffer.view;
+  if (webgpu::g_graphicsConfig.normalBuffer) {
+    pass.copySourceNormalTexture = webgpu::g_normalBuffer.texture;
+  }
   pass.msaaSamples = layout.sampleCount;
   pass.hasDepth = true;
   pass.hasStencil = false;
@@ -216,6 +225,7 @@ absl::flat_hash_map<OffscreenCacheKey, OffscreenCacheEntry> g_offscreenCache;
 struct PassSnapshotEntry {
   webgpu::TextureWithSampler color;
   webgpu::TextureWithSampler depth; // R32Float raw depth
+  webgpu::TextureWithSampler normal;
 };
 struct PassSnapshotPool {
   std::vector<PassSnapshotEntry> entries;
@@ -223,7 +233,8 @@ struct PassSnapshotPool {
 };
 std::array<PassSnapshotPool, FrameSlotCount> g_passSnapshotPools;
 
-PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool wantColor, bool wantDepth) {
+PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool wantColor, bool wantDepth,
+                                         bool wantNormal) {
   auto& pool = g_passSnapshotPools[g_recorder.frameSlot];
   if (pool.used == pool.entries.size()) {
     pool.entries.emplace_back();
@@ -235,7 +246,7 @@ PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool w
     const auto format = webgpu::g_graphicsConfig.surfaceConfiguration.format;
     const wgpu::TextureDescriptor desc{
         .label = "Pass Snapshot Color",
-        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
+        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
         .dimension = wgpu::TextureDimension::e2D,
         .size = size,
         .format = format,
@@ -254,7 +265,7 @@ PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool w
   if (wantDepth && (!entry.depth.texture || entry.depth.size.width != width || entry.depth.size.height != height)) {
     const wgpu::TextureDescriptor desc{
         .label = "Pass Snapshot Depth",
-        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
         .dimension = wgpu::TextureDimension::e2D,
         .size = size,
         .format = wgpu::TextureFormat::R32Float,
@@ -268,6 +279,25 @@ PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool w
         .view = std::move(view),
         .size = size,
         .format = wgpu::TextureFormat::R32Float,
+    };
+  }
+  if (wantNormal && (!entry.normal.texture || entry.normal.size.width != width || entry.normal.size.height != height)) {
+    const wgpu::TextureDescriptor desc{
+        .label = "Pass Snapshot Normal",
+        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
+        .dimension = wgpu::TextureDimension::e2D,
+        .size = size,
+        .format = webgpu::NormalBufferFormat,
+        .mipLevelCount = 1,
+        .sampleCount = 1,
+    };
+    auto texture = webgpu::g_device.CreateTexture(&desc);
+    auto view = texture.CreateView();
+    entry.normal = webgpu::TextureWithSampler{
+        .texture = std::move(texture),
+        .view = std::move(view),
+        .size = size,
+        .format = webgpu::NormalBufferFormat,
     };
   }
   return entry;
@@ -573,6 +603,7 @@ void resume_efb_pass_loading(const RenderPass& prevPass) {
       .copySourceTexture = prevPass.copySourceTexture,
       .copySourceView = prevPass.copySourceView,
       .copySourceDepthView = prevPass.copySourceDepthView,
+      .copySourceNormalTexture = prevPass.copySourceNormalTexture,
       .msaaSamples = prevPass.msaaSamples,
       .clearDepth = false,
       .hasDepth = prevPass.hasDepth,
@@ -708,6 +739,9 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
     profile::fifoFrame.store(packet.frameId, std::memory_order_release);
   }
   CHECK(!g_recorder.active(), "A recording session is already active");
+  if (g_recorder.normalRequested && webgpu::enable_normal_buffer()) {
+    g_recorder.normalRequested = false;
+  }
   g_recorder.packet = &packet;
   g_recorder.frameSlot = frameSlot;
   g_passSnapshotPools[frameSlot].used = 0;
@@ -721,6 +755,10 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   pass.label = pass_label("EFB");
   set_efb_targets(pass);
   pass.colorAttachments[SceneColorAttachmentIndex].clearValue = gx::g_gxState.clearColor;
+  if (!gx::efb_has_alpha(gx::g_gxState.pixelFmt)) {
+    // Matches resolve_pass_into: an EFB without alpha holds alpha 1.
+    pass.colorAttachments[SceneColorAttachmentIndex].clearValue.w() = 1.f;
+  }
   pass.clearDepthValue = gx::clear_depth_value();
   g_recorder.currentRenderPass = 0;
   g_recorder.cachedViewport = gx::map_logical_viewport(gx::g_gxState.logicalViewport);
@@ -790,6 +828,7 @@ void shutdown_recording() {
   g_passFusion = {};
   g_sprites = {};
   g_smallCopies = {};
+  g_recorder.normalRequested = false;
 }
 
 namespace testing {
@@ -1004,13 +1043,49 @@ void push_draw_command(clear::DrawData data) {
 
 template <>
 PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
-  const PipelineRef ref = find_pipeline(ShaderType::Clear, config, [=] { return create_pipeline(config); });
+  const PipelineRef ref = find_pipeline(config, get_render_target_layout());
   clear::remember_pipeline_config(ref, config); // the direct path clears from the configuration alone
   return ref;
 }
 
 namespace {
-// The EFB pass that follows an EFB copy: same targets, contents loaded unless cleared.
+// The part of the target an EFB copy clears. GX clears the copied rectangle; AuroraConfig::wholeTargetCopyClear
+// widens that to the whole target, which keeps the clear a load op on tile-based GPUs.
+struct CopyClearRegion {
+  ClipRect rect;
+  bool fullTarget = true;
+};
+
+CopyClearRegion whole_target_region(const RenderPass& pass) {
+  const auto& size = pass.colorAttachments[SceneColorAttachmentIndex].size;
+  return {
+      .rect = {.x = 0,
+               .y = 0,
+               .width = static_cast<int32_t>(size.width),
+               .height = static_cast<int32_t>(size.height)},
+      .fullTarget = true,
+  };
+}
+
+CopyClearRegion copy_clear_region(const RenderPass& pass, const ClipRect& rect) {
+  if (g_config.wholeTargetCopyClear) {
+    return whole_target_region(pass);
+  }
+  const auto& size = pass.colorAttachments[SceneColorAttachmentIndex].size;
+  const auto width = static_cast<int32_t>(size.width);
+  const auto height = static_cast<int32_t>(size.height);
+  const auto left = std::clamp<int32_t>(rect.x, 0, width);
+  const auto top = std::clamp<int32_t>(rect.y, 0, height);
+  const auto right = std::clamp<int32_t>(rect.x + rect.width, left, width);
+  const auto bottom = std::clamp<int32_t>(rect.y + rect.height, top, height);
+  return {
+      .rect = {.x = left, .y = top, .width = right - left, .height = bottom - top},
+      .fullTarget = left == 0 && top == 0 && right == width && bottom == height,
+  };
+}
+
+// The EFB pass that follows an EFB copy: same targets, contents loaded unless cleared. `clearDepth` and
+// `fullColorClear` are whole-target clears and become load ops.
 RenderPass make_efb_continuation(const RenderPass& prevPass, bool clearDepth, float clearDepthValue,
                                  bool fullColorClear, Vec4<float> clearColorValue) {
   RenderPass newPass{
@@ -1022,6 +1097,7 @@ RenderPass make_efb_continuation(const RenderPass& prevPass, bool clearDepth, fl
       .copySourceTexture = prevPass.copySourceTexture,
       .copySourceView = prevPass.copySourceView,
       .copySourceDepthView = prevPass.copySourceDepthView,
+      .copySourceNormalTexture = prevPass.copySourceNormalTexture,
       .msaaSamples = prevPass.msaaSamples,
       .clearDepthValue = clearDepthValue,
       .clearDepth = clearDepth,
@@ -1031,7 +1107,11 @@ RenderPass make_efb_continuation(const RenderPass& prevPass, bool clearDepth, fl
   for (uint32_t i = 0; i < newPass.colorAttachmentCount; ++i) {
     auto& color = newPass.colorAttachments[i];
     color.loadOp = wgpu::LoadOp::Undefined;
-    color.clear = false;
+    if (color.semantic == ColorAttachmentSemantic::Normal && clearDepth) {
+      color.clear = true;
+    } else {
+      color.clear = false;
+    }
   }
   if (fullColorClear) {
     auto& sceneColor = newPass.colorAttachments[SceneColorAttachmentIndex];
@@ -1042,14 +1122,25 @@ RenderPass make_efb_continuation(const RenderPass& prevPass, bool clearDepth, fl
   return newPass;
 }
 
-// A copy that clears only color or only alpha cannot use a load-op clear: the continuation opens with a
-// full-target clear draw instead. It is recorded on the pass so fusion can treat it as pass-start state.
-void push_leading_clear(bool clearColor, bool clearAlpha, Vec4<float> clearColorValue) {
+// A copy clear that cannot be a load-op clear (color or alpha alone, or part of the target): the continuation
+// opens with a clear draw instead. A whole-target one is recorded on the pass so fusion can treat it as
+// pass-start state.
+void push_leading_clear(bool clearColor, bool clearAlpha, bool clearDepth, Vec4<float> clearColorValue,
+                        float clearDepthValue, const CopyClearRegion& region) {
+  if (region.rect.width <= 0 || region.rect.height <= 0 || !(clearColor || clearAlpha || clearDepth)) {
+    return;
+  }
   auto& pass = current_render_passes()[g_recorder.currentRenderPass];
-  pass.leadingClearMask = (clearColor ? WriteColor : 0) | (clearAlpha ? WriteAlpha : 0);
-  pass.leadingClearValue = clearColorValue;
+  if (region.fullTarget) {
+    pass.leadingClearMask = (clearColor ? WriteColor : 0) | (clearAlpha ? WriteAlpha : 0);
+    pass.leadingClearValue = clearColorValue;
+  }
   push_draw_command(make_draw_command<clear::render>(clear::DrawData{
-      .pipeline = pipeline_ref(clear::make_pipeline_config(pass.target_layout(), clearColor, clearAlpha, false)),
+      .pipeline = pipeline_ref(clear::PipelineConfig{
+          .clearColor = clearColor,
+          .clearAlpha = clearAlpha,
+          .clearDepth = clearDepth,
+      }),
       .color =
           wgpu::Color{
               .r = clearColorValue.x(),
@@ -1057,19 +1148,34 @@ void push_leading_clear(bool clearColor, bool clearAlpha, Vec4<float> clearColor
               .b = clearColorValue.z(),
               .a = clearColorValue.w(),
           },
+      .depth = clearDepthValue,
+      .rect = region.rect,
   }));
 }
 
-// UV transform uniform for tex_copy_conv (crop region in UV space)
-std::array<float, 4> copy_uv_transform(const RenderPass& pass, const ClipRect& rect) {
+// Opens the EFB pass that follows an EFB copy and applies the copy's clear to it.
+void push_efb_continuation(const RenderPass& prevPass, bool clearColor, bool clearAlpha, bool clearDepth,
+                           Vec4<float> clearColorValue, float clearDepthValue, const CopyClearRegion& region) {
+  const bool fullColorClear = clearColor && clearAlpha && region.fullTarget;
+  const bool fullDepthClear = clearDepth && region.fullTarget;
+  current_render_passes().emplace_back(
+      make_efb_continuation(prevPass, fullDepthClear, clearDepthValue, fullColorClear, clearColorValue));
+  ++g_recorder.currentRenderPass;
+  push_leading_clear(clearColor && !fullColorClear, clearAlpha && !fullColorClear, clearDepth && !fullDepthClear,
+                     clearColorValue, clearDepthValue, region);
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+}
+
+// Uniforms for tex_copy_conv: the crop region in UV space, and whether the source reads as opaque.
+tex_copy_conv::Uniforms copy_uniforms(const RenderPass& pass, const ClipRect& rect) {
   const auto& size = pass.colorAttachments[SceneColorAttachmentIndex].size;
   const auto srcW = static_cast<float>(size.width);
   const auto srcH = static_cast<float>(size.height);
   return {
-      static_cast<float>(rect.x) / srcW,
-      static_cast<float>(rect.y) / srcH,
-      static_cast<float>(rect.width) / srcW,
-      static_cast<float>(rect.height) / srcH,
+      .offset = {static_cast<float>(rect.x) / srcW, static_cast<float>(rect.y) / srcH},
+      .scale = {static_cast<float>(rect.width) / srcW, static_cast<float>(rect.height) / srcH},
+      .opaqueAlpha = !gx::efb_has_alpha(pass.resolveSourceFormat),
   };
 }
 
@@ -1117,8 +1223,13 @@ SegmentCheck check_segment(const RenderPass& pass, size_t begin, size_t end, int
 // Called once the copy of `pass` has been recorded. Starts recording the EFB pass that follows into the same
 // RenderPass, shifted right of `rect`, when that is exact.
 bool pass_fusion_begin(RenderPass& pass, const ClipRect& rect, bool clearColor, bool clearAlpha, bool clearDepth,
-                       Vec4<float> clearColorValue, float clearDepthValue) {
+                       Vec4<float> clearColorValue, float clearDepthValue, const CopyClearRegion& region) {
   if (g_config.disableRenderPassFusion || g_recorder.inOffscreen) {
+    return false;
+  }
+  // The argument below is about copies that clear the whole target; a copy that clears only its own rectangle
+  // leaves the first segment's pixels where the shifted segment would not.
+  if (!region.fullTarget) {
     return false;
   }
   if (pass.colorAttachmentCount != 1 || pass.msaaSamples != 1 || !pass.extraResolves.empty()) {
@@ -1196,9 +1307,13 @@ bool pass_fusion_begin(RenderPass& pass, const ClipRect& rect, bool clearColor, 
 
 // Second EFB copy while a fusion is active: attaches it to the fused pass as an extra resolve.
 bool pass_fusion_complete(const TextureHandle& texture, const ClipRect& rect, bool clearColor, bool clearAlpha,
-                          bool clearDepth, GXTexFmt format) {
+                          bool clearDepth, GXTexFmt format, GXPixelFmt sourceFormat, const CopyClearRegion& region) {
   auto& fusion = g_passFusion;
   auto& pass = current_render_passes()[fusion.pass];
+  // Both copies resolve from one source with one set of clear semantics.
+  if (!region.fullTarget || sourceFormat != pass.resolveSourceFormat) {
+    return false;
+  }
   // After the second copy the fused pass leaves the second image in a different place than the original would.
   // The copy clears the whole EFB for the channels it clears, so those match; anything either segment wrote to an
   // uncleared channel would remain visible in the wrong place.
@@ -1224,13 +1339,18 @@ bool pass_fusion_complete(const TextureHandle& texture, const ClipRect& rect, bo
       .target = texture,
       .format = format,
       .rect = shifted,
-      .uniformRange = push_uniform(copy_uv_transform(pass, shifted)),
+      .uniformRange = push_uniform(copy_uniforms(pass, shifted)),
   });
   // Both transforms together for a two-target conversion pass.
-  const auto first = copy_uv_transform(pass, pass.resolveRect);
-  const auto second = copy_uv_transform(pass, shifted);
-  pass.dualResolveUniformRange = push_uniform(
-      std::array<float, 8>{first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3]});
+  const auto first = copy_uniforms(pass, pass.resolveRect);
+  const auto second = copy_uniforms(pass, shifted);
+  pass.dualResolveUniformRange = push_uniform(tex_copy_conv::DualUniforms{
+      .offset = first.offset,
+      .scale = first.scale,
+      .offset2 = second.offset,
+      .scale2 = second.scale,
+      .opaqueAlpha = first.opaqueAlpha,
+  });
   fusion.active = false;
   fusion.firstTarget = {};
   return true;
@@ -1253,8 +1373,9 @@ void pass_fusion_split() {
   g_recorder.currentRenderPass = static_cast<uint32_t>(passes.size() - 1);
   auto& split = passes.back();
   split.writeMask = fusion.segmentWrites;
-  if (!fullColorClear && (fusion.clearColor || fusion.clearAlpha)) {
-    push_leading_clear(fusion.clearColor, fusion.clearAlpha, fusion.clearColorValue);
+  if (!fullColorClear) {
+    push_leading_clear(fusion.clearColor, fusion.clearAlpha, false, fusion.clearColorValue, 0.f,
+                       whole_target_region(split));
   }
   const auto segment = fused.commands.begin() + static_cast<std::ptrdiff_t>(fusion.segmentStart);
   for (auto it = segment; it != fused.commands.end(); ++it) {
@@ -1423,11 +1544,20 @@ void sprite_segment_settle() {
 }
 
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
-                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat) {
+                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
+                       GXPixelFmt sourceFormat) {
   sprite_segment_settle();
+  if (!gx::efb_has_alpha(sourceFormat)) {
+    // An EFB without alpha reads as alpha 1 everywhere and no draw writes the channel, so a color clear restores
+    // it too. That keeps the clear a single load op instead of a color-only clear draw over loaded contents.
+    clearAlpha = clearColor;
+    clearColorValue.w() = 1.f;
+  }
+  const CopyClearRegion region = copy_clear_region(current_render_passes()[g_recorder.currentRenderPass], rect);
   bool fusedSecond = false;
   if (g_passFusion.active) {
-    fusedSecond = pass_fusion_complete(texture, rect, clearColor, clearAlpha, clearDepth, resolveFormat);
+    fusedSecond =
+        pass_fusion_complete(texture, rect, clearColor, clearAlpha, clearDepth, resolveFormat, sourceFormat, region);
     if (!fusedSecond) {
       pass_fusion_split();
     }
@@ -1442,22 +1572,14 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
                            resolveFormat != GX_TF_IA4 && resolveFormat != GX_TF_IA8 && resolveFormat != GX_CTF_R8 &&
                            resolveFormat != GX_CTF_A8 && !gx::is_depth_format(resolveFormat);
   if (!fusedSecond && texture && small_copy_pass_interval() > 1 && !g_recorder.inOffscreen && colorFormat &&
-      rect.width <= 128 && rect.height <= 128 && clearColor) {
+      rect.width <= 128 && rect.height <= 128 && clearColor && region.fullTarget) {
     const TextureRef* key = texture.get();
     const bool due = g_smallCopies.frame % small_copy_pass_interval() == 0;
     if (!due && g_smallCopies.rendered.contains(key)) {
       ++g_smallCopies.skipped;
       prevPass.discardable = true;
       enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
-      const bool fullColorClear = clearColor && clearAlpha;
-      current_render_passes().emplace_back(
-          make_efb_continuation(prevPass, clearDepth, clearDepthValue, fullColorClear, clearColorValue));
-      ++g_recorder.currentRenderPass;
-      if (!fullColorClear && (clearColor || clearAlpha)) {
-        push_leading_clear(clearColor, clearAlpha, clearColorValue);
-      }
-      push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
-      push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+      push_efb_continuation(prevPass, clearColor, clearAlpha, clearDepth, clearColorValue, clearDepthValue, region);
       return;
     }
     g_smallCopies.rendered.insert(key);
@@ -1467,26 +1589,18 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
     prevPass.resolveTarget = std::move(texture);
     prevPass.resolveRect = rect;
     prevPass.resolveFormat = resolveFormat;
-    prevPass.resolveUniformRange = push_uniform(copy_uv_transform(prevPass, rect));
+    prevPass.resolveSourceFormat = sourceFormat;
+    prevPass.resolveUniformRange = push_uniform(copy_uniforms(prevPass, rect));
     // Record the pass that follows into this one when that is exact.
-    if (pass_fusion_begin(prevPass, rect, clearColor, clearAlpha, clearDepth, clearColorValue, clearDepthValue)) {
+    if (pass_fusion_begin(prevPass, rect, clearColor, clearAlpha, clearDepth, clearColorValue, clearDepthValue,
+                          region)) {
       return;
     }
   }
   enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
 
   // Populate new render pass from previous
-  const bool fullColorClear = clearColor && clearAlpha;
-  current_render_passes().emplace_back(
-      make_efb_continuation(prevPass, clearDepth, clearDepthValue, fullColorClear, clearColorValue));
-  ++g_recorder.currentRenderPass;
-
-  if (!fullColorClear && (clearColor || clearAlpha)) {
-    // If we're only clearing color _or_ alpha, perform a clear draw
-    push_leading_clear(clearColor, clearAlpha, clearColorValue);
-  }
-  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
-  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+  push_efb_continuation(prevPass, clearColor, clearAlpha, clearDepth, clearColorValue, clearDepthValue, region);
 }
 
 void queue_palette_conv(tex_palette_conv::ConvRequest req) {
@@ -1501,14 +1615,29 @@ void queue_palette_conv(tex_palette_conv::ConvRequest req) {
 
 bool is_offscreen() noexcept { return g_recorder.inOffscreen; }
 
-uint32_t get_sample_count() noexcept {
-  CHECK(g_recorder.currentRenderPass != UINT32_MAX, "get_sample_count called outside of a frame");
-  return current_render_passes()[g_recorder.currentRenderPass].msaaSamples;
+bool has_normal_attachment() noexcept {
+  CHECK(g_recorder.currentRenderPass != UINT32_MAX, "has_normal_attachment called outside of a frame");
+  const auto& pass = current_render_passes()[g_recorder.currentRenderPass];
+  for (uint32_t i = 0; i < pass.colorAttachmentCount; ++i) {
+    if (pass.colorAttachments[i].semantic == ColorAttachmentSemantic::Normal) {
+      return true;
+    }
+  }
+  return false;
 }
 
 RenderTargetLayout get_render_target_layout() noexcept {
   CHECK(g_recorder.currentRenderPass != UINT32_MAX, "get_render_target_layout called outside of a frame");
   return current_render_passes()[g_recorder.currentRenderPass].target_layout();
+}
+
+RenderTargetLayout gx_render_target_layout() noexcept {
+  // A half-resolution sprite segment interrupts an EFB pass. The draw that ends the segment resolves its pipeline
+  // before the EFB pass resumes, and the segment's own draws only use the accumulate variant.
+  if (g_sprites.active) {
+    return scene_render_target_layout();
+  }
+  return get_render_target_layout();
 }
 
 void clear_caches() noexcept {
@@ -1613,17 +1742,29 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
   const uint32_t width = prevPass.colorAttachments[SceneColorAttachmentIndex].size.width;
   const uint32_t height = prevPass.colorAttachments[SceneColorAttachmentIndex].size.height;
+  const bool wantNormal = desc.normal && prevPass.copySourceNormalTexture;
+  if (desc.normal && !g_recorder.inOffscreen && !webgpu::g_graphicsConfig.normalBuffer && webgpu::g_hasCoreFeatures &&
+      webgpu::g_graphicsConfig.msaaSamples == 1) {
+    g_recorder.normalRequested = true;
+  }
   // Requesting no snapshots is a plain pass break (or offscreen close, discarding its output).
-  if (desc.color || wantDepth) {
-    auto& entry = acquire_pass_snapshot(width, height, desc.color, wantDepth);
+  if (desc.color || wantDepth || wantNormal) {
+    auto& entry = acquire_pass_snapshot(width, height, desc.color, wantDepth, wantNormal);
     if (desc.color) {
       prevPass.snapshotColorDst = entry.color.texture;
+      out.colorTexture = entry.color.texture;
       out.color = entry.color.view;
       out.colorFormat = entry.color.format;
     }
     if (wantDepth) {
       prevPass.snapshotDepthDst = entry.depth.view;
+      out.depthTexture = entry.depth.texture;
       out.depth = entry.depth.view;
+    }
+    if (wantNormal) {
+      prevPass.snapshotNormalDst = entry.normal.texture;
+      out.normalTexture = entry.normal.texture;
+      out.normal = entry.normal.view;
     }
   }
   out.width = width;
@@ -1711,7 +1852,9 @@ void push_draw_command(rmlui::DrawData data) {
 
 template <>
 PipelineRef pipeline_ref(const gx::PipelineConfig& config) {
-  const PipelineRef ref = find_pipeline(ShaderType::GX, config, [=] { return create_pipeline(config); });
+  // The accumulate variant draws into the sprite pass being recorded; everything else into the pass GX targets.
+  const PipelineRef ref = find_pipeline(
+      config, config.shaderConfig.spriteAccumulate ? get_render_target_layout() : gx_render_target_layout());
   // Known from the request on, not from when the pipeline thread gets to it: the OpenGL ES direct path plans a
   // pass from its draws' configurations and sent every pass with a queued pipeline through Dawn instead.
   gx::remember_pipeline_config(ref, config);
@@ -1721,7 +1864,7 @@ PipelineRef pipeline_ref(const gx::PipelineConfig& config) {
 #ifdef AURORA_ENABLE_RMLUI
 template <>
 PipelineRef pipeline_ref(const rmlui::PipelineConfig& config) {
-  return find_pipeline(ShaderType::Rml, config, [=] { return rmlui::create_pipeline(config); });
+  return find_pipeline(config);
 }
 #endif
 

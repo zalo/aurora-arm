@@ -12,6 +12,7 @@
 #include "gfx/resource_cache.hpp"
 #include "gx/gx.hpp"
 #include "gfx/clear.hpp"
+#include "gfx/frame_packet.hpp"
 #include "gfx/resources.hpp"
 #include "gfx/depth_peek.hpp"
 #include "gfx/frame.hpp"
@@ -68,6 +69,7 @@ GraphicsConfig g_graphicsConfig{};
 wgpu::Device g_device;
 bool g_hasCoreFeatures = false;
 #endif
+bool g_dualSourceBlendingSupported = false;
 } // namespace aurora::webgpu
 
 // --- GXState ---
@@ -169,10 +171,12 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept { g_gxState.rende
 
 // --- Shader/pipeline stubs ---
 namespace aurora::gx {
+uint32_t g_testPipelineBuildCount = 0;
 #ifndef AURORA_GX_TEST_LINK_GX
 // Vertex attribute part of gx.cpp's populate_pipeline_config, so the CPU vertex decoder sees the
 // draw's attribute configuration; TEV and lighting state are not needed by these tests.
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
+  ++g_testPipelineBuildCount;
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   config.shaderConfig = {};
   config.shaderConfig.cpuVertexDecode = g_config.cpuVertexDecode;
@@ -274,33 +278,27 @@ void release_buffers() noexcept {}
 #endif
 } // namespace aurora::gx::resident
 namespace aurora::gfx {
+bool g_testNormalAttachment = false;
+bool has_normal_attachment() noexcept { return g_testNormalAttachment; }
 RenderTargetLayout get_render_target_layout() noexcept {
-  return {
+  RenderTargetLayout layout{
       .colorAttachmentCount = 1,
       .colorAttachments = {{{ColorAttachmentSemantic::SceneColor, wgpu::TextureFormat::RGBA8Unorm}}},
       .depthStencilFormat = wgpu::TextureFormat::Depth24Plus,
       .sampleCount = 1,
   };
+  if (g_testNormalAttachment) {
+    layout.colorAttachmentCount = 2;
+    layout.colorAttachments[1] = {ColorAttachmentSemantic::Normal, wgpu::TextureFormat::RGB10A2Unorm};
+  }
+  detail::finalize_render_target_layout(layout);
+  return layout;
 }
+RenderTargetLayout gx_render_target_layout() noexcept { return get_render_target_layout(); }
 } // namespace aurora::gfx
 
 // --- Pipeline/draw command stubs ---
 namespace aurora::gfx {
-namespace clear {
-PipelineConfig make_pipeline_config(const RenderTargetLayout& layout, bool clearColor, bool clearAlpha,
-                                    bool clearDepth) noexcept {
-  return {
-      .targetLayoutKey = layout.key,
-      .depthStencilFormat = layout.depthStencilFormat,
-      .colorAttachmentCount = layout.colorAttachmentCount,
-      .msaaSamples = layout.sampleCount,
-      .clearColor = clearColor,
-      .clearAlpha = clearAlpha,
-      .clearDepth = clearDepth,
-  };
-}
-} // namespace clear
-
 template <>
 PipelineRef pipeline_ref<clear::PipelineConfig>(const clear::PipelineConfig& config) {
   return 0;
@@ -367,7 +365,8 @@ std::atomic<uint32_t> offscreenHeight{0};
 } // namespace testing
 
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
-                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat) {
+                       Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
+                       GXPixelFmt sourceFormat) {
   testing::resolvePassCount.fetch_add(1, std::memory_order_release);
 }
 void begin_offscreen(uint32_t width, uint32_t height) {

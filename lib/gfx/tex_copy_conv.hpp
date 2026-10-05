@@ -6,6 +6,7 @@
 
 #include <string>
 #include <string_view>
+#include <array>
 
 namespace aurora::gfx::tex_copy_conv {
 
@@ -14,10 +15,30 @@ enum class SampleFilter : uint8_t {
   Linear,
 };
 
+struct alignas(16) Uniforms {
+  Vec2<float> offset;
+  Vec2<float> scale{1.f, 1.f};
+  uint32_t opaqueAlpha = 0;
+  std::array<uint32_t, 3> _pad{};
+};
+static_assert(sizeof(Uniforms) == 32);
+
+// Uniforms of the two-target conversion (run_dual): one transform per target.
+struct alignas(16) DualUniforms {
+  Vec2<float> offset;
+  Vec2<float> scale{1.f, 1.f};
+  Vec2<float> offset2;
+  Vec2<float> scale2{1.f, 1.f};
+  uint32_t opaqueAlpha = 0;
+  std::array<uint32_t, 3> _pad{};
+};
+static_assert(sizeof(DualUniforms) == 48);
+
 struct ConvRequest {
   GXTexFmt fmt;
+  GXPixelFmt srcFmt;
   wgpu::TextureView srcView; // View of resolved EFB / offscreen color/depth
-  Range uniformRange;        // UV transform uniform (offset + scale)
+  Range uniformRange;        // Uniforms
   TextureHandle dst;         // Destination texture
   SampleFilter sampleFilter = SampleFilter::Nearest;
 };
@@ -29,8 +50,7 @@ void shutdown();
 void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
 void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
 // Two same-format, unscaled conversions from one source in a single render pass with two color targets.
-// `dualUniformRange` holds both UV transforms (32 bytes: offset, scale, offset2, scale2); `req.dst` receives the
-// first, `dst2` the second.
+// `dualUniformRange` holds a DualUniforms; `req.dst` receives the first, `dst2` the second.
 bool dual_supported(GXTexFmt fmt);
 void run_dual(const wgpu::CommandEncoder& cmd, const ConvRequest& req, const TextureHandle& dst2,
               Range dualUniformRange);

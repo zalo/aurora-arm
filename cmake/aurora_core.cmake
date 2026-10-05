@@ -2,7 +2,16 @@ add_library(aurora_core STATIC
         lib/aurora.cpp
         lib/device.cpp
         lib/device.hpp
-        lib/input.cpp
+        lib/gamepad.cpp
+        lib/gamepad.hpp
+        lib/input/binding.cpp
+        lib/input/capture.cpp
+        lib/input/router.cpp
+        lib/input/router.hpp
+        lib/input/sdl_input.cpp
+        lib/input/sdl_input.hpp
+        lib/input/source_state.cpp
+        lib/input/source_state.hpp
         lib/io.cpp
         lib/io.hpp
         lib/logging.cpp
@@ -26,6 +35,12 @@ if (AURORA_ENABLE_GX AND AURORA_CACHE_USE_ZSTD)
     target_link_libraries(aurora_core PRIVATE zstd::libzstd)
 endif ()
 
+if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_compile_options(aurora_core PUBLIC
+            /Zc:__cplusplus # Enable updated `__cplusplus` macro
+    )
+endif ()
+
 if (CMAKE_SYSTEM_NAME STREQUAL Windows)
     # stuff for fetching system info.
     target_link_libraries(aurora_core PRIVATE wbemuuid.lib comsuppw.lib ntdll.lib DXGI.lib)
@@ -45,7 +60,7 @@ if (AURORA_ENABLE_GX)
     target_link_libraries(aurora_core PUBLIC imgui)
 endif ()
 
-if(AURORA_ENABLE_RMLUI)
+if (AURORA_ENABLE_RMLUI)
     target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_RMLUI)
 
     target_sources(aurora_core PRIVATE
@@ -56,6 +71,7 @@ if(AURORA_ENABLE_RMLUI)
             lib/rmlui/SystemInterface_Aurora.cpp
             lib/rmlui/FileInterface_SDL.cpp
             lib/rmlui/GlassFilter.cpp
+            lib/rmlui/ImageEffects.cpp
     )
     target_link_libraries(aurora_core PUBLIC rmlui)
 

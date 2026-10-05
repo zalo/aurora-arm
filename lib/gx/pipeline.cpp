@@ -42,21 +42,36 @@ void remember_pipeline_config(gfx::PipelineRef ref, const PipelineConfig& config
   sPipelineConfigs.try_emplace(ref, config);
 }
 
-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+bool dst_alpha_replaces(const PipelineConfig& config) noexcept {
+  return config.alphaUpdate && config.dstAlpha != UINT32_MAX && config.dstAlpha != 0;
+}
+
+bool dst_alpha_needs_source_alpha(const PipelineConfig& config) noexcept {
+  const auto usesSourceAlpha = [](GXBlendFactor factor) {
+    return factor == GX_BL_SRCALPHA || factor == GX_BL_INVSRCALPHA;
+  };
+  return config.colorUpdate && config.blendMode == GX_BM_BLEND &&
+         (usesSourceAlpha(config.blendFacSrc) || usesSourceAlpha(config.blendFacDst));
+}
+
+gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout) {
   ZoneScoped;
-  const auto shader = build_shader(config.shaderConfig);
-  const auto hash = xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX));
-  const auto label = fmt::format("GX Pipeline {:x} shader {:x}", hash, xxh3_hash(config.shaderConfig));
-  remember_pipeline_config(hash, config); // pipelines preloaded from the cache are never requested
+  // Keyed like the pipeline cache's runtime key, which is the PipelineRef draws carry.
+  const auto hash = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)));
+  remember_pipeline_config(hash, config); // pipelines built ahead of time from the cache are never requested
+
+  std::array<wgpu::VertexBufferLayout, 2> vtxBuffers{};
+  size_t vtxBufferCount = 0;
+  decltype(decoded_vertex_layout(config.shaderConfig)) vtxLayout{};
   if (config.shaderConfig.cpuVertexDecode) {
-    const auto layout = decoded_vertex_layout(config.shaderConfig);
+    vtxLayout = decoded_vertex_layout(config.shaderConfig);
     // Points keep one record per point and draw it as one instance of a shared quad
     const bool perInstance = config.shaderConfig.lineMode == 3;
-    const wgpu::VertexBufferLayout vertexBuffer{
+    vtxBuffers[vtxBufferCount++] = {
         .stepMode = perInstance ? wgpu::VertexStepMode::Instance : wgpu::VertexStepMode::Vertex,
-        .arrayStride = layout.stride,
-        .attributeCount = layout.count,
-        .attributes = layout.attributes.data(),
+        .arrayStride = vtxLayout.stride,
+        .attributeCount = vtxLayout.count,
+        .attributes = vtxLayout.attributes.data(),
     };
     if (config.shaderConfig.residentRecords) {
       // Second vertex binding: the per-vertex resident record index (u32), fetched with the same index as
@@ -66,25 +81,58 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
           .offset = 0,
           .shaderLocation = RecordLocation,
       };
-      const wgpu::VertexBufferLayout recordBuffer{
+      vtxBuffers[vtxBufferCount++] = {
           .stepMode = wgpu::VertexStepMode::Vertex,
           .arrayStride = sizeof(uint32_t),
           .attributeCount = 1,
           .attributes = &recordAttr,
       };
-      const std::array buffers{vertexBuffer, recordBuffer};
-      return build_pipeline(config, {buffers.data(), buffers.size()}, shader, label.c_str());
     }
-    return build_pipeline(config, {&vertexBuffer, 1}, shader, label.c_str());
   }
-  return build_pipeline(config, {}, shader, label.c_str());
+  const auto shaderHash = xxh3_hash(config.shaderConfig);
+  const auto create = [&](const PipelineOptions& options, const char* passName) {
+    const auto shader = build_shader(config.shaderConfig, layout, options.dstAlphaMode);
+    const auto label = fmt::format("GX Pipeline {:x} shader {:x} {}", hash, shaderHash, passName);
+    return build_pipeline(config, layout, options, {vtxBuffers.data(), vtxBufferCount}, shader, label.c_str());
+  };
+
+  PipelineOptions options{
+      .colorUpdate = config.colorUpdate,
+      .alphaUpdate = config.alphaUpdate,
+      .depthUpdate = config.depthUpdate,
+  };
+  gfx::CompiledPipeline pipeline;
+  // The sprite accumulation variant owns its target's alpha (coverage); it is never chosen with a destination alpha.
+  if (dst_alpha_replaces(config) && !config.shaderConfig.spriteAccumulate) {
+    if (!dst_alpha_needs_source_alpha(config)) {
+      options.dstAlphaMode = DstAlphaMode::Replace;
+    } else if (webgpu::g_dualSourceBlendingSupported && layout.colorAttachmentCount == 1) {
+      options.dstAlphaMode = DstAlphaMode::DualSource;
+    } else {
+      // Write alpha before RGB, no depth write
+      auto alpha = options;
+      alpha.dstAlphaMode = DstAlphaMode::Replace;
+      alpha.colorUpdate = false;
+      alpha.depthUpdate = false;
+      pipeline.prepass = create(alpha, "alpha");
+      if (!pipeline.prepass) {
+        return {};
+      }
+      options.alphaUpdate = false;
+    }
+  }
+  pipeline.main = create(options, "main");
+  if (!pipeline.main) {
+    return {};
+  }
+  return pipeline;
 }
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
-  if (!gfx::bind_pipeline(data.pipeline, pass)) {
+  gfx::CompiledPipeline pipeline;
+  if (!gfx::get_pipeline(data.pipeline, pipeline)) {
     return;
   }
-
   const auto& resources = gfx::detail::resources();
   wgpu::IndexFormat indexFormat = wgpu::IndexFormat::Uint16;
   // The residentRecords variant reads its record per-vertex from binding 1 rather than from the immediates.
@@ -133,11 +181,19 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
   }
-  if (data.indexCount == 0) {
-    pass.Draw(data.vtxCount, data.instanceCount);
-  } else {
-    pass.DrawIndexed(data.indexCount, data.instanceCount);
+  const auto draw = [&] {
+    if (data.indexCount == 0) {
+      pass.Draw(data.vtxCount, data.instanceCount);
+    } else {
+      pass.DrawIndexed(data.indexCount, data.instanceCount);
+    }
+  };
+  if (pipeline.prepass) {
+    gfx::bind_pipeline(pipeline.prepass, pass);
+    draw();
   }
+  gfx::bind_pipeline(pipeline.main, pass);
+  draw();
 }
 
 // GPU side of the resident display-list arenas (resident_geometry.hpp); render thread only.
