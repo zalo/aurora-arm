@@ -655,6 +655,26 @@ static void pipeline_cache_abort() {
   }
 }
 
+// A damaged database (power lost or the card pulled mid-write) fails the same way on every launch, and a cache that
+// only ever aborts is never rewritten. Delete it, once per run, so the next prepare_pipeline_cache_db() starts an
+// empty one.
+static void pipeline_cache_abort(int sqliteError) {
+  static bool discarded = false;
+  pipeline_cache_abort();
+  const int primary = sqliteError & 0xff;
+  if ((primary != SQLITE_CORRUPT && primary != SQLITE_NOTADB) || discarded) {
+    return;
+  }
+  discarded = true;
+  const auto path = io::fs_path_to_string(io::fs_path_from_string(g_config.cachePath) / "pipeline_cache.db");
+  std::error_code ec;
+  for (const char* suffix : {"", "-wal", "-shm"}) {
+    std::filesystem::remove(io::fs_path_from_string(path + suffix), ec);
+  }
+  Log.warn("Pipeline cache database '{}' is damaged; deleted it to start an empty one", path);
+  g_pipelineCacheBroken = false;
+}
+
 static bool write_pipeline_cache_record(const PipelineCacheWrite& write);
 
 static std::string pipeline_cache_seed_path() {
@@ -822,7 +842,7 @@ static bool prepare_pipeline_cache_db() {
   ret = sqlite::exec(g_pipelineCacheDb, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
   if (ret != SQLITE_OK) {
     Log.error("Failed to set pipeline cache pragmas: {}", sqlite3_errmsg(g_pipelineCacheDb));
-    pipeline_cache_abort();
+    pipeline_cache_abort(ret);
     return false;
   }
 
@@ -892,7 +912,7 @@ INSERT INTO aurora_schema VALUES ({});)",
                            -1, SQLITE_PREPARE_PERSISTENT, &g_pipelineCacheLoadStmt, nullptr);
   if (ret != SQLITE_OK) {
     Log.error("Failed to prepare pipeline cache load statement: {}", sqlite3_errmsg(g_pipelineCacheDb));
-    pipeline_cache_abort();
+    pipeline_cache_abort(ret);
     return false;
   }
 
@@ -908,7 +928,7 @@ INSERT INTO aurora_schema VALUES ({});)",
       -1, SQLITE_PREPARE_PERSISTENT, &g_pipelineCacheUpsertStmt, nullptr);
   if (ret != SQLITE_OK) {
     Log.error("Failed to prepare pipeline cache upsert statement: {}", sqlite3_errmsg(g_pipelineCacheDb));
-    pipeline_cache_abort();
+    pipeline_cache_abort(ret);
     return false;
   }
 
@@ -930,7 +950,7 @@ static void prune_old_pipeline_cache_versions() {
   auto ret = sqlite::exec(g_pipelineCacheDb, clearDelete.c_str());
   if (ret != SQLITE_OK) {
     Log.error("Failed to prune clear pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
-    pipeline_cache_abort();
+    pipeline_cache_abort(ret);
     return;
   }
 
@@ -939,7 +959,7 @@ static void prune_old_pipeline_cache_versions() {
   ret = sqlite::exec(g_pipelineCacheDb, gxDelete.c_str());
   if (ret != SQLITE_OK) {
     Log.error("Failed to prune GX pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
-    pipeline_cache_abort();
+    pipeline_cache_abort(ret);
     return;
   }
 
@@ -1136,7 +1156,9 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
 
   if (ret != SQLITE_DONE && ret != SQLITE_ROW && ret != SQLITE_OK) {
     Log.error("Failed to read pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
-    pipeline_cache_abort();
+    // The abort finalizes the statement; sqlite3_clear_bindings() does not accept a null one.
+    pipeline_cache_abort(ret);
+    return acceptedRows;
   }
 
   sqlite3_reset(g_pipelineCacheLoadStmt);
